@@ -54,12 +54,21 @@ impl SortKey {
 /// Materializes the input stream, then sorts using an index-based
 /// permutation (EC-Sort pattern). Only key columns are accessed during
 /// comparison; the permutation is applied to all columns in one pass.
+pub async fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
+    let (batch, indices) = sort_indices(input, keys).await?;
+    batch.take(&indices)
+}
+
+/// Materializes the input stream and returns the original batch together
+/// with the sorted index permutation, *without* building a sorted copy.
 ///
-/// The `config` parameter controls the memory budget. If the estimated
-/// data size exceeds `sort_memory_budget`, a warning is logged but
-/// in-memory sort is still used (true external sort requires disk
-/// spilling which is not yet implemented).
-pub async fn sort(mut input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
+/// Callers can use the indices to write data in sorted order in chunks
+/// (e.g. via `CacheSFrameBuilder::write_indexed_chunked`) to avoid
+/// holding a full sorted copy in memory.
+pub async fn sort_indices(
+    mut input: BatchStream,
+    keys: &[SortKey],
+) -> Result<(SFrameRows, Vec<usize>)> {
     // Materialize all batches
     let mut result: Option<SFrameRows> = None;
     while let Some(batch_result) = input.next().await {
@@ -72,27 +81,27 @@ pub async fn sort(mut input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows
 
     let batch = match result {
         Some(b) => b,
-        None => return Ok(SFrameRows::empty(&[])),
+        None => {
+            let empty = SFrameRows::empty(&[]);
+            return Ok((empty, Vec::new()));
+        }
     };
 
     if batch.num_rows() <= 1 || keys.is_empty() {
-        return Ok(batch);
+        let n = batch.num_rows();
+        let indices: Vec<usize> = (0..n).collect();
+        return Ok((batch, indices));
     }
 
-    sort_in_memory(batch, keys)
+    let indices = build_sort_indices(&batch, keys);
+    Ok((batch, indices))
 }
 
-/// In-memory EC-Sort: build a permutation from key columns, then apply
-/// it to all columns via `take()`.
+/// Build a sorted index permutation for the batch by the given sort keys.
 ///
-/// This is O(n log n) in comparisons on key columns only. The
-/// permutation application is O(n × num_columns).
-fn sort_in_memory(batch: SFrameRows, keys: &[SortKey]) -> Result<SFrameRows> {
+/// Uses rayon's parallel sort for datasets larger than 10K rows.
+pub fn build_sort_indices(batch: &SFrameRows, keys: &[SortKey]) -> Vec<usize> {
     let n = batch.num_rows();
-
-    // Step 1: Build permutation by sorting indices on key columns only.
-    // This is the "sort key columns + row numbers" step of EC-Sort.
-    // Uses rayon's parallel sort for large datasets (>10K rows).
     let mut indices: Vec<usize> = (0..n).collect();
 
     let cmp = |&a: &usize, &b: &usize| -> std::cmp::Ordering {
@@ -117,9 +126,7 @@ fn sort_in_memory(batch: SFrameRows, keys: &[SortKey]) -> Result<SFrameRows> {
         indices.sort_by(cmp);
     }
 
-    // Step 2: Apply permutation to all columns in one pass.
-    // This is the "apply forward-map" step of EC-Sort.
-    batch.take(&indices)
+    indices
 }
 
 /// Estimate the memory size of a batch in bytes (rough).

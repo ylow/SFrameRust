@@ -40,12 +40,15 @@ impl<W: Write> SegmentWriter<W> {
     }
 
     /// Write a block of values for a specific column.
+    ///
+    /// Returns the on-disk (post-compression, pre-padding) byte count,
+    /// which callers can use for online block-size estimation.
     pub fn write_column_block(
         &mut self,
         column: usize,
         values: &[FlexType],
         dtype: FlexTypeEnum,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if column >= self.num_columns {
             return Err(sframe_types::error::SFrameError::Format(format!(
                 "Column index {} out of range ({})",
@@ -94,7 +97,7 @@ impl<W: Write> SegmentWriter<W> {
             content_type: dtype as u16,
         });
 
-        Ok(())
+        Ok(on_disk_len)
     }
 
     /// Finalize the segment: write the footer and return column element counts.

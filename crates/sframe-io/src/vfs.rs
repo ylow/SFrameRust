@@ -5,8 +5,12 @@
 //! - cache:// for reference-counted ephemeral storage
 //! - Future: S3, HTTP, HDFS backends
 
+use std::sync::Arc;
+
 use sframe_types::error::Result;
 use std::io::{Read, Seek, Write};
+
+use crate::cache_fs::CacheFs;
 
 /// A readable file with seek and size support.
 pub trait ReadableFile: Read + Seek + Send {
@@ -46,5 +50,43 @@ pub trait VirtualFileSystem: Send + Sync {
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
         Ok(contents)
+    }
+
+    /// Write a string to a file (creates or truncates).
+    fn write_string(&self, path: &str, content: &str) -> Result<()> {
+        let mut file = self.open_write(path)?;
+        file.write_all(content.as_bytes())?;
+        file.flush_all()?;
+        Ok(())
+    }
+}
+
+/// VFS wrapper around `Arc<CacheFs>` that routes writes through the
+/// memory-caching tier (`open_cache_write`).
+pub struct ArcCacheFsVfs(pub Arc<CacheFs>);
+
+impl VirtualFileSystem for ArcCacheFsVfs {
+    fn open_read(&self, path: &str) -> Result<Box<dyn ReadableFile>> {
+        self.0.open_read(path)
+    }
+
+    fn open_write(&self, path: &str) -> Result<Box<dyn WritableFile>> {
+        self.0.open_cache_write(path)
+    }
+
+    fn exists(&self, path: &str) -> Result<bool> {
+        self.0.exists(path)
+    }
+
+    fn mkdir_p(&self, path: &str) -> Result<()> {
+        self.0.mkdir_p(path)
+    }
+
+    fn remove(&self, path: &str) -> Result<()> {
+        self.0.remove(path)
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>> {
+        self.0.list_dir(path)
     }
 }

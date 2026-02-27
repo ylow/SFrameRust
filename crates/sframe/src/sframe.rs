@@ -6,8 +6,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use sframe_io::cache_fs::{global_cache_fs, CacheFs};
+use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::algorithms::aggregators::AggSpec;
-use sframe_query::algorithms::csv_parser::{read_csv, CsvOptions};
+use sframe_query::algorithms::csv_parser::{self, CsvOptions};
 use sframe_query::algorithms::csv_writer::{self, CsvWriterOptions};
 use sframe_query::algorithms::json as json_io;
 use sframe_query::algorithms::groupby;
@@ -24,6 +26,218 @@ use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::sarray::SArray;
+
+const DEFAULT_CHUNK_SIZE: usize = 8192;
+
+/// RAII guard for anonymous cache-backed SFrames.
+/// When dropped, removes the cache directory and all its files.
+struct AnonymousStore {
+    path: String,
+    cache_fs: Arc<CacheFs>,
+}
+
+impl Drop for AnonymousStore {
+    fn drop(&mut self) {
+        self.cache_fs.remove_dir(&self.path).ok();
+    }
+}
+
+/// Incremental SFrame builder backed by an arbitrary VFS.
+///
+/// Writes data in chunks to avoid holding the full column-vector copy in
+/// memory at once. Call `finish()` to finalize the SFrame; if the builder
+/// is dropped without `finish()`, the directory is cleaned up (for
+/// anonymous builders only).
+struct SFrameBuilder {
+    writer: Option<SFrameWriter>,
+    column_names: Vec<String>,
+    dtypes: Vec<FlexTypeEnum>,
+    dir_path: String,
+    /// When `Some`, this is an anonymous builder — the cache dir is removed
+    /// on Drop if `finish()` was never called.
+    cache_fs: Option<Arc<CacheFs>>,
+}
+
+impl SFrameBuilder {
+    /// Open a builder targeting the given VFS and directory path.
+    fn new(
+        vfs: Arc<dyn VirtualFileSystem>,
+        dir_path: String,
+        column_names: Vec<String>,
+        dtypes: Vec<FlexTypeEnum>,
+    ) -> Result<Self> {
+        let col_name_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+        let writer = SFrameWriter::with_vfs(vfs, &dir_path, &col_name_refs, &dtypes)?;
+
+        Ok(SFrameBuilder {
+            writer: Some(writer),
+            column_names,
+            dtypes,
+            dir_path,
+            cache_fs: None,
+        })
+    }
+
+    /// Create an anonymous builder backed by the global `CacheFs`.
+    ///
+    /// Allocates a fresh cache directory and arranges for it to be cleaned
+    /// up if the builder is dropped without calling `finish()`.
+    fn anonymous(column_names: Vec<String>, dtypes: Vec<FlexTypeEnum>) -> Result<Self> {
+        let cache_fs = global_cache_fs();
+        let dir_path = cache_fs.alloc_dir();
+        let vfs: Arc<dyn VirtualFileSystem> = Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+        let mut builder = Self::new(vfs, dir_path, column_names, dtypes)?;
+        builder.cache_fs = Some(cache_fs.clone());
+        Ok(builder)
+    }
+
+    /// Write pre-built column vectors directly.
+    fn write_columns(&mut self, cols: &[Vec<FlexType>]) -> Result<()> {
+        self.writer
+            .as_mut()
+            .expect("write_columns called after finish")
+            .write_columns(cols)
+    }
+
+    /// Write an `SFrameRows` batch in chunks to limit peak memory.
+    fn write_batch_chunked(&mut self, batch: &SFrameRows, chunk_size: usize) -> Result<()> {
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+        let mut offset = 0;
+
+        while offset < nrows {
+            let end = (offset + chunk_size).min(nrows);
+            let chunk_len = end - offset;
+
+            let mut col_vecs: Vec<Vec<FlexType>> = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                let col = batch.column(c);
+                let mut v = Vec::with_capacity(chunk_len);
+                for r in offset..end {
+                    v.push(col.get(r));
+                }
+                col_vecs.push(v);
+            }
+
+            self.write_columns(&col_vecs)?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    /// Write rows from `batch` in the order given by `indices`, in chunks.
+    /// This avoids building a full sorted copy of the batch.
+    fn write_indexed_chunked(
+        &mut self,
+        batch: &SFrameRows,
+        indices: &[usize],
+        chunk_size: usize,
+    ) -> Result<()> {
+        let ncols = batch.num_columns();
+        let total = indices.len();
+        let mut offset = 0;
+
+        while offset < total {
+            let end = (offset + chunk_size).min(total);
+            let chunk_len = end - offset;
+
+            let mut col_vecs: Vec<Vec<FlexType>> = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                let col = batch.column(c);
+                let mut v = Vec::with_capacity(chunk_len);
+                for &idx in &indices[offset..end] {
+                    v.push(col.get(idx));
+                }
+                col_vecs.push(v);
+            }
+
+            self.write_columns(&col_vecs)?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    /// Finalize the writer and return an SFrame backed by the written data.
+    ///
+    /// For anonymous builders (created via `anonymous()`), the returned
+    /// SFrame holds an `AnonymousStore` keep-alive that cleans up the
+    /// cache directory when the SFrame is dropped.
+    fn finish(mut self) -> Result<SFrame> {
+        let writer = self
+            .writer
+            .take()
+            .expect("finish called twice on SFrameBuilder");
+        let total_rows = writer.finish()?;
+
+        // Build the plan node — anonymous builders get a keep-alive guard.
+        let plan = if let Some(ref cache_fs) = self.cache_fs {
+            let store: Arc<dyn Send + Sync> = Arc::new(AnonymousStore {
+                path: self.dir_path.clone(),
+                cache_fs: cache_fs.clone(),
+            });
+            PlannerNode::sframe_source_cached(
+                &self.dir_path,
+                self.column_names.clone(),
+                self.dtypes.clone(),
+                total_rows,
+                store,
+            )
+        } else {
+            PlannerNode::sframe_source(
+                &self.dir_path,
+                self.column_names.clone(),
+                self.dtypes.clone(),
+                total_rows,
+            )
+        };
+
+        let columns: Vec<SArray> = self
+            .dtypes
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(total_rows), i))
+            .collect();
+
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
+    }
+}
+
+impl Drop for SFrameBuilder {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            // finish() was never called — clean up the directory for
+            // anonymous builders (cache-backed). Non-anonymous builders
+            // leave the directory in place since the caller manages it.
+            if let Some(ref cache_fs) = self.cache_fs {
+                cache_fs.remove_dir(&self.dir_path).ok();
+            }
+        }
+    }
+}
+
+/// Write a materialized batch to the global CacheFs and return an SFrame
+/// backed by an SFrameSource plan node pointing at the cache path.
+///
+/// For empty batches, returns a MaterializedSource-backed SFrame to avoid
+/// creating empty SFrame files on disk.
+fn write_to_cache(batch: SFrameRows, column_names: Vec<String>) -> Result<SFrame> {
+    let num_rows = batch.num_rows();
+    let dtypes = batch.dtypes();
+
+    if num_rows == 0 {
+        let plan = PlannerNode::materialized(batch);
+        let columns: Vec<SArray> = dtypes
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(0), i))
+            .collect();
+        return Ok(SFrame::new_with_columns(columns, column_names));
+    }
+
+    let mut builder = SFrameBuilder::anonymous(column_names, dtypes)?;
+    builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
+    builder.finish()
+}
 
 /// A columnar dataframe with lazy evaluation.
 pub struct SFrame {
@@ -72,39 +286,72 @@ impl SFrame {
     }
 
     /// Read a CSV file into an SFrame.
+    ///
+    /// Parses the CSV in chunks to limit peak memory: the file is tokenized
+    /// and types are inferred up-front, then rows are converted and written
+    /// to the cache in `DEFAULT_CHUNK_SIZE` increments.  Each chunk is an
+    /// independent parse unit (the C++ "split at line boundaries, parse
+    /// independently" strategy — tokenization is serial, but row→FlexType
+    /// conversion is per-chunk and parallelizable).
     pub fn from_csv(path: &str, options: Option<CsvOptions>) -> Result<Self> {
         let opts = options.unwrap_or_default();
-        let (col_names, batch) = read_csv(path, &opts)?;
+        let content = std::fs::read_to_string(path).map_err(SFrameError::Io)?;
+        let schema = csv_parser::tokenize_and_infer(&content, &opts)?;
 
-        let plan = PlannerNode::materialized(batch.clone());
-        let num_rows = batch.num_rows() as u64;
-        let dtypes = batch.dtypes();
+        // Resolve output names/types (respects output_columns subsetting)
+        let (out_names, out_types) = schema.output_names_types();
 
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| {
-                SArray::from_plan(plan.clone(), dtype, Some(num_rows), i)
-            })
-            .collect();
+        if schema.raw_rows.is_empty() {
+            let batch = SFrameRows::empty(&out_types);
+            let plan = PlannerNode::materialized(batch);
+            let columns: Vec<SArray> = out_types
+                .iter()
+                .enumerate()
+                .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(0), i))
+                .collect();
+            return Ok(SFrame::new_with_columns(columns, out_names));
+        }
 
-        Ok(SFrame::new_with_columns(columns, col_names))
+        let mut builder = SFrameBuilder::anonymous(out_names, out_types)?;
+
+        let total = schema.raw_rows.len();
+        let mut offset = 0;
+        while offset < total {
+            let end = (offset + DEFAULT_CHUNK_SIZE).min(total);
+            let col_vecs = csv_parser::parse_rows_range(&schema, offset, end)?;
+            builder.write_columns(&col_vecs)?;
+            offset = end;
+        }
+
+        builder.finish()
     }
 
     /// Read a JSON Lines file into an SFrame.
+    ///
+    /// Parses the JSON file up-front to discover column names and types,
+    /// then writes rows to the cache in `DEFAULT_CHUNK_SIZE` chunks.
     pub fn from_json(path: &str) -> Result<Self> {
-        let (col_names, batch) = json_io::read_json_file(path)?;
-        let plan = PlannerNode::materialized(batch.clone());
-        let num_rows = batch.num_rows() as u64;
-        let dtypes = batch.dtypes();
+        let parsed = json_io::parse_json_file_schema(path)?;
 
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-            .collect();
+        if parsed.rows.is_empty() {
+            return Ok(SFrame::new_with_columns(Vec::new(), Vec::new()));
+        }
 
-        Ok(SFrame::new_with_columns(columns, col_names))
+        let mut builder = SFrameBuilder::anonymous(
+            parsed.column_names.clone(),
+            parsed.column_types.clone(),
+        )?;
+
+        let total = parsed.rows.len();
+        let mut offset = 0;
+        while offset < total {
+            let end = (offset + DEFAULT_CHUNK_SIZE).min(total);
+            let col_vecs = json_io::rows_to_columns_range(&parsed, offset, end);
+            builder.write_columns(&col_vecs)?;
+            offset = end;
+        }
+
+        builder.finish()
     }
 
     /// Build an SFrame from named columns.
@@ -300,6 +547,10 @@ impl SFrame {
     }
 
     /// Sort by one or more columns.
+    ///
+    /// Uses `sort_indices` to compute the sort permutation without copying
+    /// the full dataset, then writes the reordered rows in chunks via
+    /// `CacheSFrameBuilder::write_indexed_chunked`.
     pub fn sort(&self, keys: &[(&str, SortOrder)]) -> Result<SFrame> {
         let sort_keys: Vec<SortKey> = keys
             .iter()
@@ -315,8 +566,16 @@ impl SFrame {
         let stream = self.compile_stream()?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-        let sorted = rt.block_on(sort::sort(stream, &sort_keys))?;
-        self.from_batch(sorted)
+        let (batch, indices) = rt.block_on(sort::sort_indices(stream, &sort_keys))?;
+
+        if batch.num_rows() == 0 {
+            return self.from_batch(batch);
+        }
+
+        let mut builder =
+            SFrameBuilder::anonymous(self.column_names.clone(), self.column_types())?;
+        builder.write_indexed_chunked(&batch, &indices, DEFAULT_CHUNK_SIZE)?;
+        builder.finish()
     }
 
     /// Join with another SFrame on a single column.
@@ -375,17 +634,7 @@ impl SFrame {
             }
         }
 
-        let dtypes = joined.dtypes();
-        let plan = PlannerNode::materialized(joined.clone());
-        let num_rows = joined.num_rows() as u64;
-
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-            .collect();
-
-        Ok(SFrame::new_with_columns(columns, names))
+        write_to_cache(joined, names)
     }
 
     /// Group by columns and aggregate.
@@ -407,17 +656,7 @@ impl SFrame {
             names.push(spec.output_name.clone());
         }
 
-        let dtypes = grouped.dtypes();
-        let plan = PlannerNode::materialized(grouped.clone());
-        let num_rows = grouped.num_rows() as u64;
-
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-            .collect();
-
-        Ok(SFrame::new_with_columns(columns, names))
+        write_to_cache(grouped, names)
     }
 
     // === Phase 11.1: Column Mutation ===
@@ -646,17 +885,7 @@ impl SFrame {
         new_dtypes.push(FlexTypeEnum::Dict);
 
         let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
-        let plan = PlannerNode::materialized(result.clone());
-        let num_rows = result.num_rows() as u64;
-        let dtypes = result.dtypes();
-
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-            .collect();
-
-        Ok(SFrame::new_with_columns(columns, new_names))
+        write_to_cache(result, new_names)
     }
 
     /// Unpack a Dict/List column into separate columns.
@@ -739,15 +968,7 @@ impl SFrame {
                 }
 
                 let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
-                let plan = PlannerNode::materialized(result.clone());
-                let num_rows = result.num_rows() as u64;
-                let dtypes = result.dtypes();
-
-                let columns: Vec<SArray> = dtypes.iter().enumerate()
-                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-                    .collect();
-
-                Ok(SFrame::new_with_columns(columns, new_names))
+                write_to_cache(result, new_names)
             }
             FlexTypeEnum::List => {
                 // Determine max list length
@@ -800,15 +1021,7 @@ impl SFrame {
                 }
 
                 let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
-                let plan = PlannerNode::materialized(result.clone());
-                let num_rows = result.num_rows() as u64;
-                let dtypes = result.dtypes();
-
-                let columns: Vec<SArray> = dtypes.iter().enumerate()
-                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-                    .collect();
-
-                Ok(SFrame::new_with_columns(columns, new_names))
+                write_to_cache(result, new_names)
             }
             _ => Err(SFrameError::Format(format!(
                 "Cannot unpack column '{}' of type {:?}; expected Dict or List",
@@ -894,15 +1107,7 @@ impl SFrame {
                 }
 
                 let result = SFrameRows::from_column_vecs(col_vecs, &new_dtypes)?;
-                let plan = PlannerNode::materialized(result.clone());
-                let out_rows = result.num_rows() as u64;
-                let dtypes = result.dtypes();
-
-                let columns: Vec<SArray> = dtypes.iter().enumerate()
-                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(out_rows), i))
-                    .collect();
-
-                Ok(SFrame::new_with_columns(columns, new_names))
+                write_to_cache(result, new_names)
             }
             _ => Err(SFrameError::Format(format!(
                 "Cannot stack column '{}' of type {:?}; expected List or Vector",
@@ -1084,17 +1289,7 @@ impl SFrame {
     }
 
     fn from_batch(&self, batch: SFrameRows) -> Result<SFrame> {
-        let plan = PlannerNode::materialized(batch.clone());
-        let num_rows = batch.num_rows() as u64;
-        let dtypes = batch.dtypes();
-
-        let columns: Vec<SArray> = dtypes
-            .iter()
-            .enumerate()
-            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
-            .collect();
-
-        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
+        write_to_cache(batch, self.column_names.clone())
     }
 }
 
@@ -1234,10 +1429,21 @@ impl SFrameStreamWriter {
         self.inner.set_metadata(key, value);
     }
 
+    /// Create a new streaming writer using a specific VFS backend.
+    pub fn with_vfs(
+        vfs: Arc<dyn VirtualFileSystem>,
+        path: &str,
+        column_names: &[&str],
+        column_types: &[FlexTypeEnum],
+    ) -> Result<Self> {
+        let inner = SFrameWriter::with_vfs(vfs, path, column_names, column_types)?;
+        Ok(SFrameStreamWriter { inner })
+    }
+
     /// Finalize: flush remaining buffered data, write segment footer
     /// and metadata files.
     pub fn finish(self) -> Result<()> {
-        self.inner.finish()
+        self.inner.finish().map(|_| ())
     }
 }
 

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 sframe-types = { path = "../sframe-types" }
 sframe-storage = { path = "../sframe-storage" }
+sframe-io = { path = "../sframe-io" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 futures = "0.3"
 pin-project-lite = "0.2"
@@ -14,4 +15,3 @@ rayon = "1.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-tempfile = "3"

@@ -9,6 +9,9 @@ use std::sync::Arc;
 use futures::stream::{self, Stream, StreamExt};
 
 use rayon::prelude::*;
+use sframe_io::cache_fs::global_cache_fs;
+use sframe_io::local_fs::LocalFileSystem;
+use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_storage::sframe_reader::SFrameReader;
 use sframe_storage::segment_reader::SegmentReader;
 use sframe_types::error::{Result, SFrameError};
@@ -40,6 +43,7 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
             column_names: _,
             column_types,
             num_rows,
+            ..
         } => compile_sframe_source(path, column_types, *num_rows),
 
         LogicalOp::MaterializedSource { data } => {
@@ -164,12 +168,22 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
 /// Uses rayon to read multiple segments concurrently when the SFrame has
 /// more than one segment. Each segment opens its own file handle, enabling
 /// true parallel I/O on SSDs.
+///
+/// For `cache://` paths, reads go through the global CacheFs VFS so that
+/// in-memory cached segments are served without disk I/O.
 fn compile_sframe_source(
     path: &str,
     column_types: &[FlexTypeEnum],
     _num_rows: u64,
 ) -> Result<BatchStream> {
-    let reader = SFrameReader::open(path)?;
+    let is_cache = path.starts_with("cache://");
+    let vfs: Arc<dyn VirtualFileSystem> = if is_cache {
+        Arc::new(ArcCacheFsVfs(global_cache_fs().clone()))
+    } else {
+        Arc::new(LocalFileSystem)
+    };
+
+    let reader = SFrameReader::open_with_fs(&*vfs, path)?;
     let num_segments = reader.num_segments();
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
 
@@ -183,17 +197,18 @@ fn compile_sframe_source(
 
     // Read segments in parallel using rayon.
     // Each segment opens its own file handle for independent I/O.
+    let vfs_ref: &dyn VirtualFileSystem = &*vfs;
     let all_segment_data: Vec<Result<Vec<Vec<FlexType>>>> = if num_segments <= 1 {
         // Single segment: no parallelism overhead
         segment_paths
             .iter()
-            .map(|seg_path| read_segment_independently(seg_path, &dtypes))
+            .map(|seg_path| read_segment_independently(vfs_ref, seg_path, &dtypes))
             .collect()
     } else {
         // Multiple segments: parallel reads
         segment_paths
             .par_iter()
-            .map(|seg_path| read_segment_independently(seg_path, &dtypes))
+            .map(|seg_path| read_segment_independently(vfs_ref, seg_path, &dtypes))
             .collect()
     };
 
@@ -224,13 +239,14 @@ fn compile_sframe_source(
 
 /// Read all columns from a segment file independently.
 ///
-/// Opens its own file handle, so it can be called from any thread.
+/// Opens its own file handle via the given VFS, so it can be called from any thread.
 fn read_segment_independently(
+    vfs: &dyn VirtualFileSystem,
     segment_path: &str,
     column_types: &[FlexTypeEnum],
 ) -> Result<Vec<Vec<FlexType>>> {
-    let file = std::fs::File::open(segment_path).map_err(SFrameError::Io)?;
-    let file_size = file.metadata().map_err(SFrameError::Io)?.len();
+    let file = vfs.open_read(segment_path)?;
+    let file_size = file.size()?;
     let mut seg_reader = SegmentReader::open(
         Box::new(file),
         file_size,

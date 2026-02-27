@@ -197,12 +197,13 @@ fn rebuild_with_inputs(plan: &Arc<PlannerNode>, new_inputs: Vec<Arc<PlannerNode>
 /// Clone a LogicalOp (needed because it contains Arc closures, not plain Clone).
 fn clone_op(op: &LogicalOp) -> LogicalOp {
     match op {
-        LogicalOp::SFrameSource { path, column_names, column_types, num_rows } => {
+        LogicalOp::SFrameSource { path, column_names, column_types, num_rows, _keep_alive } => {
             LogicalOp::SFrameSource {
                 path: path.clone(),
                 column_names: column_names.clone(),
                 column_types: column_types.clone(),
                 num_rows: *num_rows,
+                _keep_alive: _keep_alive.clone(),
             }
         }
         LogicalOp::Project { column_indices } => LogicalOp::Project { column_indices: column_indices.clone() },

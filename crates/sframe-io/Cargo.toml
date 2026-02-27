@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sframe-types = { path = "../sframe-types" }
+sframe-config = { path = "../sframe-config" }
 ureq = { version = "3", optional = true }
 
 [features]

@@ -3,8 +3,6 @@
 //! Reads a dir_archive (directory containing dir_archive.ini, frame_idx,
 //! sidx, and segment files) and provides access to column data.
 
-use std::path::Path;
-
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::VirtualFileSystem;
 use sframe_types::error::{Result, SFrameError};
@@ -64,13 +62,7 @@ impl SFrameReader {
         for seg_file in &group_index.segment_files {
             let seg_path = format!("{}/{}", base_path, seg_file);
             let file = fs.open_read(&seg_path)?;
-            let file_size = {
-                // Get file size from metadata
-                let path = Path::new(&seg_path);
-                path.metadata()
-                    .map_err(|e| SFrameError::Io(e))?
-                    .len()
-            };
+            let file_size = file.size()?;
 
             // Box the file as ReadSeek
             let reader = SegmentReader::open(

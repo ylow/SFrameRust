@@ -12,7 +12,10 @@ use serde_json::Value as JsonValue;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
-use crate::batch::{ColumnData, SFrameRows};
+use crate::batch::SFrameRows;
+
+#[cfg(test)]
+use crate::batch::ColumnData;
 
 /// Convert a FlexType to a JSON value.
 pub fn flex_to_json(val: &FlexType) -> JsonValue {
@@ -119,22 +122,58 @@ pub fn write_json_string(batch: &SFrameRows, column_names: &[String]) -> Result<
     Ok(output)
 }
 
-/// Read a JSON Lines file into column data.
-///
-/// Returns `(column_names, SFrameRows)`.
-pub fn read_json_file(path: &str) -> Result<(Vec<String>, SFrameRows)> {
+// ---------------------------------------------------------------------------
+// Chunked API
+// ---------------------------------------------------------------------------
+
+/// Parsed JSON data with schema, ready for chunked column conversion.
+pub struct JsonSchema {
+    pub column_names: Vec<String>,
+    pub column_types: Vec<FlexTypeEnum>,
+    /// Row-major parsed data. Each row maps column name → FlexType.
+    pub rows: Vec<HashMap<String, FlexType>>,
+}
+
+/// Parse a JSON Lines file into a [`JsonSchema`] without building SFrameRows.
+pub fn parse_json_file_schema(path: &str) -> Result<JsonSchema> {
     let file = std::fs::File::open(path).map_err(SFrameError::Io)?;
     let reader = BufReader::new(file);
-    read_json_lines(reader)
+    build_json_schema(reader)
 }
 
-/// Read JSON Lines from a string.
-pub fn read_json_string(content: &str) -> Result<(Vec<String>, SFrameRows)> {
+/// Parse a JSON Lines string into a [`JsonSchema`].
+pub fn parse_json_string_schema(content: &str) -> Result<JsonSchema> {
     let reader = BufReader::new(content.as_bytes());
-    read_json_lines(reader)
+    build_json_schema(reader)
 }
 
-fn read_json_lines<R: BufRead>(reader: R) -> Result<(Vec<String>, SFrameRows)> {
+/// Convert rows `[start..end)` from a [`JsonSchema`] into column-oriented
+/// `Vec<Vec<FlexType>>`.
+pub fn rows_to_columns_range(
+    schema: &JsonSchema,
+    start: usize,
+    end: usize,
+) -> Vec<Vec<FlexType>> {
+    let end = end.min(schema.rows.len());
+    let chunk_len = end.saturating_sub(start);
+    let ncols = schema.column_names.len();
+
+    let mut col_vecs: Vec<Vec<FlexType>> = (0..ncols)
+        .map(|_| Vec::with_capacity(chunk_len))
+        .collect();
+
+    for row_idx in start..end {
+        let row = &schema.rows[row_idx];
+        for (i, name) in schema.column_names.iter().enumerate() {
+            let val = row.get(name).cloned().unwrap_or(FlexType::Undefined);
+            col_vecs[i].push(val);
+        }
+    }
+
+    col_vecs
+}
+
+fn build_json_schema<R: BufRead>(reader: R) -> Result<JsonSchema> {
     let mut rows: Vec<HashMap<String, FlexType>> = Vec::new();
     let mut col_order: Vec<String> = Vec::new();
 
@@ -164,10 +203,6 @@ fn read_json_lines<R: BufRead>(reader: R) -> Result<(Vec<String>, SFrameRows)> {
         }
     }
 
-    if rows.is_empty() {
-        return Ok((vec![], SFrameRows::empty(&[])));
-    }
-
     // Infer types from first non-null value in each column
     let col_types: Vec<FlexTypeEnum> = col_order
         .iter()
@@ -190,17 +225,38 @@ fn read_json_lines<R: BufRead>(reader: R) -> Result<(Vec<String>, SFrameRows)> {
         })
         .collect();
 
-    // Build column vectors
-    let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::with_capacity(rows.len()); col_order.len()];
-    for row in &rows {
-        for (i, name) in col_order.iter().enumerate() {
-            let val = row.get(name).cloned().unwrap_or(FlexType::Undefined);
-            col_vecs[i].push(val);
-        }
-    }
+    Ok(JsonSchema {
+        column_names: col_order,
+        column_types: col_types,
+        rows,
+    })
+}
 
-    let batch = SFrameRows::from_column_vecs(col_vecs, &col_types)?;
-    Ok((col_order, batch))
+// ---------------------------------------------------------------------------
+// Legacy API (delegates to chunked pipeline)
+// ---------------------------------------------------------------------------
+
+/// Read a JSON Lines file into column data.
+///
+/// Returns `(column_names, SFrameRows)`.
+pub fn read_json_file(path: &str) -> Result<(Vec<String>, SFrameRows)> {
+    let schema = parse_json_file_schema(path)?;
+    json_schema_to_batch(schema)
+}
+
+/// Read JSON Lines from a string.
+pub fn read_json_string(content: &str) -> Result<(Vec<String>, SFrameRows)> {
+    let schema = parse_json_string_schema(content)?;
+    json_schema_to_batch(schema)
+}
+
+fn json_schema_to_batch(schema: JsonSchema) -> Result<(Vec<String>, SFrameRows)> {
+    if schema.rows.is_empty() {
+        return Ok((vec![], SFrameRows::empty(&[])));
+    }
+    let col_vecs = rows_to_columns_range(&schema, 0, schema.rows.len());
+    let batch = SFrameRows::from_column_vecs(col_vecs, &schema.column_types)?;
+    Ok((schema.column_names, batch))
 }
 
 #[cfg(test)]

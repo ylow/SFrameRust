@@ -4,3 +4,4 @@ pub mod http_fs;
 pub mod s3_fs;
 pub mod hdfs_fs;
 pub mod cache;
+pub mod cache_fs;

@@ -4,8 +4,14 @@
 //! groupby and reduce operations.
 
 use std::any::Any;
+use std::io::{Read, Write};
 
+use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::serialization::{
+    read_f64, read_i64, read_u64, read_u8, write_f64, write_i64, write_u64, write_u8,
+    read_flex_type, write_flex_type, read_string, write_string,
+};
 
 use crate::planner::Aggregator;
 
@@ -54,6 +60,15 @@ impl Aggregator for CountAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.count)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.count = read_u64(reader)?;
+        Ok(())
     }
 }
 
@@ -141,6 +156,22 @@ impl Aggregator for SumAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_i64(writer, self.int_sum)?;
+        write_f64(writer, self.float_sum)?;
+        write_u8(writer, self.is_float as u8)?;
+        write_u8(writer, self.has_value as u8)?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.int_sum = read_i64(reader)?;
+        self.float_sum = read_f64(reader)?;
+        self.is_float = read_u8(reader)? != 0;
+        self.has_value = read_u8(reader)? != 0;
+        Ok(())
+    }
 }
 
 /// Mean aggregator — computes arithmetic mean.
@@ -205,6 +236,18 @@ impl Aggregator for MeanAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_f64(writer, self.sum)?;
+        write_u64(writer, self.count)?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.sum = read_f64(reader)?;
+        self.count = read_u64(reader)?;
+        Ok(())
     }
 }
 
@@ -287,6 +330,24 @@ impl Aggregator for MinAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.min_int.is_some() as u8)?;
+        write_i64(writer, self.min_int.unwrap_or(0))?;
+        write_u8(writer, self.min_float.is_some() as u8)?;
+        write_f64(writer, self.min_float.unwrap_or(0.0))?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let has_int = read_u8(reader)? != 0;
+        let int_val = read_i64(reader)?;
+        self.min_int = if has_int { Some(int_val) } else { None };
+        let has_float = read_u8(reader)? != 0;
+        let float_val = read_f64(reader)?;
+        self.min_float = if has_float { Some(float_val) } else { None };
+        Ok(())
+    }
 }
 
 /// Max aggregator — finds the maximum value.
@@ -367,6 +428,24 @@ impl Aggregator for MaxAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.max_int.is_some() as u8)?;
+        write_i64(writer, self.max_int.unwrap_or(0))?;
+        write_u8(writer, self.max_float.is_some() as u8)?;
+        write_f64(writer, self.max_float.unwrap_or(0.0))?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let has_int = read_u8(reader)? != 0;
+        let int_val = read_i64(reader)?;
+        self.max_int = if has_int { Some(int_val) } else { None };
+        let has_float = read_u8(reader)? != 0;
+        let float_val = read_f64(reader)?;
+        self.max_float = if has_float { Some(float_val) } else { None };
+        Ok(())
     }
 }
 
@@ -455,6 +534,22 @@ impl Aggregator for VarianceAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.count)?;
+        write_f64(writer, self.mean)?;
+        write_f64(writer, self.m2)?;
+        write_u64(writer, self.ddof)?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.count = read_u64(reader)?;
+        self.mean = read_f64(reader)?;
+        self.m2 = read_f64(reader)?;
+        self.ddof = read_u64(reader)?;
+        Ok(())
+    }
 }
 
 /// StdDev aggregator — standard deviation (sqrt of variance).
@@ -506,6 +601,14 @@ impl Aggregator for StdDevAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        self.var_agg.save(writer)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.var_agg.load(reader)
+    }
 }
 
 /// Concat aggregator — collects values into a List.
@@ -553,6 +656,24 @@ impl Aggregator for ConcatAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.values.len() as u64)?;
+        for v in &self.values {
+            write_flex_type(writer, v)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let len = read_u64(reader)? as usize;
+        self.values.clear();
+        self.values.reserve(len);
+        for _ in 0..len {
+            self.values.push(read_flex_type(reader)?);
+        }
+        Ok(())
     }
 }
 
@@ -608,6 +729,24 @@ impl Aggregator for CountDistinctAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.seen.len() as u64)?;
+        for s in &self.seen {
+            write_string(writer, s)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let len = read_u64(reader)? as usize;
+        self.seen.clear();
+        self.seen.reserve(len);
+        for _ in 0..len {
+            self.seen.insert(read_string(reader)?);
+        }
+        Ok(())
+    }
 }
 
 /// Count non-Undefined values aggregator.
@@ -655,6 +794,15 @@ impl Aggregator for NonNullCountAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.count)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.count = read_u64(reader)?;
+        Ok(())
     }
 }
 
@@ -709,6 +857,24 @@ impl Aggregator for SelectOneAggregator {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.value.is_some() as u8)?;
+        if let Some(v) = &self.value {
+            write_flex_type(writer, v)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let has_value = read_u8(reader)? != 0;
+        self.value = if has_value {
+            Some(read_flex_type(reader)?)
+        } else {
+            None
+        };
+        Ok(())
     }
 }
 
@@ -772,6 +938,26 @@ impl Aggregator for QuantileAggregator {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_f64(writer, self.quantile)?;
+        write_u64(writer, self.values.len() as u64)?;
+        for &v in &self.values {
+            write_f64(writer, v)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.quantile = read_f64(reader)?;
+        let len = read_u64(reader)? as usize;
+        self.values.clear();
+        self.values.reserve(len);
+        for _ in 0..len {
+            self.values.push(read_f64(reader)?);
+        }
+        Ok(())
+    }
 }
 
 /// Frequency count aggregator — returns a Dict mapping value → count.
@@ -818,6 +1004,27 @@ impl Aggregator for FrequencyCountAggregator {
 
     fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.counts.len() as u64)?;
+        for (k, &v) in &self.counts {
+            write_string(writer, k)?;
+            write_u64(writer, v)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let len = read_u64(reader)? as usize;
+        self.counts.clear();
+        self.counts.reserve(len);
+        for _ in 0..len {
+            let k = read_string(reader)?;
+            let v = read_u64(reader)?;
+            self.counts.insert(k, v);
+        }
+        Ok(())
+    }
 }
 
 /// Collect values into a List.
@@ -855,6 +1062,24 @@ impl Aggregator for ZipListAggregator {
 
     fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.values.len() as u64)?;
+        for v in &self.values {
+            write_flex_type(writer, v)?;
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let len = read_u64(reader)? as usize;
+        self.values.clear();
+        self.values.reserve(len);
+        for _ in 0..len {
+            self.values.push(read_flex_type(reader)?);
+        }
+        Ok(())
+    }
 }
 
 /// Element-wise sum of Vector columns.
@@ -913,6 +1138,32 @@ impl Aggregator for VectorSumAggregator {
 
     fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.sum.is_some() as u8)?;
+        if let Some(s) = &self.sum {
+            write_u64(writer, s.len() as u64)?;
+            for &v in s {
+                write_f64(writer, v)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let has_value = read_u8(reader)? != 0;
+        self.sum = if has_value {
+            let len = read_u64(reader)? as usize;
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(read_f64(reader)?);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        Ok(())
+    }
 }
 
 /// Element-wise average of Vector columns.
@@ -975,6 +1226,34 @@ impl Aggregator for VectorAvgAggregator {
 
     fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
     fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.sum.is_some() as u8)?;
+        if let Some(s) = &self.sum {
+            write_u64(writer, s.len() as u64)?;
+            for &v in s {
+                write_f64(writer, v)?;
+            }
+        }
+        write_u64(writer, self.count)?;
+        Ok(())
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        let has_value = read_u8(reader)? != 0;
+        self.sum = if has_value {
+            let len = read_u64(reader)? as usize;
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(read_f64(reader)?);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        self.count = read_u64(reader)?;
+        Ok(())
+    }
 }
 
 /// Specification for a groupby aggregation.

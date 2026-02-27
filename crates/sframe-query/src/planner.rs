@@ -3,8 +3,10 @@
 //! DAG of PlannerNodes representing query operations. Nodes are Arc-shared
 //! so the same subexpression can appear in multiple places.
 
+use std::io::{Read, Write};
 use std::sync::Arc;
 
+use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
@@ -17,12 +19,14 @@ pub struct PlannerNode {
 
 /// Logical operations in the query plan.
 pub enum LogicalOp {
-    /// Read an SFrame from disk.
+    /// Read an SFrame from disk (or from cache://).
     SFrameSource {
         path: String,
         column_names: Vec<String>,
         column_types: Vec<FlexTypeEnum>,
         num_rows: u64,
+        /// Keeps the backing store alive (e.g. AnonymousStore for cache:// paths).
+        _keep_alive: Option<Arc<dyn Send + Sync>>,
     },
 
     /// Select specific columns by index.
@@ -100,6 +104,15 @@ pub trait Aggregator: Send + Sync {
 
     /// Downcast support for merge operations.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Serialize aggregator state to a writer (for spill-to-disk).
+    fn save(&self, writer: &mut dyn Write) -> Result<()>;
+
+    /// Deserialize aggregator state from a reader (for spill-to-disk).
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()>;
+
+    /// Pre-spill hook called before serialization. Default is no-op.
+    fn partial_finalize(&mut self) {}
 }
 
 impl PlannerNode {
@@ -116,6 +129,27 @@ impl PlannerNode {
                 column_names,
                 column_types,
                 num_rows,
+                _keep_alive: None,
+            },
+            inputs: vec![],
+        })
+    }
+
+    /// Create a source node backed by a cache:// path with a keep-alive guard.
+    pub fn sframe_source_cached(
+        path: &str,
+        column_names: Vec<String>,
+        column_types: Vec<FlexTypeEnum>,
+        num_rows: u64,
+        keep_alive: Arc<dyn Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(PlannerNode {
+            op: LogicalOp::SFrameSource {
+                path: path.to_string(),
+                column_names,
+                column_types,
+                num_rows,
+                _keep_alive: Some(keep_alive),
             },
             inputs: vec![],
         })
