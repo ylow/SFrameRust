@@ -445,6 +445,73 @@ impl SArray {
         )
     }
 
+    // === Phase 8.4: Type Casting ===
+
+    /// Cast elements to a different type.
+    ///
+    /// If `undefined_on_failure` is true, values that can't be converted become
+    /// Undefined. Otherwise, best-effort conversion is used.
+    pub fn astype(&self, target: FlexTypeEnum, undefined_on_failure: bool) -> SArray {
+        self.apply(
+            Arc::new(move |v| {
+                let result = match (&v, target) {
+                    // Same type — no conversion
+                    (FlexType::Integer(_), FlexTypeEnum::Integer) => v.clone(),
+                    (FlexType::Float(_), FlexTypeEnum::Float) => v.clone(),
+                    (FlexType::String(_), FlexTypeEnum::String) => v.clone(),
+
+                    // Int ↔ Float
+                    (FlexType::Integer(i), FlexTypeEnum::Float) => FlexType::Float(*i as f64),
+                    (FlexType::Float(f), FlexTypeEnum::Integer) => FlexType::Integer(*f as i64),
+
+                    // Numeric → String
+                    (FlexType::Integer(i), FlexTypeEnum::String) => FlexType::String(i.to_string().into()),
+                    (FlexType::Float(f), FlexTypeEnum::String) => FlexType::String(format!("{}", f).into()),
+
+                    // String → Numeric (parse)
+                    (FlexType::String(s), FlexTypeEnum::Integer) => {
+                        match s.parse::<i64>() {
+                            Ok(i) => FlexType::Integer(i),
+                            Err(_) => {
+                                // Try parsing as float first then truncate
+                                match s.parse::<f64>() {
+                                    Ok(f) => FlexType::Integer(f as i64),
+                                    Err(_) => {
+                                        if undefined_on_failure { FlexType::Undefined }
+                                        else { v.clone() }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (FlexType::String(s), FlexTypeEnum::Float) => {
+                        match s.parse::<f64>() {
+                            Ok(f) => FlexType::Float(f),
+                            Err(_) => {
+                                if undefined_on_failure { FlexType::Undefined }
+                                else { v.clone() }
+                            }
+                        }
+                    }
+
+                    // Anything → String (format)
+                    (_, FlexTypeEnum::String) => FlexType::String(format!("{}", v).into()),
+
+                    // Undefined stays Undefined
+                    (FlexType::Undefined, _) => FlexType::Undefined,
+
+                    // Other conversions
+                    _ => {
+                        if undefined_on_failure { FlexType::Undefined }
+                        else { v.clone() }
+                    }
+                };
+                result
+            }),
+            target,
+        )
+    }
+
     // === Phase 10.4: Reduction operations ===
 
     /// Sum of all values.
@@ -1443,6 +1510,45 @@ mod tests {
             clipped.to_vec().unwrap(),
             vec![FlexType::Integer(3), FlexType::Integer(5), FlexType::Integer(7)]
         );
+    }
+
+    // === Phase 8.4 Tests ===
+
+    #[test]
+    fn test_astype_int_to_float() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+
+        let floats = sa.astype(FlexTypeEnum::Float, false);
+        assert_eq!(floats.dtype(), FlexTypeEnum::Float);
+        assert_eq!(floats.to_vec().unwrap(), vec![FlexType::Float(1.0), FlexType::Float(2.0), FlexType::Float(3.0)]);
+    }
+
+    #[test]
+    fn test_astype_string_to_int() {
+        let sa = SArray::from_vec(
+            vec![FlexType::String("42".into()), FlexType::String("bad".into()), FlexType::String("7".into())],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let ints = sa.astype(FlexTypeEnum::Integer, true);
+        let vals = ints.to_vec().unwrap();
+        assert_eq!(vals[0], FlexType::Integer(42));
+        assert_eq!(vals[1], FlexType::Undefined); // "bad" → Undefined
+        assert_eq!(vals[2], FlexType::Integer(7));
+    }
+
+    #[test]
+    fn test_astype_int_to_string() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(42)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+
+        let strings = sa.astype(FlexTypeEnum::String, false);
+        assert_eq!(strings.to_vec().unwrap(), vec![FlexType::String("42".into())]);
     }
 
     // === Phase 10.5-10.8 Tests ===

@@ -774,6 +774,209 @@ impl Aggregator for QuantileAggregator {
     }
 }
 
+/// Frequency count aggregator — returns a Dict mapping value → count.
+#[derive(Clone)]
+pub struct FrequencyCountAggregator {
+    counts: std::collections::HashMap<String, u64>,
+}
+
+impl FrequencyCountAggregator {
+    pub fn new() -> Self {
+        FrequencyCountAggregator { counts: std::collections::HashMap::new() }
+    }
+}
+
+impl Aggregator for FrequencyCountAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if let Some(v) = values.first() {
+            if !matches!(v, FlexType::Undefined) {
+                let key = format!("{}", v);
+                *self.counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            for (k, v) in &o.counts {
+                *self.counts.entry(k.clone()).or_insert(0) += v;
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        let entries: Vec<(FlexType, FlexType)> = self.counts
+            .iter()
+            .map(|(k, &v)| (FlexType::String(k.clone().into()), FlexType::Integer(v as i64)))
+            .collect();
+        FlexType::Dict(std::sync::Arc::from(entries))
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Dict
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+/// Collect values into a List.
+#[derive(Clone)]
+pub struct ZipListAggregator {
+    values: Vec<FlexType>,
+}
+
+impl ZipListAggregator {
+    pub fn new() -> Self {
+        ZipListAggregator { values: Vec::new() }
+    }
+}
+
+impl Aggregator for ZipListAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if let Some(v) = values.first() {
+            self.values.push(v.clone());
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            self.values.extend(o.values.iter().cloned());
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::List(std::sync::Arc::from(self.values.clone()))
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::List
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+/// Element-wise sum of Vector columns.
+#[derive(Clone)]
+pub struct VectorSumAggregator {
+    sum: Option<Vec<f64>>,
+}
+
+impl VectorSumAggregator {
+    pub fn new() -> Self {
+        VectorSumAggregator { sum: None }
+    }
+}
+
+impl Aggregator for VectorSumAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if let Some(FlexType::Vector(v)) = values.first() {
+            match &mut self.sum {
+                None => self.sum = Some(v.to_vec()),
+                Some(s) => {
+                    for (i, &val) in v.iter().enumerate() {
+                        if i < s.len() {
+                            s[i] += val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            if let Some(other_sum) = &o.sum {
+                match &mut self.sum {
+                    None => self.sum = Some(other_sum.clone()),
+                    Some(s) => {
+                        for (i, &val) in other_sum.iter().enumerate() {
+                            if i < s.len() { s[i] += val; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        match &self.sum {
+            Some(s) => FlexType::Vector(std::sync::Arc::from(s.clone())),
+            None => FlexType::Undefined,
+        }
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Vector
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+/// Element-wise average of Vector columns.
+#[derive(Clone)]
+pub struct VectorAvgAggregator {
+    sum: Option<Vec<f64>>,
+    count: u64,
+}
+
+impl VectorAvgAggregator {
+    pub fn new() -> Self {
+        VectorAvgAggregator { sum: None, count: 0 }
+    }
+}
+
+impl Aggregator for VectorAvgAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if let Some(FlexType::Vector(v)) = values.first() {
+            self.count += 1;
+            match &mut self.sum {
+                None => self.sum = Some(v.to_vec()),
+                Some(s) => {
+                    for (i, &val) in v.iter().enumerate() {
+                        if i < s.len() { s[i] += val; }
+                    }
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<Self>() {
+            self.count += o.count;
+            if let Some(other_sum) = &o.sum {
+                match &mut self.sum {
+                    None => self.sum = Some(other_sum.clone()),
+                    Some(s) => {
+                        for (i, &val) in other_sum.iter().enumerate() {
+                            if i < s.len() { s[i] += val; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        match &self.sum {
+            Some(s) if self.count > 0 => {
+                let avg: Vec<f64> = s.iter().map(|v| v / self.count as f64).collect();
+                FlexType::Vector(std::sync::Arc::from(avg))
+            }
+            _ => FlexType::Undefined,
+        }
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Vector
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
 /// Specification for a groupby aggregation.
 #[derive(Clone)]
 pub struct AggSpec {
@@ -840,6 +1043,22 @@ impl AggSpec {
 
     pub fn select_one(column: usize, output_name: &str) -> Self {
         Self::new(column, Box::new(SelectOneAggregator::new()), output_name)
+    }
+
+    pub fn frequency_count(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(FrequencyCountAggregator::new()), output_name)
+    }
+
+    pub fn zip_list(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(ZipListAggregator::new()), output_name)
+    }
+
+    pub fn vector_sum(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(VectorSumAggregator::new()), output_name)
+    }
+
+    pub fn vector_avg(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(VectorAvgAggregator::new()), output_name)
     }
 }
 
@@ -1028,5 +1247,69 @@ mod tests {
         let _ = AggSpec::quantile(0, 0.5, "median");
         let _ = AggSpec::median(0, "median");
         let _ = AggSpec::select_one(0, "first");
+        let _ = AggSpec::frequency_count(0, "freq");
+        let _ = AggSpec::zip_list(0, "zipped");
+        let _ = AggSpec::vector_sum(0, "vsum");
+        let _ = AggSpec::vector_avg(0, "vavg");
+    }
+
+    #[test]
+    fn test_frequency_count() {
+        let mut agg = FrequencyCountAggregator::new();
+        agg.add(&[FlexType::String("a".into())]);
+        agg.add(&[FlexType::String("b".into())]);
+        agg.add(&[FlexType::String("a".into())]);
+        agg.add(&[FlexType::String("c".into())]);
+        agg.add(&[FlexType::String("a".into())]);
+        let result = agg.finalize();
+        if let FlexType::Dict(d) = result {
+            let a_count = d.iter().find(|(k, _)| k == &FlexType::String("a".into()))
+                .map(|(_, v)| v.clone());
+            assert_eq!(a_count, Some(FlexType::Integer(3)));
+        } else {
+            panic!("Expected Dict");
+        }
+    }
+
+    #[test]
+    fn test_zip_list() {
+        let mut agg = ZipListAggregator::new();
+        agg.add(&[FlexType::Integer(1)]);
+        agg.add(&[FlexType::Integer(2)]);
+        agg.add(&[FlexType::Integer(3)]);
+        let result = agg.finalize();
+        if let FlexType::List(l) = result {
+            assert_eq!(l.len(), 3);
+            assert_eq!(l[0], FlexType::Integer(1));
+        } else {
+            panic!("Expected List");
+        }
+    }
+
+    #[test]
+    fn test_vector_sum() {
+        let mut agg = VectorSumAggregator::new();
+        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![1.0, 2.0, 3.0]))]);
+        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![4.0, 5.0, 6.0]))]);
+        let result = agg.finalize();
+        if let FlexType::Vector(v) = result {
+            assert_eq!(&*v, &[5.0, 7.0, 9.0]);
+        } else {
+            panic!("Expected Vector");
+        }
+    }
+
+    #[test]
+    fn test_vector_avg() {
+        let mut agg = VectorAvgAggregator::new();
+        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![2.0, 4.0]))]);
+        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![4.0, 6.0]))]);
+        let result = agg.finalize();
+        if let FlexType::Vector(v) = result {
+            assert!((v[0] - 3.0).abs() < 1e-10);
+            assert!((v[1] - 5.0).abs() < 1e-10);
+        } else {
+            panic!("Expected Vector");
+        }
     }
 }
