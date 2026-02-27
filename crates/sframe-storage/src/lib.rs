@@ -1,3 +1,10 @@
+pub mod block_decode;
 pub mod block_info;
+pub mod codec_float;
+pub mod codec_integer;
+pub mod codec_string;
+pub mod codec_vector;
 pub mod dir_archive;
 pub mod index;
+pub mod segment_reader;
+pub mod sframe_reader;

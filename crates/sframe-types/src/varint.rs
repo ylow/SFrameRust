@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use crate::error::Result;
 
 /// Decode a variable-length unsigned integer.
-pub fn decode_varint(reader: &mut impl Read) -> Result<u64> {
+pub fn decode_varint(reader: &mut (impl Read + ?Sized)) -> Result<u64> {
     let mut first = [0u8; 1];
     reader.read_exact(&mut first)?;
     let b = first[0];

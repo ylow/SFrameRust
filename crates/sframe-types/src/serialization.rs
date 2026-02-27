@@ -15,43 +15,43 @@ use crate::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
 
 // --- Primitive readers ---
 
-pub fn read_u8(reader: &mut impl Read) -> Result<u8> {
+pub fn read_u8(reader: &mut (impl Read + ?Sized)) -> Result<u8> {
     let mut buf = [0u8; 1];
     reader.read_exact(&mut buf)?;
     Ok(buf[0])
 }
 
-pub fn read_u16(reader: &mut impl Read) -> Result<u16> {
+pub fn read_u16(reader: &mut (impl Read + ?Sized)) -> Result<u16> {
     let mut buf = [0u8; 2];
     reader.read_exact(&mut buf)?;
     Ok(u16::from_le_bytes(buf))
 }
 
-pub fn read_u32(reader: &mut impl Read) -> Result<u32> {
+pub fn read_u32(reader: &mut (impl Read + ?Sized)) -> Result<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-pub fn read_u64(reader: &mut impl Read) -> Result<u64> {
+pub fn read_u64(reader: &mut (impl Read + ?Sized)) -> Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
 }
 
-pub fn read_i64(reader: &mut impl Read) -> Result<i64> {
+pub fn read_i64(reader: &mut (impl Read + ?Sized)) -> Result<i64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(i64::from_le_bytes(buf))
 }
 
-pub fn read_f64(reader: &mut impl Read) -> Result<f64> {
+pub fn read_f64(reader: &mut (impl Read + ?Sized)) -> Result<f64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(f64::from_le_bytes(buf))
 }
 
-pub fn read_i32(reader: &mut impl Read) -> Result<i32> {
+pub fn read_i32(reader: &mut (impl Read + ?Sized)) -> Result<i32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(i32::from_le_bytes(buf))
@@ -64,7 +64,7 @@ pub fn read_bytes(reader: &mut impl Read, len: usize) -> Result<Vec<u8>> {
 }
 
 /// Read a GraphLab-serialized string: 8-byte LE length + raw bytes.
-pub fn read_string(reader: &mut impl Read) -> Result<String> {
+pub fn read_string(reader: &mut (impl Read + ?Sized)) -> Result<String> {
     let len = read_u64(reader)? as usize;
     if len > 256 * 1024 * 1024 {
         return Err(SFrameError::Format(format!(
@@ -78,7 +78,7 @@ pub fn read_string(reader: &mut impl Read) -> Result<String> {
 }
 
 /// Read a GraphLab-serialized Vec<f64>: 8-byte LE length + raw f64 bytes (POD).
-pub fn read_vec_f64(reader: &mut impl Read) -> Result<Vec<f64>> {
+pub fn read_vec_f64(reader: &mut (impl Read + ?Sized)) -> Result<Vec<f64>> {
     let len = read_u64(reader)? as usize;
     let mut result = Vec::with_capacity(len);
     for _ in 0..len {
@@ -96,7 +96,7 @@ const FLEX_TYPE_TAG_OFFSET: u8 = 128;
 const LEGACY_TZ_SHIFT: i32 = 25;
 
 /// Deserialize a FlexType from GraphLab archive format.
-pub fn read_flex_type(reader: &mut impl Read) -> Result<FlexType> {
+pub fn read_flex_type(reader: &mut (impl Read + ?Sized)) -> Result<FlexType> {
     let tag = read_u8(reader)?;
 
     if tag < FLEX_TYPE_TAG_OFFSET {
@@ -153,7 +153,7 @@ pub fn read_flex_type(reader: &mut impl Read) -> Result<FlexType> {
 ///
 /// Legacy detection: if tz_offset (raw byte 7) is in range
 /// (-LEGACY_TZ_SHIFT, LEGACY_TZ_SHIFT), it's old format (no microseconds).
-pub fn read_flex_datetime(reader: &mut impl Read) -> Result<FlexDateTime> {
+pub fn read_flex_datetime(reader: &mut (impl Read + ?Sized)) -> Result<FlexDateTime> {
     let mut first8 = [0u8; 8];
     reader.read_exact(&mut first8)?;
 

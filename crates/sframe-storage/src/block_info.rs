@@ -35,7 +35,7 @@ pub struct BlockInfo {
 
 impl BlockInfo {
     /// Read a single BlockInfo from a reader (48 bytes, matching C++ POD layout).
-    fn read_from(reader: &mut impl Read) -> Result<Self> {
+    fn read_from(reader: &mut (impl Read + ?Sized)) -> Result<Self> {
         let offset = read_u64(reader)?;
         let length = read_u64(reader)?;
         let block_size = read_u64(reader)?;
@@ -78,7 +78,7 @@ impl BlockInfo {
 ///   2. Seek to file_size - 8 - footer_size
 ///   3. Deserialize Vec<Vec<BlockInfo>>
 pub fn read_block_index(
-    reader: &mut (impl Read + Seek),
+    reader: &mut (impl Read + Seek + ?Sized),
     file_size: u64,
 ) -> Result<Vec<Vec<BlockInfo>>> {
     // Read footer_size from last 8 bytes

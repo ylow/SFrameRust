@@ -18,7 +18,7 @@ pub struct DenseBitset {
 
 impl DenseBitset {
     /// Deserialize from GraphLab archive format.
-    pub fn deserialize(reader: &mut impl Read) -> Result<Self> {
+    pub fn deserialize(reader: &mut (impl Read + ?Sized)) -> Result<Self> {
         let len = read_u64(reader)? as usize;
         let arrlen = read_u64(reader)? as usize;
         let mut words = Vec::with_capacity(arrlen);
