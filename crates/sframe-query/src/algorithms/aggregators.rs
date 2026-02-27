@@ -556,6 +556,224 @@ impl Aggregator for ConcatAggregator {
     }
 }
 
+/// Count distinct (unique) values aggregator.
+#[derive(Clone)]
+pub struct CountDistinctAggregator {
+    /// Store string representations for hashing since FlexType doesn't impl Hash.
+    seen: std::collections::HashSet<String>,
+}
+
+impl CountDistinctAggregator {
+    pub fn new() -> Self {
+        CountDistinctAggregator {
+            seen: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl Default for CountDistinctAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for CountDistinctAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        if !matches!(values[0], FlexType::Undefined) {
+            self.seen.insert(format!("{}", values[0]));
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<CountDistinctAggregator>() {
+            self.seen.extend(o.seen.iter().cloned());
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.seen.len() as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Count non-Undefined values aggregator.
+#[derive(Clone)]
+pub struct NonNullCountAggregator {
+    count: u64,
+}
+
+impl NonNullCountAggregator {
+    pub fn new() -> Self {
+        NonNullCountAggregator { count: 0 }
+    }
+}
+
+impl Default for NonNullCountAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for NonNullCountAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if !values.is_empty() && !matches!(values[0], FlexType::Undefined) {
+            self.count += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<NonNullCountAggregator>() {
+            self.count += o.count;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.count as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Select one (first non-Undefined) value aggregator.
+#[derive(Clone)]
+pub struct SelectOneAggregator {
+    value: Option<FlexType>,
+}
+
+impl SelectOneAggregator {
+    pub fn new() -> Self {
+        SelectOneAggregator { value: None }
+    }
+}
+
+impl Default for SelectOneAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for SelectOneAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if self.value.is_none() && !values.is_empty() && !matches!(values[0], FlexType::Undefined) {
+            self.value = Some(values[0].clone());
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if self.value.is_none() {
+            if let Some(o) = other.as_any().downcast_ref::<SelectOneAggregator>() {
+                self.value = o.value.clone();
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        self.value.take().unwrap_or(FlexType::Undefined)
+    }
+
+    fn output_type(&self, input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        if !input_types.is_empty() {
+            input_types[0]
+        } else {
+            FlexTypeEnum::Undefined
+        }
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Quantile aggregator — collects all values, sorts, and picks the percentile.
+#[derive(Clone)]
+pub struct QuantileAggregator {
+    values: Vec<f64>,
+    quantile: f64,
+}
+
+impl QuantileAggregator {
+    pub fn new(quantile: f64) -> Self {
+        QuantileAggregator {
+            values: Vec::new(),
+            quantile: quantile.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn median() -> Self {
+        Self::new(0.5)
+    }
+}
+
+impl Aggregator for QuantileAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) => self.values.push(*i as f64),
+            FlexType::Float(f) => self.values.push(*f),
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<QuantileAggregator>() {
+            self.values.extend_from_slice(&o.values);
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        if self.values.is_empty() {
+            return FlexType::Undefined;
+        }
+        self.values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = self.values.len();
+        let idx = ((n - 1) as f64 * self.quantile).round() as usize;
+        let idx = idx.min(n - 1);
+        FlexType::Float(self.values[idx])
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Float
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Specification for a groupby aggregation.
 #[derive(Clone)]
 pub struct AggSpec {
@@ -594,6 +812,34 @@ impl AggSpec {
 
     pub fn max(column: usize, output_name: &str) -> Self {
         Self::new(column, Box::new(MaxAggregator::new()), output_name)
+    }
+
+    pub fn variance(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(VarianceAggregator::sample()), output_name)
+    }
+
+    pub fn stddev(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(StdDevAggregator::sample()), output_name)
+    }
+
+    pub fn concat(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(ConcatAggregator::new()), output_name)
+    }
+
+    pub fn count_distinct(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(CountDistinctAggregator::new()), output_name)
+    }
+
+    pub fn quantile(column: usize, quantile: f64, output_name: &str) -> Self {
+        Self::new(column, Box::new(QuantileAggregator::new(quantile)), output_name)
+    }
+
+    pub fn median(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(QuantileAggregator::median()), output_name)
+    }
+
+    pub fn select_one(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(SelectOneAggregator::new()), output_name)
     }
 }
 
@@ -714,5 +960,73 @@ mod tests {
             }
             other => panic!("Expected List, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let mut agg = CountDistinctAggregator::new();
+        agg.add(&[FlexType::Integer(1)]);
+        agg.add(&[FlexType::Integer(2)]);
+        agg.add(&[FlexType::Integer(1)]);
+        agg.add(&[FlexType::Integer(3)]);
+        agg.add(&[FlexType::Undefined]);
+        assert_eq!(agg.finalize(), FlexType::Integer(3));
+    }
+
+    #[test]
+    fn test_non_null_count() {
+        let mut agg = NonNullCountAggregator::new();
+        agg.add(&[FlexType::Integer(1)]);
+        agg.add(&[FlexType::Undefined]);
+        agg.add(&[FlexType::Integer(3)]);
+        agg.add(&[FlexType::Undefined]);
+        assert_eq!(agg.finalize(), FlexType::Integer(2));
+    }
+
+    #[test]
+    fn test_select_one() {
+        let mut agg = SelectOneAggregator::new();
+        agg.add(&[FlexType::Undefined]);
+        agg.add(&[FlexType::Integer(42)]);
+        agg.add(&[FlexType::Integer(99)]);
+        assert_eq!(agg.finalize(), FlexType::Integer(42));
+    }
+
+    #[test]
+    fn test_quantile_median() {
+        let mut agg = QuantileAggregator::median();
+        for &v in &[1.0, 2.0, 3.0, 4.0, 5.0] {
+            agg.add(&[FlexType::Float(v)]);
+        }
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 3.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_quantile_25() {
+        let mut agg = QuantileAggregator::new(0.25);
+        for &v in &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            agg.add(&[FlexType::Float(v)]);
+        }
+        // 25th percentile of [1,2,3,4,5,6,7,8]
+        // idx = round((8-1) * 0.25) = round(1.75) = 2 → value 3.0
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 3.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_aggspec_convenience_constructors() {
+        // Just verify they construct without error
+        let _ = AggSpec::variance(0, "var");
+        let _ = AggSpec::stddev(0, "std");
+        let _ = AggSpec::concat(0, "vals");
+        let _ = AggSpec::count_distinct(0, "unique_count");
+        let _ = AggSpec::quantile(0, 0.5, "median");
+        let _ = AggSpec::median(0, "median");
+        let _ = AggSpec::select_one(0, "first");
     }
 }
