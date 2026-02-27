@@ -13,6 +13,7 @@ use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::{ColumnData, SFrameRows};
+use crate::optimizer;
 use crate::planner::{LogicalOp, PlannerNode};
 
 /// A stream of SFrameRows batches.
@@ -22,7 +23,15 @@ pub type BatchStream = Pin<Box<dyn Stream<Item = Result<SFrameRows>> + Send>>;
 const SOURCE_BATCH_SIZE: usize = 4096;
 
 /// Compile a logical plan node into a BatchStream.
+///
+/// Applies optimizer passes before compilation for better execution.
 pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
+    let node = optimizer::optimize(node);
+    compile_node(&node)
+}
+
+/// Internal compilation without optimization (used recursively).
+fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     match &node.op {
         LogicalOp::SFrameSource {
             path,
@@ -37,7 +46,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
         }
 
         LogicalOp::Project { column_indices } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let indices = column_indices.clone();
             Ok(Box::pin(input.map(move |batch_result| {
                 batch_result.and_then(|batch| batch.select_columns(&indices))
@@ -45,7 +54,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
         }
 
         LogicalOp::Filter { column, predicate } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let col = *column;
             let pred = predicate.clone();
             Ok(Box::pin(input.filter_map(move |batch_result| {
@@ -75,7 +84,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
             func,
             output_type,
         } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let col = *input_column;
             let f = func.clone();
             let out_type = *output_type;
@@ -92,7 +101,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
             func,
             output_type,
         } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let l_col = *left_column;
             let r_col = *right_column;
             let f = func.clone();
@@ -108,7 +117,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
             func,
             output_types,
         } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let f = func.clone();
             let out_types = output_types.clone();
             Ok(Box::pin(input.map(move |batch_result| {
@@ -119,8 +128,8 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
         }
 
         LogicalOp::Append => {
-            let left = compile(&node.inputs[0])?;
-            let right = compile(&node.inputs[1])?;
+            let left = compile_node(&node.inputs[0])?;
+            let right = compile_node(&node.inputs[1])?;
             Ok(Box::pin(left.chain(right)))
         }
 
@@ -128,7 +137,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
             let mut combined: BatchStream =
                 Box::pin(stream::empty());
             for input_node in &node.inputs {
-                let input = compile(input_node)?;
+                let input = compile_node(input_node)?;
                 combined = Box::pin(combined.chain(input));
             }
             Ok(combined)
@@ -139,7 +148,7 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
         }
 
         LogicalOp::Reduce { aggregator } => {
-            let input = compile(&node.inputs[0])?;
+            let input = compile_node(&node.inputs[0])?;
             let agg = aggregator.clone();
             Ok(Box::pin(stream::once(async move {
                 execute_reduce(input, agg).await
