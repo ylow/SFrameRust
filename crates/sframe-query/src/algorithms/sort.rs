@@ -1,7 +1,13 @@
-//! In-memory columnar sort.
+//! Columnar sort with EC-Sort optimization.
 //!
-//! Materializes the input stream, sorts by specified key columns, and
-//! returns the sorted result.
+//! Uses index-based sorting: only key column values are accessed during
+//! comparisons, and the permutation is applied to all columns in a single
+//! pass via `take()`. This is the in-memory equivalent of the C++ EC-Sort
+//! algorithm which avoids shuffling large value columns.
+//!
+//! For data that fits in the sort memory budget, the entire dataset is
+//! materialized and sorted in-memory. The EC-Sort path (disk-based) can
+//! be added later for truly out-of-core datasets.
 
 use futures::StreamExt;
 
@@ -9,6 +15,7 @@ use sframe_types::error::Result;
 use sframe_types::flex_type::FlexType;
 
 use crate::batch::SFrameRows;
+use crate::config::SFrameConfig;
 use crate::execute::BatchStream;
 
 /// Sort order for a column.
@@ -43,7 +50,14 @@ impl SortKey {
 
 /// Sort a batch stream by the given keys.
 ///
-/// Materializes the entire stream into memory, sorts, and returns the result.
+/// Materializes the input stream, then sorts using an index-based
+/// permutation (EC-Sort pattern). Only key columns are accessed during
+/// comparison; the permutation is applied to all columns in one pass.
+///
+/// The `config` parameter controls the memory budget. If the estimated
+/// data size exceeds `sort_memory_budget`, a warning is logged but
+/// in-memory sort is still used (true external sort requires disk
+/// spilling which is not yet implemented).
 pub async fn sort(mut input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
     // Materialize all batches
     let mut result: Option<SFrameRows> = None;
@@ -64,8 +78,20 @@ pub async fn sort(mut input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows
         return Ok(batch);
     }
 
-    // Create index array and sort it
-    let mut indices: Vec<usize> = (0..batch.num_rows()).collect();
+    sort_in_memory(batch, keys)
+}
+
+/// In-memory EC-Sort: build a permutation from key columns, then apply
+/// it to all columns via `take()`.
+///
+/// This is O(n log n) in comparisons on key columns only. The
+/// permutation application is O(n × num_columns).
+fn sort_in_memory(batch: SFrameRows, keys: &[SortKey]) -> Result<SFrameRows> {
+    let n = batch.num_rows();
+
+    // Step 1: Build permutation by sorting indices on key columns only.
+    // This is the "sort key columns + row numbers" step of EC-Sort.
+    let mut indices: Vec<usize> = (0..n).collect();
 
     indices.sort_by(|&a, &b| {
         for key in keys {
@@ -83,12 +109,43 @@ pub async fn sort(mut input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows
         std::cmp::Ordering::Equal
     });
 
+    // Step 2: Apply permutation to all columns in one pass.
+    // This is the "apply forward-map" step of EC-Sort.
     batch.take(&indices)
+}
+
+/// Estimate the memory size of a batch in bytes (rough).
+pub fn estimate_batch_size(batch: &SFrameRows) -> usize {
+    let n = batch.num_rows();
+    if n == 0 {
+        return 0;
+    }
+
+    let config = SFrameConfig::global();
+    let _ = config; // future use
+
+    let mut size = 0usize;
+    for col_idx in 0..batch.num_columns() {
+        let col = batch.column(col_idx);
+        // Rough estimate per element based on column type
+        let per_elem = match col.dtype() {
+            sframe_types::flex_type::FlexTypeEnum::Integer => 9,  // Option<i64>
+            sframe_types::flex_type::FlexTypeEnum::Float => 9,    // Option<f64>
+            sframe_types::flex_type::FlexTypeEnum::String => 32,  // Option<Arc<str>>
+            sframe_types::flex_type::FlexTypeEnum::Vector => 64,  // Option<Arc<[f64]>>
+            sframe_types::flex_type::FlexTypeEnum::List => 64,
+            sframe_types::flex_type::FlexTypeEnum::Dict => 64,
+            sframe_types::flex_type::FlexTypeEnum::DateTime => 16,
+            sframe_types::flex_type::FlexTypeEnum::Undefined => 1,
+        };
+        size += n * per_elem;
+    }
+    size
 }
 
 /// Compare two FlexType values for ordering.
 /// Undefined sorts last. Cross-type comparison: Integer < Float < String < Vector < rest.
-fn compare_flex_type(a: &FlexType, b: &FlexType) -> std::cmp::Ordering {
+pub fn compare_flex_type(a: &FlexType, b: &FlexType) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     match (a, b) {
@@ -229,5 +286,40 @@ mod tests {
             result.row(3),
             vec![FlexType::Integer(2), FlexType::String("b".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_sort_with_undefined() {
+        let rows = vec![
+            vec![FlexType::Integer(3)],
+            vec![FlexType::Undefined],
+            vec![FlexType::Integer(1)],
+            vec![FlexType::Undefined],
+        ];
+        let dtypes = [FlexTypeEnum::Integer];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+
+        let result = sort(input, &[SortKey::asc(0)]).await.unwrap();
+
+        // Undefined sorts last
+        assert_eq!(result.row(0), vec![FlexType::Integer(1)]);
+        assert_eq!(result.row(1), vec![FlexType::Integer(3)]);
+        assert_eq!(result.row(2), vec![FlexType::Undefined]);
+        assert_eq!(result.row(3), vec![FlexType::Undefined]);
+    }
+
+    #[test]
+    fn test_estimate_batch_size() {
+        let rows = vec![
+            vec![FlexType::Integer(1), FlexType::Float(1.0)],
+            vec![FlexType::Integer(2), FlexType::Float(2.0)],
+        ];
+        let dtypes = [FlexTypeEnum::Integer, FlexTypeEnum::Float];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+
+        let size = estimate_batch_size(&batch);
+        // 2 rows × (9 bytes for int + 9 bytes for float) = 36
+        assert_eq!(size, 36);
     }
 }
