@@ -1,0 +1,15 @@
+[package]
+name = "sframe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sframe-types = { path = "../sframe-types" }
+sframe-storage = { path = "../sframe-storage" }
+sframe-query = { path = "../sframe-query" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"

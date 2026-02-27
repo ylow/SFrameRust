@@ -5,4 +5,5 @@ members = [
     "crates/sframe-io",
     "crates/sframe-storage",
     "crates/sframe-query",
+    "crates/sframe",
 ]

@@ -369,6 +369,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sframe"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "sframe-query",
+ "sframe-storage",
+ "sframe-types",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sframe-io"
 version = "0.1.0"
 dependencies = [
