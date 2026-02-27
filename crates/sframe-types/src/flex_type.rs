@@ -131,6 +131,240 @@ impl std::fmt::Display for FlexType {
     }
 }
 
+// === Arithmetic Operators ===
+//
+// Matching C++ flexible_type operator semantics:
+// - int op int → int (except div → float)
+// - float op float → float
+// - int op float → float (promotion)
+// - string + string → concat
+// - vector op vector → element-wise (same length required)
+// - vector op scalar → broadcast
+// - Any op involving Undefined → Undefined
+
+impl std::ops::Add for FlexType {
+    type Output = FlexType;
+
+    fn add(self, rhs: FlexType) -> FlexType {
+        match (self, rhs) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => FlexType::Integer(a + b),
+            (FlexType::Float(a), FlexType::Float(b)) => FlexType::Float(a + b),
+            (FlexType::Integer(a), FlexType::Float(b)) => FlexType::Float(a as f64 + b),
+            (FlexType::Float(a), FlexType::Integer(b)) => FlexType::Float(a + b as f64),
+            (FlexType::String(a), FlexType::String(b)) => {
+                let mut s = a.to_string();
+                s.push_str(&b);
+                FlexType::String(Arc::from(s.as_str()))
+            }
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                if a.len() == b.len() {
+                    let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+                    FlexType::Vector(Arc::from(v))
+                } else {
+                    FlexType::Undefined
+                }
+            }
+            (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+impl std::ops::Sub for FlexType {
+    type Output = FlexType;
+
+    fn sub(self, rhs: FlexType) -> FlexType {
+        match (self, rhs) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => FlexType::Integer(a - b),
+            (FlexType::Float(a), FlexType::Float(b)) => FlexType::Float(a - b),
+            (FlexType::Integer(a), FlexType::Float(b)) => FlexType::Float(a as f64 - b),
+            (FlexType::Float(a), FlexType::Integer(b)) => FlexType::Float(a - b as f64),
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                if a.len() == b.len() {
+                    let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x - y).collect();
+                    FlexType::Vector(Arc::from(v))
+                } else {
+                    FlexType::Undefined
+                }
+            }
+            (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+impl std::ops::Mul for FlexType {
+    type Output = FlexType;
+
+    fn mul(self, rhs: FlexType) -> FlexType {
+        match (self, rhs) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => FlexType::Integer(a * b),
+            (FlexType::Float(a), FlexType::Float(b)) => FlexType::Float(a * b),
+            (FlexType::Integer(a), FlexType::Float(b)) => FlexType::Float(a as f64 * b),
+            (FlexType::Float(a), FlexType::Integer(b)) => FlexType::Float(a * b as f64),
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                if a.len() == b.len() {
+                    let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
+                    FlexType::Vector(Arc::from(v))
+                } else {
+                    FlexType::Undefined
+                }
+            }
+            // vector * scalar
+            (FlexType::Vector(a), FlexType::Float(s)) | (FlexType::Float(s), FlexType::Vector(a)) => {
+                let v: Vec<f64> = a.iter().map(|x| x * s).collect();
+                FlexType::Vector(Arc::from(v))
+            }
+            (FlexType::Vector(a), FlexType::Integer(s)) | (FlexType::Integer(s), FlexType::Vector(a)) => {
+                let sf = s as f64;
+                let v: Vec<f64> = a.iter().map(|x| x * sf).collect();
+                FlexType::Vector(Arc::from(v))
+            }
+            (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+impl std::ops::Div for FlexType {
+    type Output = FlexType;
+
+    /// Division always returns Float (like C++ SFrame).
+    fn div(self, rhs: FlexType) -> FlexType {
+        match (self, rhs) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => {
+                if b == 0 {
+                    FlexType::Undefined
+                } else {
+                    FlexType::Float(a as f64 / b as f64)
+                }
+            }
+            (FlexType::Float(a), FlexType::Float(b)) => FlexType::Float(a / b),
+            (FlexType::Integer(a), FlexType::Float(b)) => FlexType::Float(a as f64 / b),
+            (FlexType::Float(a), FlexType::Integer(b)) => FlexType::Float(a / b as f64),
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                if a.len() == b.len() {
+                    let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x / y).collect();
+                    FlexType::Vector(Arc::from(v))
+                } else {
+                    FlexType::Undefined
+                }
+            }
+            // vector / scalar
+            (FlexType::Vector(a), FlexType::Float(s)) => {
+                let v: Vec<f64> = a.iter().map(|x| x / s).collect();
+                FlexType::Vector(Arc::from(v))
+            }
+            (FlexType::Vector(a), FlexType::Integer(s)) => {
+                let sf = s as f64;
+                let v: Vec<f64> = a.iter().map(|x| x / sf).collect();
+                FlexType::Vector(Arc::from(v))
+            }
+            (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+impl std::ops::Rem for FlexType {
+    type Output = FlexType;
+
+    fn rem(self, rhs: FlexType) -> FlexType {
+        match (self, rhs) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => {
+                if b == 0 {
+                    FlexType::Undefined
+                } else {
+                    FlexType::Integer(a % b)
+                }
+            }
+            (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+impl std::ops::Neg for FlexType {
+    type Output = FlexType;
+
+    fn neg(self) -> FlexType {
+        match self {
+            FlexType::Integer(a) => FlexType::Integer(-a),
+            FlexType::Float(a) => FlexType::Float(-a),
+            FlexType::Vector(a) => {
+                let v: Vec<f64> = a.iter().map(|x| -x).collect();
+                FlexType::Vector(Arc::from(v))
+            }
+            FlexType::Undefined => FlexType::Undefined,
+            _ => FlexType::Undefined,
+        }
+    }
+}
+
+// === Comparison & Ordering ===
+//
+// PartialOrd with cross-type numeric comparison.
+// Undefined sorts last (greater than everything).
+// Type ordering fallback: Integer < Float < String < Vector < List < Dict < DateTime < Undefined
+
+impl PartialOrd for FlexType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            // Undefined sorts last
+            (FlexType::Undefined, FlexType::Undefined) => Some(Ordering::Equal),
+            (FlexType::Undefined, _) => Some(Ordering::Greater),
+            (_, FlexType::Undefined) => Some(Ordering::Less),
+
+            // Same-type comparisons
+            (FlexType::Integer(a), FlexType::Integer(b)) => a.partial_cmp(b),
+            (FlexType::Float(a), FlexType::Float(b)) => a.partial_cmp(b),
+            (FlexType::String(a), FlexType::String(b)) => a.as_ref().partial_cmp(b.as_ref()),
+
+            // Cross-type numeric
+            (FlexType::Integer(a), FlexType::Float(b)) => (*a as f64).partial_cmp(b),
+            (FlexType::Float(a), FlexType::Integer(b)) => a.partial_cmp(&(*b as f64)),
+
+            // Vectors: lexicographic
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.partial_cmp(y) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                a.len().partial_cmp(&b.len())
+            }
+
+            // DateTime: by timestamp
+            (FlexType::DateTime(a), FlexType::DateTime(b)) => {
+                a.posix_timestamp.partial_cmp(&b.posix_timestamp)
+            }
+
+            // Different types: order by type rank
+            (a, b) => {
+                let rank_a = type_rank(a);
+                let rank_b = type_rank(b);
+                rank_a.partial_cmp(&rank_b)
+            }
+        }
+    }
+}
+
+fn type_rank(v: &FlexType) -> u8 {
+    match v {
+        FlexType::Integer(_) => 0,
+        FlexType::Float(_) => 1,
+        FlexType::String(_) => 2,
+        FlexType::Vector(_) => 3,
+        FlexType::List(_) => 4,
+        FlexType::Dict(_) => 5,
+        FlexType::DateTime(_) => 6,
+        FlexType::Undefined => 7,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +403,166 @@ mod tests {
         assert_eq!(format!("{}", FlexType::Float(3.14)), "3.14");
         assert_eq!(format!("{}", FlexType::String(Arc::from("hello"))), "hello");
         assert_eq!(format!("{}", FlexType::Undefined), "None");
+    }
+
+    // === Arithmetic operator tests ===
+
+    #[test]
+    fn test_add_integers() {
+        assert_eq!(
+            FlexType::Integer(3) + FlexType::Integer(4),
+            FlexType::Integer(7)
+        );
+    }
+
+    #[test]
+    fn test_add_floats() {
+        match FlexType::Float(1.5) + FlexType::Float(2.5) {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_add_int_float_promotion() {
+        match FlexType::Integer(1) + FlexType::Float(2.5) {
+            FlexType::Float(v) => assert!((v - 3.5).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_add_strings() {
+        assert_eq!(
+            FlexType::String(Arc::from("hello")) + FlexType::String(Arc::from(" world")),
+            FlexType::String(Arc::from("hello world"))
+        );
+    }
+
+    #[test]
+    fn test_add_vectors() {
+        let a = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
+        let b = FlexType::Vector(Arc::from(vec![4.0, 5.0, 6.0]));
+        match a + b {
+            FlexType::Vector(v) => assert_eq!(v.as_ref(), &[5.0, 7.0, 9.0]),
+            other => panic!("Expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sub_integers() {
+        assert_eq!(
+            FlexType::Integer(10) - FlexType::Integer(3),
+            FlexType::Integer(7)
+        );
+    }
+
+    #[test]
+    fn test_mul_int_float() {
+        match FlexType::Integer(3) * FlexType::Float(2.5) {
+            FlexType::Float(v) => assert!((v - 7.5).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mul_vector_scalar() {
+        let v = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
+        match v * FlexType::Float(2.0) {
+            FlexType::Vector(r) => assert_eq!(r.as_ref(), &[2.0, 4.0, 6.0]),
+            other => panic!("Expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_div_always_float() {
+        match FlexType::Integer(7) / FlexType::Integer(2) {
+            FlexType::Float(v) => assert!((v - 3.5).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_div_by_zero() {
+        assert_eq!(
+            FlexType::Integer(1) / FlexType::Integer(0),
+            FlexType::Undefined
+        );
+    }
+
+    #[test]
+    fn test_rem_integers() {
+        assert_eq!(
+            FlexType::Integer(7) % FlexType::Integer(3),
+            FlexType::Integer(1)
+        );
+    }
+
+    #[test]
+    fn test_neg() {
+        assert_eq!(-FlexType::Integer(5), FlexType::Integer(-5));
+        match -FlexType::Float(3.14) {
+            FlexType::Float(v) => assert!((v + 3.14).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_neg_vector() {
+        match -FlexType::Vector(Arc::from(vec![1.0, -2.0, 3.0])) {
+            FlexType::Vector(v) => assert_eq!(v.as_ref(), &[-1.0, 2.0, -3.0]),
+            other => panic!("Expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_undefined_propagates() {
+        assert_eq!(
+            FlexType::Integer(1) + FlexType::Undefined,
+            FlexType::Undefined
+        );
+        assert_eq!(
+            FlexType::Undefined - FlexType::Float(1.0),
+            FlexType::Undefined
+        );
+    }
+
+    // === Comparison / ordering tests ===
+
+    #[test]
+    fn test_ordering_integers() {
+        assert!(FlexType::Integer(1) < FlexType::Integer(2));
+        assert!(FlexType::Integer(3) > FlexType::Integer(2));
+        assert!(FlexType::Integer(5) == FlexType::Integer(5));
+    }
+
+    #[test]
+    fn test_ordering_floats() {
+        assert!(FlexType::Float(1.0) < FlexType::Float(2.0));
+    }
+
+    #[test]
+    fn test_ordering_cross_type_numeric() {
+        assert!(FlexType::Integer(1) < FlexType::Float(1.5));
+        assert!(FlexType::Float(0.5) < FlexType::Integer(1));
+    }
+
+    #[test]
+    fn test_ordering_strings() {
+        assert!(FlexType::String(Arc::from("apple")) < FlexType::String(Arc::from("banana")));
+    }
+
+    #[test]
+    fn test_ordering_undefined_last() {
+        assert!(FlexType::Integer(1) < FlexType::Undefined);
+        assert!(FlexType::String(Arc::from("z")) < FlexType::Undefined);
+        assert!(FlexType::Undefined == FlexType::Undefined);
+    }
+
+    #[test]
+    fn test_ordering_different_types() {
+        // Integer < Float < String < Vector
+        assert!(FlexType::Integer(999) < FlexType::String(Arc::from("a")));
+        assert!(FlexType::Float(999.0) < FlexType::String(Arc::from("a")));
     }
 }
