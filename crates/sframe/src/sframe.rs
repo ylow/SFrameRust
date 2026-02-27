@@ -29,9 +29,19 @@ use crate::sarray::SArray;
 pub struct SFrame {
     columns: Vec<SArray>,
     column_names: Vec<String>,
+    metadata: HashMap<String, String>,
 }
 
 impl SFrame {
+    /// Internal constructor with default empty metadata.
+    fn new_with_columns(columns: Vec<SArray>, column_names: Vec<String>) -> Self {
+        SFrame {
+            columns,
+            column_names,
+            metadata: HashMap::new(),
+        }
+    }
+
     /// Read an SFrame from disk.
     pub fn read(path: &str) -> Result<Self> {
         let reader = SFrameReader::open(path)?;
@@ -54,10 +64,11 @@ impl SFrame {
             })
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: col_names,
-        })
+        let mut sf = SFrame::new_with_columns(columns, col_names);
+        // Load metadata from disk
+        let reader = SFrameReader::open(path)?;
+        sf.metadata = reader.metadata().clone();
+        Ok(sf)
     }
 
     /// Read a CSV file into an SFrame.
@@ -77,10 +88,7 @@ impl SFrame {
             })
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: col_names,
-        })
+        Ok(SFrame::new_with_columns(columns, col_names))
     }
 
     /// Read a JSON Lines file into an SFrame.
@@ -96,20 +104,14 @@ impl SFrame {
             .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: col_names,
-        })
+        Ok(SFrame::new_with_columns(columns, col_names))
     }
 
     /// Build an SFrame from named columns.
     pub fn from_columns(cols: Vec<(&str, SArray)>) -> Result<Self> {
         let column_names: Vec<String> = cols.iter().map(|(name, _)| name.to_string()).collect();
         let columns: Vec<SArray> = cols.into_iter().map(|(_, col)| col).collect();
-        Ok(SFrame {
-            columns,
-            column_names,
-        })
+        Ok(SFrame::new_with_columns(columns, column_names))
     }
 
     /// Number of rows.
@@ -144,6 +146,26 @@ impl SFrame {
             .collect()
     }
 
+    /// Get a metadata value by key.
+    pub fn get_metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(|s| s.as_str())
+    }
+
+    /// Set a metadata key-value pair.
+    pub fn set_metadata(&mut self, key: &str, value: &str) {
+        self.metadata.insert(key.to_string(), value.to_string());
+    }
+
+    /// Remove a metadata key.
+    pub fn remove_metadata(&mut self, key: &str) {
+        self.metadata.remove(key);
+    }
+
+    /// Get all metadata.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
     /// Access a column by name.
     pub fn column(&self, name: &str) -> Result<&SArray> {
         let idx = self.column_index(name)?;
@@ -159,10 +181,7 @@ impl SFrame {
             new_columns.push(self.columns[idx].clone());
             new_names.push(name.to_string());
         }
-        Ok(SFrame {
-            columns: new_columns,
-            column_names: new_names,
-        })
+        Ok(SFrame::new_with_columns(new_columns, new_names))
     }
 
     /// Add a column (returns a new SFrame).
@@ -177,10 +196,7 @@ impl SFrame {
         let mut names = self.column_names.clone();
         columns.push(col);
         names.push(name.to_string());
-        Ok(SFrame {
-            columns,
-            column_names: names,
-        })
+        Ok(SFrame::new_with_columns(columns, names))
     }
 
     /// Remove a column (returns a new SFrame).
@@ -190,10 +206,7 @@ impl SFrame {
         let mut names = self.column_names.clone();
         columns.remove(idx);
         names.remove(idx);
-        Ok(SFrame {
-            columns,
-            column_names: names,
-        })
+        Ok(SFrame::new_with_columns(columns, names))
     }
 
     /// Filter rows by a predicate on a named column.
@@ -221,10 +234,7 @@ impl SFrame {
                 })
                 .collect();
 
-            return Ok(SFrame {
-                columns,
-                column_names: self.column_names.clone(),
-            });
+            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
         }
 
         // Fallback: materialize, filter, rebuild
@@ -264,10 +274,7 @@ impl SFrame {
                 .map(|(i, c)| SArray::from_plan(appended.clone(), c.dtype(), None, i))
                 .collect();
 
-            return Ok(SFrame {
-                columns,
-                column_names: self.column_names.clone(),
-            });
+            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
         }
 
         // Fallback: materialize both sides
@@ -378,10 +385,7 @@ impl SFrame {
             .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: names,
-        })
+        Ok(SFrame::new_with_columns(columns, names))
     }
 
     /// Group by columns and aggregate.
@@ -413,10 +417,7 @@ impl SFrame {
             .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: names,
-        })
+        Ok(SFrame::new_with_columns(columns, names))
     }
 
     // === Phase 11.1: Column Mutation ===
@@ -426,10 +427,7 @@ impl SFrame {
         let idx = self.column_index(name)?;
         let mut columns = self.columns.clone();
         columns[idx] = col;
-        Ok(SFrame {
-            columns,
-            column_names: self.column_names.clone(),
-        })
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 
     /// Rename columns according to a mapping (returns a new SFrame).
@@ -449,10 +447,7 @@ impl SFrame {
             }
             new_names[idx] = new_name.to_string();
         }
-        Ok(SFrame {
-            columns: self.columns.clone(),
-            column_names: new_names,
-        })
+        Ok(SFrame::new_with_columns(self.columns.clone(), new_names))
     }
 
     /// Swap two columns by name (returns a new SFrame).
@@ -463,10 +458,7 @@ impl SFrame {
         let mut names = self.column_names.clone();
         columns.swap(idx1, idx2);
         names.swap(idx1, idx2);
-        Ok(SFrame {
-            columns,
-            column_names: names,
-        })
+        Ok(SFrame::new_with_columns(columns, names))
     }
 
     // === Phase 11.2: Missing Value Handling ===
@@ -664,10 +656,7 @@ impl SFrame {
             .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: new_names,
-        })
+        Ok(SFrame::new_with_columns(columns, new_names))
     }
 
     /// Unpack a Dict/List column into separate columns.
@@ -758,7 +747,7 @@ impl SFrame {
                     .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
                     .collect();
 
-                Ok(SFrame { columns, column_names: new_names })
+                Ok(SFrame::new_with_columns(columns, new_names))
             }
             FlexTypeEnum::List => {
                 // Determine max list length
@@ -819,7 +808,7 @@ impl SFrame {
                     .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
                     .collect();
 
-                Ok(SFrame { columns, column_names: new_names })
+                Ok(SFrame::new_with_columns(columns, new_names))
             }
             _ => Err(SFrameError::Format(format!(
                 "Cannot unpack column '{}' of type {:?}; expected Dict or List",
@@ -913,7 +902,7 @@ impl SFrame {
                     .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(out_rows), i))
                     .collect();
 
-                Ok(SFrame { columns, column_names: new_names })
+                Ok(SFrame::new_with_columns(columns, new_names))
             }
             _ => Err(SFrameError::Format(format!(
                 "Cannot stack column '{}' of type {:?}; expected List or Vector",
@@ -987,6 +976,11 @@ impl SFrame {
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
         let dtypes = self.column_types();
         let mut writer = SFrameStreamWriter::new(path, &col_names, &dtypes)?;
+
+        // Persist metadata
+        for (key, value) in &self.metadata {
+            writer.set_metadata(key, value);
+        }
 
         let stream = self.compile_stream()?;
         for_each_batch_sync(stream, |batch| {
@@ -1100,10 +1094,7 @@ impl SFrame {
             .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
-        Ok(SFrame {
-            columns,
-            column_names: self.column_names.clone(),
-        })
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 }
 
@@ -1236,6 +1227,11 @@ impl SFrameStreamWriter {
         }
         let col_vecs = batch.to_column_vecs();
         self.inner.write_columns(&col_vecs)
+    }
+
+    /// Set a metadata key-value pair to be persisted.
+    pub fn set_metadata(&mut self, key: &str, value: &str) {
+        self.inner.set_metadata(key, value);
     }
 
     /// Finalize: flush remaining buffered data, write segment footer
@@ -1793,5 +1789,68 @@ mod tests {
         let sf2 = SFrame::from_json(path_str).unwrap();
         assert_eq!(sf2.num_rows().unwrap(), 2);
         assert_eq!(sf2.num_columns(), 3);
+    }
+
+    // === Phase 13 Tests ===
+
+    #[test]
+    fn test_parallel_sort_large() {
+        // Build a large enough SFrame to trigger parallel sort (>10K rows)
+        let n = 15_000;
+        let values: Vec<FlexType> = (0..n)
+            .rev()
+            .map(|i| FlexType::Integer(i))
+            .collect();
+        let sa = SArray::from_vec(values, FlexTypeEnum::Integer).unwrap();
+        let sf = SFrame::from_columns(vec![("val", sa)]).unwrap();
+
+        let sorted = sf.sort(&[("val", SortOrder::Ascending)]).unwrap();
+        let rows = sorted.head(5).unwrap();
+        assert_eq!(rows.num_rows().unwrap(), 5);
+
+        let v = rows.column("val").unwrap().to_vec().unwrap();
+        assert_eq!(v[0], FlexType::Integer(0));
+        assert_eq!(v[1], FlexType::Integer(1));
+        assert_eq!(v[4], FlexType::Integer(4));
+    }
+
+    // === Phase 16.1 Tests ===
+
+    #[test]
+    fn test_metadata_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.sf");
+        let path_str = path.to_str().unwrap();
+
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let mut sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
+        sf.set_metadata("author", "test_user");
+        sf.set_metadata("version", "1.0");
+        sf.save(path_str).unwrap();
+
+        // Read back and verify metadata survived
+        let sf2 = SFrame::read(path_str).unwrap();
+        assert_eq!(sf2.get_metadata("author"), Some("test_user"));
+        assert_eq!(sf2.get_metadata("version"), Some("1.0"));
+        assert_eq!(sf2.get_metadata("nonexistent"), None);
+        assert_eq!(sf2.num_rows().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_metadata_in_memory() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let mut sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
+
+        assert_eq!(sf.get_metadata("key"), None);
+        sf.set_metadata("key", "value");
+        assert_eq!(sf.get_metadata("key"), Some("value"));
+        sf.remove_metadata("key");
+        assert_eq!(sf.get_metadata("key"), None);
     }
 }

@@ -156,6 +156,16 @@ impl SFrameReader {
     pub fn column_names(&self) -> &[String] {
         &self.frame_index.column_names
     }
+
+    /// Get a metadata value by key.
+    pub fn get_metadata(&self, key: &str) -> Option<&str> {
+        self.frame_index.metadata.get(key).map(|s| s.as_str())
+    }
+
+    /// Get all metadata as a reference.
+    pub fn metadata(&self) -> &std::collections::HashMap<String, String> {
+        &self.frame_index.metadata
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 //! be added later for truly out-of-core datasets.
 
 use futures::StreamExt;
+use rayon::prelude::*;
 
 use sframe_types::error::Result;
 use sframe_types::flex_type::FlexType;
@@ -91,9 +92,10 @@ fn sort_in_memory(batch: SFrameRows, keys: &[SortKey]) -> Result<SFrameRows> {
 
     // Step 1: Build permutation by sorting indices on key columns only.
     // This is the "sort key columns + row numbers" step of EC-Sort.
+    // Uses rayon's parallel sort for large datasets (>10K rows).
     let mut indices: Vec<usize> = (0..n).collect();
 
-    indices.sort_by(|&a, &b| {
+    let cmp = |&a: &usize, &b: &usize| -> std::cmp::Ordering {
         for key in keys {
             let va = batch.column(key.column).get(a);
             let vb = batch.column(key.column).get(b);
@@ -107,7 +109,13 @@ fn sort_in_memory(batch: SFrameRows, keys: &[SortKey]) -> Result<SFrameRows> {
             }
         }
         std::cmp::Ordering::Equal
-    });
+    };
+
+    if n > 10_000 {
+        indices.par_sort_by(cmp);
+    } else {
+        indices.sort_by(cmp);
+    }
 
     // Step 2: Apply permutation to all columns in one pass.
     // This is the "apply forward-map" step of EC-Sort.

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use futures::stream::{self, Stream, StreamExt};
 
+use rayon::prelude::*;
 use sframe_storage::sframe_reader::SFrameReader;
+use sframe_storage::segment_reader::SegmentReader;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
@@ -157,26 +159,48 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     }
 }
 
-/// Compile an SFrame source: reads one segment at a time and emits batches.
+/// Compile an SFrame source: reads segments in parallel and emits batches.
 ///
-/// Unlike the previous implementation that loaded all columns eagerly,
-/// this reads segment-by-segment. Only one segment's data is in memory
-/// at a time, limiting peak memory usage.
+/// Uses rayon to read multiple segments concurrently when the SFrame has
+/// more than one segment. Each segment opens its own file handle, enabling
+/// true parallel I/O on SSDs.
 fn compile_sframe_source(
     path: &str,
     column_types: &[FlexTypeEnum],
     _num_rows: u64,
 ) -> Result<BatchStream> {
-    let mut reader = SFrameReader::open(path)?;
+    let reader = SFrameReader::open(path)?;
     let num_segments = reader.num_segments();
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
 
-    // Read segment-at-a-time: for each segment, read all columns,
-    // then emit as batches of SOURCE_BATCH_SIZE.
-    let mut batches: Vec<Result<SFrameRows>> = Vec::new();
+    // Collect segment file paths for parallel reading
+    let segment_paths: Vec<String> = reader
+        .group_index
+        .segment_files
+        .iter()
+        .map(|f| format!("{}/{}", path, f))
+        .collect();
 
-    for seg_idx in 0..num_segments {
-        let seg_data = reader.read_segment_columns(seg_idx)?;
+    // Read segments in parallel using rayon.
+    // Each segment opens its own file handle for independent I/O.
+    let all_segment_data: Vec<Result<Vec<Vec<FlexType>>>> = if num_segments <= 1 {
+        // Single segment: no parallelism overhead
+        segment_paths
+            .iter()
+            .map(|seg_path| read_segment_independently(seg_path, &dtypes))
+            .collect()
+    } else {
+        // Multiple segments: parallel reads
+        segment_paths
+            .par_iter()
+            .map(|seg_path| read_segment_independently(seg_path, &dtypes))
+            .collect()
+    };
+
+    // Convert to batches
+    let mut batches: Vec<Result<SFrameRows>> = Vec::new();
+    for seg_result in all_segment_data {
+        let seg_data = seg_result?;
         let seg_rows = if seg_data.is_empty() { 0 } else { seg_data[0].len() };
 
         let mut offset = 0;
@@ -193,10 +217,31 @@ fn compile_sframe_source(
             batches.push(SFrameRows::new(columns));
             offset = end;
         }
-        // seg_data is dropped here, freeing the segment's memory
     }
 
     Ok(Box::pin(stream::iter(batches)))
+}
+
+/// Read all columns from a segment file independently.
+///
+/// Opens its own file handle, so it can be called from any thread.
+fn read_segment_independently(
+    segment_path: &str,
+    column_types: &[FlexTypeEnum],
+) -> Result<Vec<Vec<FlexType>>> {
+    let file = std::fs::File::open(segment_path).map_err(SFrameError::Io)?;
+    let file_size = file.metadata().map_err(SFrameError::Io)?.len();
+    let mut seg_reader = SegmentReader::open(
+        Box::new(file),
+        file_size,
+        column_types.to_vec(),
+    )?;
+    let num_cols = seg_reader.num_columns();
+    let mut columns = Vec::with_capacity(num_cols);
+    for col in 0..num_cols {
+        columns.push(seg_reader.read_column(col)?);
+    }
+    Ok(columns)
 }
 
 /// Compile a range source.

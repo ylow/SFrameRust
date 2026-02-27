@@ -1,5 +1,7 @@
 //! Parsers for .frame_idx (INI) and .sidx (JSON) index files.
 
+use std::collections::HashMap;
+
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexTypeEnum;
 
@@ -12,6 +14,7 @@ pub struct FrameIndex {
     pub nrows: u64,
     pub column_names: Vec<String>,
     pub column_files: Vec<String>,
+    pub metadata: HashMap<String, String>,
 }
 
 impl FrameIndex {
@@ -22,6 +25,7 @@ impl FrameIndex {
         let mut nrows = 0u64;
         let mut column_names: Vec<(usize, String)> = Vec::new();
         let mut column_files: Vec<(usize, String)> = Vec::new();
+        let mut metadata: HashMap<String, String> = HashMap::new();
         let mut section = String::new();
 
         for line in content.lines() {
@@ -67,6 +71,9 @@ impl FrameIndex {
                         })?;
                         column_files.push((idx, value.to_string()));
                     }
+                    "metadata" => {
+                        metadata.insert(key.to_string(), value.to_string());
+                    }
                     _ => {}
                 }
             }
@@ -93,6 +100,7 @@ impl FrameIndex {
             nrows,
             column_names,
             column_files,
+            metadata,
         })
     }
 }

@@ -80,6 +80,7 @@ pub fn write_sframe(
         &sidx_file,
         nrows,
         1,
+        &std::collections::HashMap::new(),
     )?;
 
     // Write dir_archive.ini
@@ -212,6 +213,7 @@ fn write_frame_idx(
     sidx_file: &str,
     nrows: u64,
     num_segments: usize,
+    metadata: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let mut content = String::new();
 
@@ -232,6 +234,9 @@ fn write_frame_idx(
     }
 
     content.push_str("\n[metadata]\n");
+    for (key, value) in metadata {
+        content.push_str(&format!("{}={}\n", key, value));
+    }
 
     std::fs::write(path, content).map_err(|e| SFrameError::Io(e))?;
 
@@ -300,6 +305,9 @@ pub struct SFrameWriter {
     column_buffers: Vec<Vec<FlexType>>,
     buffered_rows: usize,
     total_rows: u64,
+
+    // User metadata
+    metadata: std::collections::HashMap<String, String>,
 }
 
 impl SFrameWriter {
@@ -359,7 +367,13 @@ impl SFrameWriter {
             column_buffers: vec![Vec::new(); num_columns],
             buffered_rows: 0,
             total_rows: 0,
+            metadata: std::collections::HashMap::new(),
         })
+    }
+
+    /// Set a metadata key-value pair to be persisted in the frame_idx file.
+    pub fn set_metadata(&mut self, key: &str, value: &str) {
+        self.metadata.insert(key.to_string(), value.to_string());
     }
 
     /// Write a batch of column data. Each element of `columns` contains
@@ -509,6 +523,7 @@ impl SFrameWriter {
             &sidx_file,
             self.total_rows,
             num_segments,
+            &self.metadata,
         )?;
 
         // Write dir_archive.ini
