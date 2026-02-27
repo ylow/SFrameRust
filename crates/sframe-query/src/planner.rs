@@ -97,6 +97,9 @@ pub trait Aggregator: Send + Sync {
 
     /// Clone this aggregator (needed since we can't use Clone with dyn).
     fn box_clone(&self) -> Box<dyn Aggregator>;
+
+    /// Downcast support for merge operations.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 impl PlannerNode {

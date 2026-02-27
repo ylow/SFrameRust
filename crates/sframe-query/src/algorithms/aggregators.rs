@@ -1,0 +1,718 @@
+//! Built-in aggregator implementations.
+//!
+//! Each aggregator implements the `Aggregator` trait for use in
+//! groupby and reduce operations.
+
+use std::any::Any;
+
+use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+
+use crate::planner::Aggregator;
+
+/// Count aggregator — counts non-undefined values.
+#[derive(Clone)]
+pub struct CountAggregator {
+    count: u64,
+}
+
+impl CountAggregator {
+    pub fn new() -> Self {
+        CountAggregator { count: 0 }
+    }
+}
+
+impl Default for CountAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for CountAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if !values.is_empty() && !matches!(values[0], FlexType::Undefined) {
+            self.count += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<CountAggregator>() {
+            self.count += o.count;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.count as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Sum aggregator — sums numeric values.
+#[derive(Clone)]
+pub struct SumAggregator {
+    int_sum: i64,
+    float_sum: f64,
+    is_float: bool,
+    has_value: bool,
+}
+
+impl SumAggregator {
+    pub fn new() -> Self {
+        SumAggregator {
+            int_sum: 0,
+            float_sum: 0.0,
+            is_float: false,
+            has_value: false,
+        }
+    }
+}
+
+impl Default for SumAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for SumAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) => {
+                self.int_sum += i;
+                self.has_value = true;
+            }
+            FlexType::Float(f) => {
+                self.float_sum += f;
+                self.is_float = true;
+                self.has_value = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<SumAggregator>() {
+            self.int_sum += o.int_sum;
+            self.float_sum += o.float_sum;
+            if o.is_float {
+                self.is_float = true;
+            }
+            if o.has_value {
+                self.has_value = true;
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        if !self.has_value {
+            return FlexType::Undefined;
+        }
+        if self.is_float {
+            FlexType::Float(self.float_sum + self.int_sum as f64)
+        } else {
+            FlexType::Integer(self.int_sum)
+        }
+    }
+
+    fn output_type(&self, input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        if !input_types.is_empty() && input_types[0] == FlexTypeEnum::Float {
+            FlexTypeEnum::Float
+        } else {
+            FlexTypeEnum::Integer
+        }
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Mean aggregator — computes arithmetic mean.
+#[derive(Clone)]
+pub struct MeanAggregator {
+    sum: f64,
+    count: u64,
+}
+
+impl MeanAggregator {
+    pub fn new() -> Self {
+        MeanAggregator { sum: 0.0, count: 0 }
+    }
+}
+
+impl Default for MeanAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for MeanAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) => {
+                self.sum += *i as f64;
+                self.count += 1;
+            }
+            FlexType::Float(f) => {
+                self.sum += f;
+                self.count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<MeanAggregator>() {
+            self.sum += o.sum;
+            self.count += o.count;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        if self.count == 0 {
+            FlexType::Undefined
+        } else {
+            FlexType::Float(self.sum / self.count as f64)
+        }
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Float
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Min aggregator — finds the minimum value.
+#[derive(Clone)]
+pub struct MinAggregator {
+    min_int: Option<i64>,
+    min_float: Option<f64>,
+}
+
+impl MinAggregator {
+    pub fn new() -> Self {
+        MinAggregator {
+            min_int: None,
+            min_float: None,
+        }
+    }
+}
+
+impl Default for MinAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for MinAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) => {
+                self.min_int = Some(self.min_int.map_or(*i, |m| m.min(*i)));
+            }
+            FlexType::Float(f) => {
+                self.min_float = Some(self.min_float.map_or(*f, |m| m.min(*f)));
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<MinAggregator>() {
+            if let Some(oi) = o.min_int {
+                self.min_int = Some(self.min_int.map_or(oi, |m| m.min(oi)));
+            }
+            if let Some(of) = o.min_float {
+                self.min_float = Some(self.min_float.map_or(of, |m| m.min(of)));
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        match (self.min_int, self.min_float) {
+            (Some(i), None) => FlexType::Integer(i),
+            (None, Some(f)) => FlexType::Float(f),
+            (Some(i), Some(f)) => {
+                if (i as f64) <= f {
+                    FlexType::Integer(i)
+                } else {
+                    FlexType::Float(f)
+                }
+            }
+            (None, None) => FlexType::Undefined,
+        }
+    }
+
+    fn output_type(&self, input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        if !input_types.is_empty() {
+            input_types[0]
+        } else {
+            FlexTypeEnum::Undefined
+        }
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Max aggregator — finds the maximum value.
+#[derive(Clone)]
+pub struct MaxAggregator {
+    max_int: Option<i64>,
+    max_float: Option<f64>,
+}
+
+impl MaxAggregator {
+    pub fn new() -> Self {
+        MaxAggregator {
+            max_int: None,
+            max_float: None,
+        }
+    }
+}
+
+impl Default for MaxAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for MaxAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) => {
+                self.max_int = Some(self.max_int.map_or(*i, |m| m.max(*i)));
+            }
+            FlexType::Float(f) => {
+                self.max_float = Some(self.max_float.map_or(*f, |m| m.max(*f)));
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<MaxAggregator>() {
+            if let Some(oi) = o.max_int {
+                self.max_int = Some(self.max_int.map_or(oi, |m| m.max(oi)));
+            }
+            if let Some(of) = o.max_float {
+                self.max_float = Some(self.max_float.map_or(of, |m| m.max(of)));
+            }
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        match (self.max_int, self.max_float) {
+            (Some(i), None) => FlexType::Integer(i),
+            (None, Some(f)) => FlexType::Float(f),
+            (Some(i), Some(f)) => {
+                if (i as f64) >= f {
+                    FlexType::Integer(i)
+                } else {
+                    FlexType::Float(f)
+                }
+            }
+            (None, None) => FlexType::Undefined,
+        }
+    }
+
+    fn output_type(&self, input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        if !input_types.is_empty() {
+            input_types[0]
+        } else {
+            FlexTypeEnum::Undefined
+        }
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Variance aggregator — computes sample variance using Welford's algorithm.
+#[derive(Clone)]
+pub struct VarianceAggregator {
+    count: u64,
+    mean: f64,
+    m2: f64,
+    ddof: u64, // 0 for population, 1 for sample
+}
+
+impl VarianceAggregator {
+    pub fn new(ddof: u64) -> Self {
+        VarianceAggregator {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            ddof,
+        }
+    }
+
+    /// Sample variance (ddof=1).
+    pub fn sample() -> Self {
+        Self::new(1)
+    }
+
+    /// Population variance (ddof=0).
+    pub fn population() -> Self {
+        Self::new(0)
+    }
+}
+
+impl Aggregator for VarianceAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        let x = match &values[0] {
+            FlexType::Integer(i) => *i as f64,
+            FlexType::Float(f) => *f,
+            _ => return,
+        };
+        self.count += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = x - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<VarianceAggregator>() {
+            if o.count == 0 {
+                return;
+            }
+            if self.count == 0 {
+                self.count = o.count;
+                self.mean = o.mean;
+                self.m2 = o.m2;
+                return;
+            }
+            let total = self.count + o.count;
+            let delta = o.mean - self.mean;
+            self.m2 += o.m2
+                + delta * delta * (self.count as f64 * o.count as f64) / total as f64;
+            self.mean = (self.mean * self.count as f64 + o.mean * o.count as f64) / total as f64;
+            self.count = total;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        if self.count <= self.ddof {
+            return FlexType::Undefined;
+        }
+        FlexType::Float(self.m2 / (self.count - self.ddof) as f64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Float
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// StdDev aggregator — standard deviation (sqrt of variance).
+#[derive(Clone)]
+pub struct StdDevAggregator {
+    var_agg: VarianceAggregator,
+}
+
+impl StdDevAggregator {
+    pub fn sample() -> Self {
+        StdDevAggregator {
+            var_agg: VarianceAggregator::sample(),
+        }
+    }
+
+    pub fn population() -> Self {
+        StdDevAggregator {
+            var_agg: VarianceAggregator::population(),
+        }
+    }
+}
+
+impl Aggregator for StdDevAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        self.var_agg.add(values);
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<StdDevAggregator>() {
+            self.var_agg.merge(&o.var_agg);
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        match self.var_agg.finalize() {
+            FlexType::Float(v) => FlexType::Float(v.sqrt()),
+            other => other,
+        }
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Float
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Concat aggregator — collects values into a List.
+#[derive(Clone)]
+pub struct ConcatAggregator {
+    values: Vec<FlexType>,
+}
+
+impl ConcatAggregator {
+    pub fn new() -> Self {
+        ConcatAggregator { values: Vec::new() }
+    }
+}
+
+impl Default for ConcatAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for ConcatAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if !values.is_empty() {
+            self.values.push(values[0].clone());
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<ConcatAggregator>() {
+            self.values.extend_from_slice(&o.values);
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::List(self.values.clone().into())
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::List
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Specification for a groupby aggregation.
+#[derive(Clone)]
+pub struct AggSpec {
+    /// Which column to aggregate on.
+    pub column: usize,
+    /// The aggregator to use.
+    pub aggregator: Box<dyn Aggregator>,
+    /// Output column name.
+    pub output_name: String,
+}
+
+impl AggSpec {
+    pub fn new(column: usize, aggregator: Box<dyn Aggregator>, output_name: &str) -> Self {
+        AggSpec {
+            column,
+            aggregator,
+            output_name: output_name.to_string(),
+        }
+    }
+
+    pub fn count(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(CountAggregator::new()), output_name)
+    }
+
+    pub fn sum(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(SumAggregator::new()), output_name)
+    }
+
+    pub fn mean(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(MeanAggregator::new()), output_name)
+    }
+
+    pub fn min(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(MinAggregator::new()), output_name)
+    }
+
+    pub fn max(column: usize, output_name: &str) -> Self {
+        Self::new(column, Box::new(MaxAggregator::new()), output_name)
+    }
+}
+
+impl Clone for Box<dyn Aggregator> {
+    fn clone(&self) -> Self {
+        self.box_clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_count() {
+        let mut agg = CountAggregator::new();
+        agg.add(&[FlexType::Integer(1)]);
+        agg.add(&[FlexType::Integer(2)]);
+        agg.add(&[FlexType::Undefined]);
+        agg.add(&[FlexType::Integer(3)]);
+        assert_eq!(agg.finalize(), FlexType::Integer(3));
+    }
+
+    #[test]
+    fn test_sum_int() {
+        let mut agg = SumAggregator::new();
+        agg.add(&[FlexType::Integer(10)]);
+        agg.add(&[FlexType::Integer(20)]);
+        agg.add(&[FlexType::Integer(30)]);
+        assert_eq!(agg.finalize(), FlexType::Integer(60));
+    }
+
+    #[test]
+    fn test_sum_float() {
+        let mut agg = SumAggregator::new();
+        agg.add(&[FlexType::Float(1.5)]);
+        agg.add(&[FlexType::Float(2.5)]);
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mean() {
+        let mut agg = MeanAggregator::new();
+        agg.add(&[FlexType::Float(2.0)]);
+        agg.add(&[FlexType::Float(4.0)]);
+        agg.add(&[FlexType::Float(6.0)]);
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_min_max() {
+        let mut min_agg = MinAggregator::new();
+        let mut max_agg = MaxAggregator::new();
+        for &v in &[5, 2, 8, 1, 9] {
+            min_agg.add(&[FlexType::Integer(v)]);
+            max_agg.add(&[FlexType::Integer(v)]);
+        }
+        assert_eq!(min_agg.finalize(), FlexType::Integer(1));
+        assert_eq!(max_agg.finalize(), FlexType::Integer(9));
+    }
+
+    #[test]
+    fn test_variance() {
+        // Values: 2, 4, 4, 4, 5, 5, 7, 9
+        // Population variance = 4.0
+        let mut agg = VarianceAggregator::population();
+        for &v in &[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+            agg.add(&[FlexType::Float(v)]);
+        }
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stddev() {
+        let mut agg = StdDevAggregator::population();
+        for &v in &[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+            agg.add(&[FlexType::Float(v)]);
+        }
+        match agg.finalize() {
+            FlexType::Float(v) => assert!((v - 2.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge() {
+        let mut agg1 = SumAggregator::new();
+        let mut agg2 = SumAggregator::new();
+        agg1.add(&[FlexType::Integer(10)]);
+        agg1.add(&[FlexType::Integer(20)]);
+        agg2.add(&[FlexType::Integer(30)]);
+        agg2.add(&[FlexType::Integer(40)]);
+        agg1.merge(&agg2);
+        assert_eq!(agg1.finalize(), FlexType::Integer(100));
+    }
+
+    #[test]
+    fn test_concat() {
+        let mut agg = ConcatAggregator::new();
+        agg.add(&[FlexType::String("a".into())]);
+        agg.add(&[FlexType::String("b".into())]);
+        agg.add(&[FlexType::String("c".into())]);
+        match agg.finalize() {
+            FlexType::List(l) => {
+                assert_eq!(l.len(), 3);
+                assert_eq!(l[0], FlexType::String("a".into()));
+                assert_eq!(l[1], FlexType::String("b".into()));
+                assert_eq!(l[2], FlexType::String("c".into()));
+            }
+            other => panic!("Expected List, got {:?}", other),
+        }
+    }
+}
