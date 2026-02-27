@@ -9,6 +9,7 @@ use std::sync::Arc;
 use sframe_query::algorithms::aggregators::AggSpec;
 use sframe_query::algorithms::csv_parser::{read_csv, CsvOptions};
 use sframe_query::algorithms::csv_writer::{self, CsvWriterOptions};
+use sframe_query::algorithms::json as json_io;
 use sframe_query::algorithms::groupby;
 use sframe_query::algorithms::join::{self, JoinOn, JoinType};
 use sframe_query::algorithms::sort::{self, SortKey, SortOrder};
@@ -74,6 +75,25 @@ impl SFrame {
             .map(|(i, &dtype)| {
                 SArray::from_plan(plan.clone(), dtype, Some(num_rows), i)
             })
+            .collect();
+
+        Ok(SFrame {
+            columns,
+            column_names: col_names,
+        })
+    }
+
+    /// Read a JSON Lines file into an SFrame.
+    pub fn from_json(path: &str) -> Result<Self> {
+        let (col_names, batch) = json_io::read_json_file(path)?;
+        let plan = PlannerNode::materialized(batch.clone());
+        let num_rows = batch.num_rows() as u64;
+        let dtypes = batch.dtypes();
+
+        let columns: Vec<SArray> = dtypes
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
             .collect();
 
         Ok(SFrame {
@@ -983,6 +1003,12 @@ impl SFrame {
         csv_writer::write_csv_file(path, &batch, &self.column_names, &opts)
     }
 
+    /// Write to JSON Lines file.
+    pub fn to_json(&self, path: &str) -> Result<()> {
+        let batch = self.materialize_batch()?;
+        json_io::write_json_file(path, &batch, &self.column_names)
+    }
+
     /// Iterate over rows.
     pub fn iter_rows(&self) -> Result<Vec<Vec<FlexType>>> {
         let batch = self.materialize_batch()?;
@@ -1733,5 +1759,39 @@ mod tests {
         assert!(content.contains("id,name"));
         assert!(content.contains("1,alice"));
         assert!(content.contains("2,bob"));
+    }
+
+    #[test]
+    fn test_json_roundtrip() {
+        let sf = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                vec![FlexType::String("alice".into()), FlexType::String("bob".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("score", SArray::from_vec(
+                vec![FlexType::Float(90.5), FlexType::Float(85.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        sf.to_json(path_str).unwrap();
+
+        // Verify file content
+        let content = std::fs::read_to_string(path_str).unwrap();
+        assert!(content.contains("\"id\":1"));
+        assert!(content.contains("\"name\":\"alice\""));
+
+        // Read back
+        let sf2 = SFrame::from_json(path_str).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), 2);
+        assert_eq!(sf2.num_columns(), 3);
     }
 }
