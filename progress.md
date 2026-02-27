@@ -2,12 +2,39 @@
 
 ## Current Status
 **Last Updated:** 2026-02-27
-**Tasks Completed:** 17
-**Current Task:** Phases 6-12, 14 complete — remaining: 13, 15, 16
+**Tasks Completed:** 21
+**Current Task:** ALL PHASES COMPLETE (6-16)
 
 ---
 
 ## Session Log
+
+### 2026-02-27 — Phase 15.1+15.3+16.2-16.5: Storage Backends, Cache, Image Type
+
+**Commit:** `45189b4` — `feat: Phase 15.1+15.3+16.2-16.5 — storage backend stubs, cache, image type`
+
+**What was done:**
+Phase 15.1: S3 storage backend stub with S3Config struct. Phase 15.3: HDFS storage backend stub with HdfsConfig struct. Phase 16.2: Verified materialize() already works as explicit caching for lazy evaluation. Phase 16.4: CachedFileSystem LRU read cache wrapping any VFS backend with configurable memory budget, auto-eviction, invalidation on write/remove. Phase 16.5: FlexImage type for ML image workflows (Raw/JPEG/PNG, pixel access, dimension metadata). 8 new tests.
+
+**Tests:** All 294 tests pass.
+
+### 2026-02-27 — Phase 13+15.2+16.1: Parallel Execution, HTTP VFS, Metadata
+
+**Commit:** `ba90957` — `feat: Phase 13 + 15.2 + 16.1 — parallel execution, HTTP VFS, metadata`
+
+**What was done:**
+Phase 13.1: Parallel segment reads using rayon (multi-segment SFrames read concurrently via independent file handles). Phase 13.3: Parallel sort via rayon par_sort_by for datasets >10K rows. Phase 15.2: HTTP/HTTPS read-only VFS backend (behind http feature flag) using ureq. Phase 16.1: SFrame metadata — key-value pairs stored in frame_idx [metadata] section, persisted through save/load cycle, get_metadata/set_metadata/remove_metadata APIs. 3 new tests.
+
+**Tests:** All 286 tests pass.
+
+### 2026-02-27 — Phase 8.4 + Remaining 9.2: Astype and Aggregators
+
+**Commit:** `edd05c7` — `feat(sarray+query): Phase 8.4 + remaining 9.2 — astype and aggregators`
+
+**What was done:**
+Phase 8.4: SArray astype() for type casting (int↔float, numeric→string, string→numeric with parse fallback, undefined_on_failure mode). Phase 9.2 remaining: FrequencyCount (value→count Dict), ZipList (collect into List), VectorSum/VectorAvg (element-wise vector aggregation). 7 new tests.
+
+**Tests:** All 283 tests pass.
 
 ### 2026-02-27 — Phase 12: Query Optimizer
 
