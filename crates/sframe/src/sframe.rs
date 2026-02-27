@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use sframe_query::algorithms::aggregators::AggSpec;
 use sframe_query::algorithms::csv_parser::{read_csv, CsvOptions};
+use sframe_query::algorithms::csv_writer::{self, CsvWriterOptions};
 use sframe_query::algorithms::groupby;
 use sframe_query::algorithms::join::{self, JoinOn, JoinType};
 use sframe_query::algorithms::sort::{self, SortKey, SortOrder};
@@ -576,6 +577,331 @@ impl SFrame {
         sorted.head(k)
     }
 
+    // === Phase 11.4: Reshaping ===
+
+    /// Pack multiple columns into a single Dict column.
+    ///
+    /// Each row becomes a dict mapping column_name → value for the packed columns.
+    /// The packed columns are removed and replaced by a new column.
+    pub fn pack_columns(
+        &self,
+        columns: &[&str],
+        new_column_name: &str,
+    ) -> Result<SFrame> {
+        let pack_indices: Vec<usize> = columns
+            .iter()
+            .map(|&name| self.column_index(name))
+            .collect::<Result<_>>()?;
+        let pack_set: HashSet<usize> = pack_indices.iter().copied().collect();
+        let pack_names: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
+
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+
+        // Build non-packed columns
+        let mut new_names: Vec<String> = Vec::new();
+        let mut new_col_vecs: Vec<Vec<FlexType>> = Vec::new();
+        let mut new_dtypes: Vec<FlexTypeEnum> = Vec::new();
+        for (i, name) in self.column_names.iter().enumerate() {
+            if !pack_set.contains(&i) {
+                new_names.push(name.clone());
+                let mut col = Vec::with_capacity(nrows);
+                for row in 0..nrows {
+                    col.push(batch.column(i).get(row).clone());
+                }
+                new_col_vecs.push(col);
+                new_dtypes.push(self.columns[i].dtype());
+            }
+        }
+
+        // Build the packed dict column
+        let mut dict_col = Vec::with_capacity(nrows);
+        for row in 0..nrows {
+            let entries: Vec<(FlexType, FlexType)> = pack_indices
+                .iter()
+                .enumerate()
+                .map(|(pi, &ci)| {
+                    (
+                        FlexType::String(pack_names[pi].clone().into()),
+                        batch.column(ci).get(row).clone(),
+                    )
+                })
+                .collect();
+            dict_col.push(FlexType::Dict(Arc::from(entries)));
+        }
+        new_names.push(new_column_name.to_string());
+        new_col_vecs.push(dict_col);
+        new_dtypes.push(FlexTypeEnum::Dict);
+
+        let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
+        let plan = PlannerNode::materialized(result.clone());
+        let num_rows = result.num_rows() as u64;
+        let dtypes = result.dtypes();
+
+        let columns: Vec<SArray> = dtypes
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
+            .collect();
+
+        Ok(SFrame {
+            columns,
+            column_names: new_names,
+        })
+    }
+
+    /// Unpack a Dict/List column into separate columns.
+    ///
+    /// For Dict columns: creates one column per unique key.
+    /// For List columns: creates numbered columns (prefix.0, prefix.1, ...).
+    pub fn unpack_column(
+        &self,
+        column_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<SFrame> {
+        let col_idx = self.column_index(column_name)?;
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let pfx = prefix.unwrap_or(column_name);
+
+        // Determine keys/positions by scanning the column
+        let col_dtype = self.columns[col_idx].dtype();
+
+        match col_dtype {
+            FlexTypeEnum::Dict => {
+                // Collect all unique keys
+                let mut all_keys: Vec<FlexType> = Vec::new();
+                for row in 0..nrows {
+                    if let FlexType::Dict(d) = batch.column(col_idx).get(row) {
+                        for (k, _) in d.iter() {
+                            if !all_keys.contains(k) {
+                                all_keys.push(k.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Build unpacked columns
+                let mut new_names: Vec<String> = Vec::new();
+                let mut new_col_vecs: Vec<Vec<FlexType>> = Vec::new();
+                let mut new_dtypes: Vec<FlexTypeEnum> = Vec::new();
+
+                // Keep other columns
+                for (i, name) in self.column_names.iter().enumerate() {
+                    if i != col_idx {
+                        new_names.push(name.clone());
+                        let mut col = Vec::with_capacity(nrows);
+                        for row in 0..nrows {
+                            col.push(batch.column(i).get(row).clone());
+                        }
+                        new_col_vecs.push(col);
+                        new_dtypes.push(self.columns[i].dtype());
+                    }
+                }
+
+                // Add unpacked columns
+                for key in &all_keys {
+                    let key_str = format!("{}", key);
+                    new_names.push(format!("{}.{}", pfx, key_str));
+
+                    let mut col = Vec::with_capacity(nrows);
+                    let mut inferred_type = FlexTypeEnum::String;
+                    for row in 0..nrows {
+                        if let FlexType::Dict(d) = batch.column(col_idx).get(row) {
+                            let val = d.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+                            let v = val.unwrap_or(FlexType::Undefined);
+                            if !matches!(v, FlexType::Undefined) && inferred_type == FlexTypeEnum::String {
+                                inferred_type = match &v {
+                                    FlexType::Integer(_) => FlexTypeEnum::Integer,
+                                    FlexType::Float(_) => FlexTypeEnum::Float,
+                                    FlexType::Vector(_) => FlexTypeEnum::Vector,
+                                    FlexType::List(_) => FlexTypeEnum::List,
+                                    FlexType::Dict(_) => FlexTypeEnum::Dict,
+                                    _ => FlexTypeEnum::String,
+                                };
+                            }
+                            col.push(v);
+                        } else {
+                            col.push(FlexType::Undefined);
+                        }
+                    }
+                    new_col_vecs.push(col);
+                    new_dtypes.push(inferred_type);
+                }
+
+                let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
+                let plan = PlannerNode::materialized(result.clone());
+                let num_rows = result.num_rows() as u64;
+                let dtypes = result.dtypes();
+
+                let columns: Vec<SArray> = dtypes.iter().enumerate()
+                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
+                    .collect();
+
+                Ok(SFrame { columns, column_names: new_names })
+            }
+            FlexTypeEnum::List => {
+                // Determine max list length
+                let mut max_len = 0usize;
+                for row in 0..nrows {
+                    if let FlexType::List(l) = batch.column(col_idx).get(row) {
+                        max_len = max_len.max(l.len());
+                    }
+                }
+
+                let mut new_names: Vec<String> = Vec::new();
+                let mut new_col_vecs: Vec<Vec<FlexType>> = Vec::new();
+                let mut new_dtypes: Vec<FlexTypeEnum> = Vec::new();
+
+                // Keep other columns
+                for (i, name) in self.column_names.iter().enumerate() {
+                    if i != col_idx {
+                        new_names.push(name.clone());
+                        let mut col = Vec::with_capacity(nrows);
+                        for row in 0..nrows {
+                            col.push(batch.column(i).get(row).clone());
+                        }
+                        new_col_vecs.push(col);
+                        new_dtypes.push(self.columns[i].dtype());
+                    }
+                }
+
+                // Add unpacked columns
+                for pos in 0..max_len {
+                    new_names.push(format!("{}.{}", pfx, pos));
+                    let mut col = Vec::with_capacity(nrows);
+                    let mut inferred_type = FlexTypeEnum::String;
+                    for row in 0..nrows {
+                        if let FlexType::List(l) = batch.column(col_idx).get(row) {
+                            let v = l.get(pos).cloned().unwrap_or(FlexType::Undefined);
+                            if !matches!(v, FlexType::Undefined) && inferred_type == FlexTypeEnum::String {
+                                inferred_type = match &v {
+                                    FlexType::Integer(_) => FlexTypeEnum::Integer,
+                                    FlexType::Float(_) => FlexTypeEnum::Float,
+                                    _ => FlexTypeEnum::String,
+                                };
+                            }
+                            col.push(v);
+                        } else {
+                            col.push(FlexType::Undefined);
+                        }
+                    }
+                    new_col_vecs.push(col);
+                    new_dtypes.push(inferred_type);
+                }
+
+                let result = SFrameRows::from_column_vecs(new_col_vecs, &new_dtypes)?;
+                let plan = PlannerNode::materialized(result.clone());
+                let num_rows = result.num_rows() as u64;
+                let dtypes = result.dtypes();
+
+                let columns: Vec<SArray> = dtypes.iter().enumerate()
+                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
+                    .collect();
+
+                Ok(SFrame { columns, column_names: new_names })
+            }
+            _ => Err(SFrameError::Format(format!(
+                "Cannot unpack column '{}' of type {:?}; expected Dict or List",
+                column_name, col_dtype
+            ))),
+        }
+    }
+
+    /// Unnest a List or Dict column (one row per element).
+    ///
+    /// For List: each list element becomes its own row, with other columns duplicated.
+    /// For Dict: expands to (key, value) columns.
+    pub fn stack(&self, column_name: &str, new_column_name: &str) -> Result<SFrame> {
+        let col_idx = self.column_index(column_name)?;
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+        let col_dtype = self.columns[col_idx].dtype();
+
+        let mut new_names: Vec<String> = self.column_names.clone();
+        new_names[col_idx] = new_column_name.to_string();
+
+        let mut new_dtypes: Vec<FlexTypeEnum> = self.column_types();
+
+        // For dict stacking, replace the column with key-value pair columns
+        match col_dtype {
+            FlexTypeEnum::List | FlexTypeEnum::Vector => {
+                // Infer element type from first non-empty element
+                let elem_type = if col_dtype == FlexTypeEnum::Vector {
+                    FlexTypeEnum::Float
+                } else {
+                    // Scan for first non-empty list and use its first element's type
+                    let mut found = FlexTypeEnum::String;
+                    for row in 0..nrows {
+                        if let FlexType::List(l) = batch.column(col_idx).get(row) {
+                            if let Some(first) = l.first() {
+                                found = match first {
+                                    FlexType::Integer(_) => FlexTypeEnum::Integer,
+                                    FlexType::Float(_) => FlexTypeEnum::Float,
+                                    FlexType::String(_) => FlexTypeEnum::String,
+                                    FlexType::Vector(_) => FlexTypeEnum::Vector,
+                                    FlexType::List(_) => FlexTypeEnum::List,
+                                    FlexType::Dict(_) => FlexTypeEnum::Dict,
+                                    FlexType::DateTime(_) => FlexTypeEnum::DateTime,
+                                    FlexType::Undefined => FlexTypeEnum::String,
+                                };
+                                break;
+                            }
+                        }
+                    }
+                    found
+                };
+                new_dtypes[col_idx] = elem_type;
+                let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+
+                for row in 0..nrows {
+                    let elements: Vec<FlexType> = match batch.column(col_idx).get(row) {
+                        FlexType::List(l) => l.to_vec(),
+                        FlexType::Vector(v) => v.iter().map(|&f| FlexType::Float(f)).collect(),
+                        _ => vec![FlexType::Undefined],
+                    };
+
+                    if elements.is_empty() {
+                        // Keep row with Undefined for the stacked column
+                        for c in 0..ncols {
+                            if c == col_idx {
+                                col_vecs[c].push(FlexType::Undefined);
+                            } else {
+                                col_vecs[c].push(batch.column(c).get(row).clone());
+                            }
+                        }
+                    } else {
+                        for elem in elements {
+                            for c in 0..ncols {
+                                if c == col_idx {
+                                    col_vecs[c].push(elem.clone());
+                                } else {
+                                    col_vecs[c].push(batch.column(c).get(row).clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let result = SFrameRows::from_column_vecs(col_vecs, &new_dtypes)?;
+                let plan = PlannerNode::materialized(result.clone());
+                let out_rows = result.num_rows() as u64;
+                let dtypes = result.dtypes();
+
+                let columns: Vec<SArray> = dtypes.iter().enumerate()
+                    .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(out_rows), i))
+                    .collect();
+
+                Ok(SFrame { columns, column_names: new_names })
+            }
+            _ => Err(SFrameError::Format(format!(
+                "Cannot stack column '{}' of type {:?}; expected List or Vector",
+                column_name, col_dtype
+            ))),
+        }
+    }
+
     // === Phase 11.5: Deduplication ===
 
     /// Remove duplicate rows.
@@ -648,6 +974,13 @@ impl SFrame {
         })?;
 
         writer.finish()
+    }
+
+    /// Write to CSV file.
+    pub fn to_csv(&self, path: &str, options: Option<CsvWriterOptions>) -> Result<()> {
+        let opts = options.unwrap_or_default();
+        let batch = self.materialize_batch()?;
+        csv_writer::write_csv_file(path, &batch, &self.column_names, &opts)
     }
 
     /// Iterate over rows.
@@ -1302,5 +1635,103 @@ mod tests {
         let ids = last2.column("id").unwrap().to_vec().unwrap();
         assert_eq!(ids[0], FlexType::Integer(3));
         assert_eq!(ids[1], FlexType::Integer(4));
+    }
+
+    // === Phase 11.4 + 7.5 Tests ===
+
+    #[test]
+    fn test_pack_columns() {
+        let sf = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("x", SArray::from_vec(
+                vec![FlexType::Float(1.0), FlexType::Float(2.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+            ("y", SArray::from_vec(
+                vec![FlexType::Float(3.0), FlexType::Float(4.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let packed = sf.pack_columns(&["x", "y"], "coords").unwrap();
+        assert_eq!(packed.num_columns(), 2); // id + coords
+        assert_eq!(packed.column_names(), &["id", "coords"]);
+        assert_eq!(packed.column("coords").unwrap().dtype(), FlexTypeEnum::Dict);
+    }
+
+    #[test]
+    fn test_unpack_dict_column() {
+        // First pack, then unpack
+        let sf = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("x", SArray::from_vec(
+                vec![FlexType::Float(1.0), FlexType::Float(2.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+            ("y", SArray::from_vec(
+                vec![FlexType::Float(3.0), FlexType::Float(4.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let packed = sf.pack_columns(&["x", "y"], "coords").unwrap();
+        let unpacked = packed.unpack_column("coords", Some("c")).unwrap();
+        assert_eq!(unpacked.num_columns(), 3); // id + c.x + c.y
+        assert!(unpacked.column_names().contains(&"c.x".to_string()));
+        assert!(unpacked.column_names().contains(&"c.y".to_string()));
+    }
+
+    #[test]
+    fn test_stack() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::List(Arc::from(vec![FlexType::Integer(1), FlexType::Integer(2)])),
+                FlexType::List(Arc::from(vec![FlexType::Integer(3)])),
+            ],
+            FlexTypeEnum::List,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::String("a".into()), FlexType::String("b".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("items", sa),
+        ]).unwrap();
+
+        let stacked = sf.stack("items", "item").unwrap();
+        assert_eq!(stacked.num_rows().unwrap(), 3); // 2 + 1 = 3 rows
+        assert_eq!(stacked.column_names(), &["id", "item"]);
+    }
+
+    #[test]
+    fn test_to_csv() {
+        let sf = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                vec![FlexType::String("alice".into()), FlexType::String("bob".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.csv");
+        let path_str = path.to_str().unwrap();
+
+        sf.to_csv(path_str, None).unwrap();
+
+        let content = std::fs::read_to_string(path_str).unwrap();
+        assert!(content.contains("id,name"));
+        assert!(content.contains("1,alice"));
+        assert!(content.contains("2,bob"));
     }
 }
