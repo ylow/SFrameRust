@@ -10,10 +10,10 @@
 //! BlockInfo is serialized as POD (48 bytes per entry, matching C++ struct
 //! layout with 6 bytes of trailing padding).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use sframe_types::error::{Result, SFrameError};
-use sframe_types::serialization::{read_u16, read_u64};
+use sframe_types::serialization::{read_u16, read_u64, write_u16, write_u64};
 
 /// Block flags matching C++ BLOCK_FLAGS enum.
 pub const LZ4_COMPRESSION: u64 = 1;
@@ -66,6 +66,46 @@ impl BlockInfo {
     pub fn has_encoding_extension(&self) -> bool {
         self.flags & BLOCK_ENCODING_EXTENSION != 0
     }
+
+    /// Write a single BlockInfo (48 bytes, matching C++ POD layout).
+    pub fn write_to(&self, writer: &mut (impl Write + ?Sized)) -> Result<()> {
+        write_u64(writer, self.offset)?;
+        write_u64(writer, self.length)?;
+        write_u64(writer, self.block_size)?;
+        write_u64(writer, self.num_elem)?;
+        write_u64(writer, self.flags)?;
+        write_u16(writer, self.content_type)?;
+        // 6 bytes padding
+        writer.write_all(&[0u8; 6])?;
+        Ok(())
+    }
+}
+
+/// Write the block index (Vec<Vec<BlockInfo>>) as a segment file footer.
+/// Returns the number of bytes written (the footer_size).
+pub fn write_block_index(
+    writer: &mut (impl Write + ?Sized),
+    block_index: &[Vec<BlockInfo>],
+) -> Result<u64> {
+    let mut size = 0u64;
+
+    // Outer vec length
+    write_u64(writer, block_index.len() as u64)?;
+    size += 8;
+
+    for col_blocks in block_index {
+        // Inner vec length
+        write_u64(writer, col_blocks.len() as u64)?;
+        size += 8;
+
+        // POD blocks
+        for block in col_blocks {
+            block.write_to(writer)?;
+            size += 48;
+        }
+    }
+
+    Ok(size)
 }
 
 /// Read the block index (Vec<Vec<BlockInfo>>) from a segment file footer.

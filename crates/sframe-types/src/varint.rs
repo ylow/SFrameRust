@@ -47,7 +47,7 @@ pub fn decode_varint(reader: &mut (impl Read + ?Sized)) -> Result<u64> {
 }
 
 /// Encode a variable-length unsigned integer.
-pub fn encode_varint(value: u64, writer: &mut impl Write) -> Result<()> {
+pub fn encode_varint(value: u64, writer: &mut (impl Write + ?Sized)) -> Result<()> {
     let bits_needed = if value == 0 {
         0
     } else {

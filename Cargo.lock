@@ -292,6 +292,7 @@ dependencies = [
  "serde_json",
  "sframe-io",
  "sframe-types",
+ "tempfile",
  "thiserror",
 ]
 

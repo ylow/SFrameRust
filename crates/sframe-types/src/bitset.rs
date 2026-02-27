@@ -5,10 +5,10 @@
 //! - arrlen (8 bytes LE): number of u64 words
 //! - arrlen * 8 bytes: raw u64 words (little-endian)
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use crate::error::Result;
-use crate::serialization::read_u64;
+use crate::serialization::{read_u64, write_u64};
 
 /// A dense bitset stored as packed u64 words.
 pub struct DenseBitset {
@@ -37,6 +37,24 @@ impl DenseBitset {
         self.len == 0
     }
 
+    /// Create a new bitset of the given length, all bits cleared.
+    pub fn new(len: usize) -> Self {
+        let arrlen = (len + 63) / 64;
+        DenseBitset {
+            len,
+            words: vec![0u64; arrlen],
+        }
+    }
+
+    /// Set the bit at the given index.
+    pub fn set(&mut self, index: usize) {
+        if index < self.len {
+            let word_idx = index / 64;
+            let bit_idx = index % 64;
+            self.words[word_idx] |= 1u64 << bit_idx;
+        }
+    }
+
     /// Get bit at the given index. Returns false for out-of-range indices.
     pub fn get(&self, index: usize) -> bool {
         if index >= self.len {
@@ -45,6 +63,16 @@ impl DenseBitset {
         let word_idx = index / 64;
         let bit_idx = index % 64;
         (self.words[word_idx] >> bit_idx) & 1 == 1
+    }
+
+    /// Serialize to GraphLab archive format.
+    pub fn serialize(&self, writer: &mut (impl Write + ?Sized)) -> Result<()> {
+        write_u64(writer, self.len as u64)?;
+        write_u64(writer, self.words.len() as u64)?;
+        for &word in &self.words {
+            write_u64(writer, word)?;
+        }
+        Ok(())
     }
 }
 

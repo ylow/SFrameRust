@@ -13,3 +13,4 @@ thiserror = "2"
 
 [dev-dependencies]
 csv = "1"
+tempfile = "3"

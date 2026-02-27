@@ -10,11 +10,11 @@
 //! The BLOCK_ENCODING_EXTENSION flag in BlockInfo indicates the new format.
 //! Without that flag, legacy encoding is assumed (no reserved byte).
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 
 use sframe_types::error::{Result, SFrameError};
 
-use crate::codec_integer::decode_integers_for;
+use crate::codec_integer::{decode_integers_for, encode_integers_for};
 
 /// Reserved byte values for float encoding.
 const LEGACY_ENCODING: u8 = 0;
@@ -68,6 +68,39 @@ fn decode_floats_integer(data: &[u8], num_elements: usize) -> Result<Vec<f64>> {
         result.push(val as f64);
     }
     Ok(result)
+}
+
+// ==========================================================================
+// Encoding
+// ==========================================================================
+
+/// Encode floats, writing the reserved byte and encoded data.
+///
+/// Tries integer encoding first (if all values are exact integers), falls back
+/// to legacy bit-rotation encoding.
+pub fn encode_floats(writer: &mut (impl Write + ?Sized), values: &[f64]) -> Result<()> {
+    // Check if all values can be represented exactly as integers
+    let all_integer = values.iter().all(|&v| v == (v as i64) as f64 && v.is_finite());
+
+    if all_integer {
+        writer.write_all(&[INTEGER_ENCODING])?;
+        let ints: Vec<i64> = values.iter().map(|&v| v as i64).collect();
+        encode_integers_for(writer, &ints)?;
+    } else {
+        writer.write_all(&[LEGACY_ENCODING])?;
+        let rotated: Vec<i64> = values
+            .iter()
+            .map(|&v| rotate_double_bits(v.to_bits()) as i64)
+            .collect();
+        encode_integers_for(writer, &rotated)?;
+    }
+    Ok(())
+}
+
+/// Sign-magnitude rotation for legacy float encoding.
+/// C++ encoding: `encoded = (bits << 1) | (bits >> 63)`
+fn rotate_double_bits(bits: u64) -> u64 {
+    (bits << 1) | (bits >> 63)
 }
 
 /// Undo the sign-magnitude rotation used for legacy float encoding.

@@ -1,4 +1,4 @@
-//! GraphLab-compatible archive deserialization.
+//! GraphLab-compatible archive serialization and deserialization.
 //!
 //! The C++ oarchive/iarchive serializes primitives as little-endian POD:
 //! - Integers: raw LE bytes (u8/u16/u32/u64/i64)
@@ -7,7 +7,7 @@
 //! - Vectors: 8-byte LE length prefix + elements
 //! - FlexType: 1-byte tag (128 + type_enum) + value data
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use crate::error::{Result, SFrameError};
@@ -61,6 +61,119 @@ pub fn read_bytes(reader: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+// --- Primitive writers ---
+
+pub fn write_u8(writer: &mut (impl Write + ?Sized), val: u8) -> Result<()> {
+    writer.write_all(&[val])?;
+    Ok(())
+}
+
+pub fn write_u16(writer: &mut (impl Write + ?Sized), val: u16) -> Result<()> {
+    writer.write_all(&val.to_le_bytes())?;
+    Ok(())
+}
+
+pub fn write_u32(writer: &mut (impl Write + ?Sized), val: u32) -> Result<()> {
+    writer.write_all(&val.to_le_bytes())?;
+    Ok(())
+}
+
+pub fn write_u64(writer: &mut (impl Write + ?Sized), val: u64) -> Result<()> {
+    writer.write_all(&val.to_le_bytes())?;
+    Ok(())
+}
+
+pub fn write_i64(writer: &mut (impl Write + ?Sized), val: i64) -> Result<()> {
+    writer.write_all(&val.to_le_bytes())?;
+    Ok(())
+}
+
+pub fn write_f64(writer: &mut (impl Write + ?Sized), val: f64) -> Result<()> {
+    writer.write_all(&val.to_le_bytes())?;
+    Ok(())
+}
+
+/// Write a GraphLab-serialized string: 8-byte LE length + raw bytes.
+pub fn write_string(writer: &mut (impl Write + ?Sized), s: &str) -> Result<()> {
+    write_u64(writer, s.len() as u64)?;
+    writer.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+/// Write a GraphLab-serialized Vec<f64>: 8-byte LE length + raw f64 bytes.
+pub fn write_vec_f64(writer: &mut (impl Write + ?Sized), v: &[f64]) -> Result<()> {
+    write_u64(writer, v.len() as u64)?;
+    for &val in v {
+        write_f64(writer, val)?;
+    }
+    Ok(())
+}
+
+/// Serialize a FlexType to GraphLab archive format.
+pub fn write_flex_type(writer: &mut (impl Write + ?Sized), val: &FlexType) -> Result<()> {
+    match val {
+        FlexType::Integer(v) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::Integer as u8)?;
+            write_i64(writer, *v)?;
+        }
+        FlexType::Float(v) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::Float as u8)?;
+            write_f64(writer, *v)?;
+        }
+        FlexType::String(s) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::String as u8)?;
+            write_string(writer, s)?;
+        }
+        FlexType::Vector(v) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::Vector as u8)?;
+            write_vec_f64(writer, v)?;
+        }
+        FlexType::List(items) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::List as u8)?;
+            write_u64(writer, items.len() as u64)?;
+            for item in items.iter() {
+                write_flex_type(writer, item)?;
+            }
+        }
+        FlexType::Dict(pairs) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::Dict as u8)?;
+            write_u64(writer, pairs.len() as u64)?;
+            for (k, v) in pairs.iter() {
+                write_flex_type(writer, k)?;
+                write_flex_type(writer, v)?;
+            }
+        }
+        FlexType::DateTime(dt) => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::DateTime as u8)?;
+            write_flex_datetime(writer, dt)?;
+        }
+        FlexType::Undefined => {
+            write_u8(writer, FLEX_TYPE_TAG_OFFSET + FlexTypeEnum::Undefined as u8)?;
+        }
+    }
+    Ok(())
+}
+
+/// Serialize flex_date_time (new format with microseconds).
+pub fn write_flex_datetime(writer: &mut (impl Write + ?Sized), dt: &FlexDateTime) -> Result<()> {
+    let ts_low = dt.posix_timestamp as u32;
+    let ts_high = ((dt.posix_timestamp as u64) >> 32) as u32 & 0x00FF_FFFF;
+
+    // New format: apply LEGACY_TZ_SHIFT to indicate microsecond field follows
+    let tz_shifted = if dt.tz_offset_quarter_hours >= 0 {
+        (dt.tz_offset_quarter_hours as i32) + LEGACY_TZ_SHIFT
+    } else {
+        (dt.tz_offset_quarter_hours as i32) - LEGACY_TZ_SHIFT
+    };
+    let tz_byte = tz_shifted as u8;
+
+    let ts_high_and_tz = ts_high | ((tz_byte as u32) << 24);
+    write_u32(writer, ts_low)?;
+    write_u32(writer, ts_high_and_tz)?;
+    write_u32(writer, dt.microsecond)?;
+    Ok(())
 }
 
 /// Read a GraphLab-serialized string: 8-byte LE length + raw bytes.

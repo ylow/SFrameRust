@@ -5,12 +5,12 @@
 //!
 //! The reserved byte value 0 indicates NEW_ENCODING (standard).
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 
 use sframe_types::error::{Result, SFrameError};
 
-use crate::codec_float::decode_floats;
-use crate::codec_integer::decode_integers_for_reader;
+use crate::codec_float::{decode_floats, encode_floats};
+use crate::codec_integer::{decode_integers_for_reader, encode_integers_for};
 
 /// Decode a vector block, returning Vec<f64> for each element.
 pub fn decode_vectors(
@@ -61,4 +61,27 @@ pub fn decode_vectors(
     }
 
     Ok(result)
+}
+
+// ==========================================================================
+// Encoding
+// ==========================================================================
+
+/// Reserved byte for new vector encoding format.
+const VECTOR_RESERVED_NEW: u8 = 0;
+
+/// Encode vectors: reserved byte + FoR lengths + float-encoded values.
+pub fn encode_vectors(writer: &mut (impl Write + ?Sized), vectors: &[&[f64]]) -> Result<()> {
+    // Reserved byte
+    writer.write_all(&[VECTOR_RESERVED_NEW])?;
+
+    // Encode lengths
+    let lengths: Vec<i64> = vectors.iter().map(|v| v.len() as i64).collect();
+    encode_integers_for(writer, &lengths)?;
+
+    // Flatten and encode values
+    let flat: Vec<f64> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+    encode_floats(writer, &flat)?;
+
+    Ok(())
 }
