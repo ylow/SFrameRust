@@ -2,12 +2,75 @@
 
 ## Current Status
 **Last Updated:** 2026-02-27
-**Tasks Completed:** 9
-**Current Task:** Phase 9 complete — next is Phase 10 (SArray operations)
+**Tasks Completed:** 17
+**Current Task:** Phases 6-12, 14 complete — remaining: 13, 15, 16
 
 ---
 
 ## Session Log
+
+### 2026-02-27 — Phase 12: Query Optimizer
+
+**Commit:** `bdc6d22` — `feat(optimizer): Phase 12 — query optimizer`
+
+**What was done:**
+Three optimization passes: project fusion (merge adjacent Project nodes into composed projection), identity elimination (remove no-op Project nodes), projection pushdown (push Project below Filter to reduce data flow). Integrated into compile() — all plans automatically optimized. 5 new tests.
+
+**Tests:** All 276 tests pass.
+
+### 2026-02-27 — Phase 14: JSON Support
+
+**Commit:** `8b36538` — `feat(json): Phase 14 — JSON Lines support`
+
+**What was done:**
+FlexType ↔ JSON conversion with type-preserving roundtrips. JSON Lines reader auto-discovers columns and infers types. SFrame::from_json and SFrame::to_json APIs. Handles vectors, lists, dicts, nested types. 6 new tests.
+
+**Tests:** All 271 tests pass.
+
+### 2026-02-27 — Phase 11.4 + 7.5: Reshaping and CSV Writer
+
+**Commit:** `0fdc212` — `feat(sframe): Phase 11.4+7.5 — reshaping and CSV writer`
+
+**What was done:**
+Phase 11.4: pack_columns (multi-col → dict), unpack_column (dict/list → multi-col with type inference), stack (unnest list/vector). Phase 7.5: CSV writer with CsvWriterOptions (delimiter, quoting, NA, header), QuoteStyle enum, vector/list/dict bracket serialization. 8 new tests.
+
+**Tests:** All 265 tests pass.
+
+### 2026-02-27 — Phase 10.5-10.8: Specialized SArray Operations
+
+**Commit:** `45e88d6` — `feat(sarray): Phase 10.5-10.8 — specialized SArray operations`
+
+**What was done:**
+Phase 10.5: String ops (count_bag_of_words, count_ngrams, count_character_ngrams, contains). Phase 10.6: Dict ops (dict_keys/values, dict_trim_by_keys/values, dict_has_any_keys/all_keys). Phase 10.7: Structured data (item_length, vector_slice). Phase 10.8: Rolling aggregations (rolling_sum/mean/min/max). 12 new tests.
+
+**Tests:** All 257 tests pass.
+
+### 2026-02-27 — Phase 11.6: Multi-Column Join Keys
+
+**Commit:** `cef768a` — `feat(join): Phase 11.6 — multi-column join keys`
+
+**What was done:**
+Extended JoinOn to support multiple column pairs via JoinOn::multi(). Replaced FlexTypeHashKey with CompositeKey for composite hash/eq. Added SFrame::join_on() method. 2 new tests.
+
+**Tests:** All 245 tests pass.
+
+### 2026-02-27 — Phase 11.1-11.3 + 11.5 + 11.7: SFrame Operations
+
+**Commit:** `23436e0` — `feat(sframe): Phase 11.1-11.3+11.5+11.7 — SFrame operations`
+
+**What was done:**
+Phase 11.1: Column mutation (replace_column, rename, swap_columns). Phase 11.2: Missing value handling (dropna any/all, fillna). Phase 11.3: Sampling (sample, random_split, topk). Phase 11.5: Deduplication (unique). Phase 11.7: Tail (tail). 13 new tests.
+
+**Tests:** All 243 tests pass.
+
+### 2026-02-27 — Phase 10.1-10.4: SArray Operations
+
+**Commit:** `a82e5b0` — `feat(sarray): Phase 10.1-10.4 — SArray operations`
+
+**What was done:**
+Phase 10.1: Core ops (tail, sort, unique, append, sample). Phase 10.2: Missing values (countna, dropna, fillna, is_na). Phase 10.3: Numeric (clip). Phase 10.4: Reductions (sum, min, max, mean, std_dev, variance, any, all, nnz, num_missing). 14 new tests.
+
+**Tests:** All 230 tests pass.
 
 ### 2026-02-27 — Phase 9: Missing Aggregators
 
