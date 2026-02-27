@@ -22,19 +22,31 @@ pub enum JoinType {
     Full,
 }
 
-/// Join key specification: (left_column, right_column).
+/// Join key specification: pairs of (left_column, right_column) indices.
 #[derive(Debug, Clone)]
 pub struct JoinOn {
-    pub left_column: usize,
-    pub right_column: usize,
+    pub pairs: Vec<(usize, usize)>,
 }
 
 impl JoinOn {
+    /// Single-column join.
     pub fn new(left: usize, right: usize) -> Self {
         JoinOn {
-            left_column: left,
-            right_column: right,
+            pairs: vec![(left, right)],
         }
+    }
+
+    /// Multi-column join.
+    pub fn multi(pairs: Vec<(usize, usize)>) -> Self {
+        JoinOn { pairs }
+    }
+
+    fn left_columns(&self) -> Vec<usize> {
+        self.pairs.iter().map(|&(l, _)| l).collect()
+    }
+
+    fn right_columns(&self) -> Vec<usize> {
+        self.pairs.iter().map(|&(_, r)| r).collect()
     }
 }
 
@@ -58,18 +70,22 @@ pub async fn join(
         return Ok(SFrameRows::empty(&[]));
     }
 
+    let left_key_cols = on.left_columns();
+    let right_key_cols = on.right_columns();
+
     // Build hash table on the right side
-    let mut right_index: HashMap<FlexTypeHashKey, Vec<usize>> = HashMap::new();
+    let mut right_index: HashMap<CompositeKey, Vec<usize>> = HashMap::new();
     for i in 0..right_rows {
-        let key = FlexTypeHashKey(right.column(on.right_column).get(i));
+        let key = CompositeKey::from_row(&right, i, &right_key_cols);
         right_index.entry(key).or_default().push(i);
     }
 
-    // Determine output schema: all left cols + right cols (excluding join key)
+    // Determine output schema: all left cols + right cols (excluding join key columns)
     let left_dtypes = left.dtypes();
     let right_dtypes = right.dtypes();
+    let right_key_set: std::collections::HashSet<usize> = right_key_cols.iter().copied().collect();
     let right_output_cols: Vec<usize> = (0..right.num_columns())
-        .filter(|&c| c != on.right_column)
+        .filter(|c| !right_key_set.contains(c))
         .collect();
 
     let mut output_dtypes: Vec<FlexTypeEnum> = left_dtypes.clone();
@@ -86,7 +102,7 @@ pub async fn join(
 
     // Probe: for each left row, find matching right rows
     for left_idx in 0..left_rows {
-        let key = FlexTypeHashKey(left.column(on.left_column).get(left_idx));
+        let key = CompositeKey::from_row(&left, left_idx, &left_key_cols);
         let matches = right_index.get(&key);
 
         if let Some(right_indices) = matches {
@@ -199,33 +215,57 @@ fn emit_right_only(
     Ok(())
 }
 
-/// Wrapper for FlexType to implement Hash + Eq for join keys.
+/// Composite hash key for single or multi-column joins.
 #[derive(Clone, Debug)]
-struct FlexTypeHashKey(FlexType);
+struct CompositeKey(Vec<FlexType>);
 
-impl PartialEq for FlexTypeHashKey {
+impl CompositeKey {
+    fn single(val: FlexType) -> Self {
+        CompositeKey(vec![val])
+    }
+
+    fn from_row(batch: &SFrameRows, row: usize, columns: &[usize]) -> Self {
+        CompositeKey(columns.iter().map(|&c| batch.column(c).get(row)).collect())
+    }
+}
+
+impl PartialEq for CompositeKey {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (FlexType::Integer(a), FlexType::Integer(b)) => a == b,
-            (FlexType::Float(a), FlexType::Float(b)) => a.to_bits() == b.to_bits(),
-            (FlexType::String(a), FlexType::String(b)) => a == b,
-            (FlexType::Undefined, FlexType::Undefined) => true,
-            _ => false,
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0.iter().zip(other.0.iter()).all(|(a, b)| flex_eq(a, b))
+    }
+}
+
+impl Eq for CompositeKey {}
+
+impl std::hash::Hash for CompositeKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for val in &self.0 {
+            hash_flex(val, state);
         }
     }
 }
 
-impl Eq for FlexTypeHashKey {}
+fn flex_eq(a: &FlexType, b: &FlexType) -> bool {
+    match (a, b) {
+        (FlexType::Integer(a), FlexType::Integer(b)) => a == b,
+        (FlexType::Float(a), FlexType::Float(b)) => a.to_bits() == b.to_bits(),
+        (FlexType::String(a), FlexType::String(b)) => a == b,
+        (FlexType::Undefined, FlexType::Undefined) => true,
+        _ => false,
+    }
+}
 
-impl std::hash::Hash for FlexTypeHashKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(&self.0).hash(state);
-        match &self.0 {
-            FlexType::Integer(i) => i.hash(state),
-            FlexType::Float(f) => f.to_bits().hash(state),
-            FlexType::String(s) => s.hash(state),
-            _ => {}
-        }
+fn hash_flex<H: std::hash::Hasher>(val: &FlexType, state: &mut H) {
+    use std::hash::Hash;
+    std::mem::discriminant(val).hash(state);
+    match val {
+        FlexType::Integer(i) => i.hash(state),
+        FlexType::Float(f) => f.to_bits().hash(state),
+        FlexType::String(s) => s.hash(state),
+        _ => {}
     }
 }
 
@@ -355,5 +395,44 @@ mod tests {
 
         // Both rows should appear (no match between them)
         assert_eq!(result.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_column_join() {
+        // Left: dept, region, name
+        let left_rows = vec![
+            vec![FlexType::String("eng".into()), FlexType::String("us".into()), FlexType::String("alice".into())],
+            vec![FlexType::String("eng".into()), FlexType::String("eu".into()), FlexType::String("bob".into())],
+            vec![FlexType::String("sales".into()), FlexType::String("us".into()), FlexType::String("charlie".into())],
+        ];
+        let left = SFrameRows::from_rows(
+            &left_rows,
+            &[FlexTypeEnum::String, FlexTypeEnum::String, FlexTypeEnum::String],
+        ).unwrap();
+
+        // Right: dept, region, budget
+        let right_rows = vec![
+            vec![FlexType::String("eng".into()), FlexType::String("us".into()), FlexType::Float(100.0)],
+            vec![FlexType::String("eng".into()), FlexType::String("eu".into()), FlexType::Float(80.0)],
+            vec![FlexType::String("hr".into()), FlexType::String("us".into()), FlexType::Float(50.0)],
+        ];
+        let right = SFrameRows::from_rows(
+            &right_rows,
+            &[FlexTypeEnum::String, FlexTypeEnum::String, FlexTypeEnum::Float],
+        ).unwrap();
+
+        // Join on (dept, region)
+        let result = join(
+            make_stream(left),
+            make_stream(right),
+            &JoinOn::multi(vec![(0, 0), (1, 1)]),
+            JoinType::Inner,
+        ).await.unwrap();
+
+        // eng+us → alice, eng+eu → bob. sales+us has no match.
+        assert_eq!(result.num_rows(), 2);
+        // Output: left.dept, left.region, left.name, right.budget
+        // (right.dept and right.region excluded as join keys)
+        assert_eq!(result.num_columns(), 4);
     }
 }

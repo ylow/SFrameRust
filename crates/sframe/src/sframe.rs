@@ -3,7 +3,7 @@
 //! Operations build PlannerNode DAGs. Materialization happens on
 //! `.head()`, `.iter_rows()`, `.save()`, `.materialize()`, or `Display`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sframe_query::algorithms::aggregators::AggSpec;
@@ -291,7 +291,7 @@ impl SFrame {
         self.from_batch(sorted)
     }
 
-    /// Join with another SFrame.
+    /// Join with another SFrame on a single column.
     pub fn join(
         &self,
         other: &SFrame,
@@ -299,8 +299,27 @@ impl SFrame {
         right_col: &str,
         how: JoinType,
     ) -> Result<SFrame> {
-        let left_idx = self.column_index(left_col)?;
-        let right_idx = other.column_index(right_col)?;
+        self.join_on(other, &[(left_col, right_col)], how)
+    }
+
+    /// Join with another SFrame on one or more column pairs.
+    pub fn join_on(
+        &self,
+        other: &SFrame,
+        on: &[(&str, &str)],
+        how: JoinType,
+    ) -> Result<SFrame> {
+        if on.is_empty() {
+            return Err(SFrameError::Format("Join requires at least one key pair".to_string()));
+        }
+
+        let pairs: Vec<(usize, usize)> = on
+            .iter()
+            .map(|&(l, r)| Ok((self.column_index(l)?, other.column_index(r)?)))
+            .collect::<Result<_>>()?;
+
+        let right_key_indices: HashSet<usize> =
+            pairs.iter().map(|&(_, r)| r).collect();
 
         let left_stream = self.compile_stream()?;
         let right_stream = other.compile_stream()?;
@@ -311,15 +330,14 @@ impl SFrame {
         let joined = rt.block_on(join::join(
             left_stream,
             right_stream,
-            &JoinOn::new(left_idx, right_idx),
+            &JoinOn::multi(pairs),
             how,
         ))?;
 
-        // Build output column names: all left cols + right cols (minus join key)
+        // Build output column names: all left cols + right cols (minus join keys)
         let mut names: Vec<String> = self.column_names.clone();
         for (i, name) in other.column_names.iter().enumerate() {
-            if i != right_idx {
-                // Disambiguate if needed
+            if !right_key_indices.contains(&i) {
                 let out_name = if names.contains(name) {
                     format!("{}.1", name)
                 } else {
@@ -1214,6 +1232,44 @@ mod tests {
         // Ascending (reverse=true), so bottom 2 are 1 and 2
         assert_eq!(ids[0], FlexType::Integer(1));
         assert_eq!(ids[1], FlexType::Integer(2));
+    }
+
+    #[test]
+    fn test_multi_column_join() {
+        let left = SFrame::from_columns(vec![
+            ("dept", SArray::from_vec(
+                vec![FlexType::String("eng".into()), FlexType::String("eng".into()), FlexType::String("sales".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("region", SArray::from_vec(
+                vec![FlexType::String("us".into()), FlexType::String("eu".into()), FlexType::String("us".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                vec![FlexType::String("alice".into()), FlexType::String("bob".into()), FlexType::String("charlie".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+
+        let right = SFrame::from_columns(vec![
+            ("dept", SArray::from_vec(
+                vec![FlexType::String("eng".into()), FlexType::String("eng".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("region", SArray::from_vec(
+                vec![FlexType::String("us".into()), FlexType::String("eu".into())],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("budget", SArray::from_vec(
+                vec![FlexType::Float(100.0), FlexType::Float(80.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let joined = left.join_on(&right, &[("dept", "dept"), ("region", "region")], JoinType::Inner).unwrap();
+        assert_eq!(joined.num_rows().unwrap(), 2); // eng+us and eng+eu match
+        assert_eq!(joined.num_columns(), 4); // dept, region, name, budget
+        assert_eq!(joined.column_names(), &["dept", "region", "name", "budget"]);
     }
 
     #[test]
