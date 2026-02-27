@@ -3,6 +3,7 @@
 //! Operations build PlannerNode DAGs. Materialization happens on
 //! `.head()`, `.iter_rows()`, `.save()`, `.materialize()`, or `Display`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sframe_query::algorithms::aggregators::AggSpec;
@@ -377,6 +378,235 @@ impl SFrame {
             columns,
             column_names: names,
         })
+    }
+
+    // === Phase 11.1: Column Mutation ===
+
+    /// Replace a column with a new SArray (returns a new SFrame).
+    pub fn replace_column(&self, name: &str, col: SArray) -> Result<SFrame> {
+        let idx = self.column_index(name)?;
+        let mut columns = self.columns.clone();
+        columns[idx] = col;
+        Ok(SFrame {
+            columns,
+            column_names: self.column_names.clone(),
+        })
+    }
+
+    /// Rename columns according to a mapping (returns a new SFrame).
+    pub fn rename(&self, mapping: &HashMap<&str, &str>) -> Result<SFrame> {
+        let mut new_names = self.column_names.clone();
+        for (&old_name, &new_name) in mapping {
+            let idx = self.column_index(old_name)?;
+            // Check that new name doesn't conflict with an existing column
+            // (unless it's the column being renamed itself)
+            if let Some(existing_idx) = new_names.iter().position(|n| n == new_name) {
+                if existing_idx != idx {
+                    return Err(SFrameError::Format(format!(
+                        "Column '{}' already exists",
+                        new_name
+                    )));
+                }
+            }
+            new_names[idx] = new_name.to_string();
+        }
+        Ok(SFrame {
+            columns: self.columns.clone(),
+            column_names: new_names,
+        })
+    }
+
+    /// Swap two columns by name (returns a new SFrame).
+    pub fn swap_columns(&self, name1: &str, name2: &str) -> Result<SFrame> {
+        let idx1 = self.column_index(name1)?;
+        let idx2 = self.column_index(name2)?;
+        let mut columns = self.columns.clone();
+        let mut names = self.column_names.clone();
+        columns.swap(idx1, idx2);
+        names.swap(idx1, idx2);
+        Ok(SFrame {
+            columns,
+            column_names: names,
+        })
+    }
+
+    // === Phase 11.2: Missing Value Handling ===
+
+    /// Drop rows with missing values.
+    ///
+    /// - `column_name`: if `Some`, only check that column; if `None`, check all columns.
+    /// - `how`: `"any"` drops rows where any specified column is Undefined,
+    ///          `"all"` drops rows where all specified columns are Undefined.
+    pub fn dropna(&self, column_name: Option<&str>, how: &str) -> Result<SFrame> {
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+
+        let check_cols: Vec<usize> = if let Some(name) = column_name {
+            vec![self.column_index(name)?]
+        } else {
+            (0..ncols).collect()
+        };
+
+        let keep: Vec<bool> = (0..nrows)
+            .map(|row| {
+                let undefs = check_cols
+                    .iter()
+                    .filter(|&&c| matches!(batch.column(c).get(row), FlexType::Undefined))
+                    .count();
+                match how {
+                    "all" => undefs < check_cols.len(), // keep unless ALL are undef
+                    _ => undefs == 0,                    // "any": keep only if none are undef
+                }
+            })
+            .collect();
+
+        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        for (row, &kept) in keep.iter().enumerate() {
+            if kept {
+                for col in 0..ncols {
+                    col_vecs[col].push(batch.column(col).get(row).clone());
+                }
+            }
+        }
+
+        let dtypes = self.column_types();
+        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        self.from_batch(result)
+    }
+
+    /// Fill missing values in a column.
+    pub fn fillna(&self, column_name: &str, value: FlexType) -> Result<SFrame> {
+        let idx = self.column_index(column_name)?;
+        let filled = self.columns[idx].fillna(value);
+        self.replace_column(column_name, filled)
+    }
+
+    // === Phase 11.3: Sampling & Splitting ===
+
+    /// Random sample of rows.
+    pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SFrame> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+        let seed = seed.unwrap_or(42);
+        let threshold = (fraction * u64::MAX as f64) as u64;
+
+        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        for row in 0..nrows {
+            let mut hasher = DefaultHasher::new();
+            (seed, row as u64).hash(&mut hasher);
+            if hasher.finish() < threshold {
+                for col in 0..ncols {
+                    col_vecs[col].push(batch.column(col).get(row).clone());
+                }
+            }
+        }
+
+        let dtypes = self.column_types();
+        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        self.from_batch(result)
+    }
+
+    /// Random split into two SFrames.
+    ///
+    /// Returns `(train, test)` where `train` contains approximately `fraction`
+    /// of the rows and `test` contains the rest.
+    pub fn random_split(&self, fraction: f64, seed: Option<u64>) -> Result<(SFrame, SFrame)> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+        let seed = seed.unwrap_or(42);
+        let threshold = (fraction * u64::MAX as f64) as u64;
+
+        let mut left_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        let mut right_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+
+        for row in 0..nrows {
+            let mut hasher = DefaultHasher::new();
+            (seed, row as u64).hash(&mut hasher);
+            let target = if hasher.finish() < threshold {
+                &mut left_vecs
+            } else {
+                &mut right_vecs
+            };
+            for col in 0..ncols {
+                target[col].push(batch.column(col).get(row).clone());
+            }
+        }
+
+        let dtypes = self.column_types();
+        let left = SFrameRows::from_column_vecs(left_vecs, &dtypes)?;
+        let right = SFrameRows::from_column_vecs(right_vecs, &dtypes)?;
+        Ok((self.from_batch(left)?, self.from_batch(right)?))
+    }
+
+    /// Top-k rows by a column.
+    pub fn topk(&self, column_name: &str, k: usize, reverse: bool) -> Result<SFrame> {
+        let order = if reverse {
+            SortOrder::Ascending
+        } else {
+            SortOrder::Descending
+        };
+        let sorted = self.sort(&[(column_name, order)])?;
+        sorted.head(k)
+    }
+
+    // === Phase 11.5: Deduplication ===
+
+    /// Remove duplicate rows.
+    pub fn unique(&self) -> Result<SFrame> {
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+
+        for row in 0..nrows {
+            // Build a row key for deduplication
+            let row_values: Vec<FlexType> = (0..ncols)
+                .map(|c| batch.column(c).get(row).clone())
+                .collect();
+            let key = format!("{:?}", row_values);
+            if seen.insert(key) {
+                for (col, v) in row_values.into_iter().enumerate() {
+                    col_vecs[col].push(v);
+                }
+            }
+        }
+
+        let dtypes = self.column_types();
+        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        self.from_batch(result)
+    }
+
+    // === Phase 11.7: Tail ===
+
+    /// Return the last n rows.
+    pub fn tail(&self, n: usize) -> Result<SFrame> {
+        let batch = self.materialize_batch()?;
+        let nrows = batch.num_rows();
+        if n >= nrows {
+            return self.from_batch(batch);
+        }
+        let start = nrows - n;
+        let ncols = batch.num_columns();
+        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        for row in start..nrows {
+            for col in 0..ncols {
+                col_vecs[col].push(batch.column(col).get(row).clone());
+            }
+        }
+        let dtypes = self.column_types();
+        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        self.from_batch(result)
     }
 
     /// Materialize all lazy computations.
@@ -853,5 +1083,168 @@ mod tests {
         assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String("alice".into())]);
         assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String("bob".into())]);
         assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String("charlie".into())]);
+    }
+
+    // === Phase 11 Tests ===
+
+    fn make_test_sf() -> SFrame {
+        SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3), FlexType::Integer(4)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                vec![
+                    FlexType::String("alice".into()),
+                    FlexType::String("bob".into()),
+                    FlexType::Undefined,
+                    FlexType::String("dave".into()),
+                ],
+                FlexTypeEnum::String,
+            ).unwrap()),
+            ("score", SArray::from_vec(
+                vec![FlexType::Float(90.0), FlexType::Undefined, FlexType::Float(70.0), FlexType::Float(80.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap()
+    }
+
+    #[test]
+    fn test_replace_column() {
+        let sf = make_test_sf();
+        let new_col = SArray::from_vec(
+            vec![FlexType::Integer(10), FlexType::Integer(20), FlexType::Integer(30), FlexType::Integer(40)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let sf2 = sf.replace_column("score", new_col).unwrap();
+        assert_eq!(sf2.column_types()[2], FlexTypeEnum::Integer);
+        let vals = sf2.column("score").unwrap().to_vec().unwrap();
+        assert_eq!(vals[0], FlexType::Integer(10));
+    }
+
+    #[test]
+    fn test_rename_columns() {
+        let sf = make_test_sf();
+        let mut mapping = HashMap::new();
+        mapping.insert("id", "user_id");
+        mapping.insert("name", "user_name");
+        let sf2 = sf.rename(&mapping).unwrap();
+        assert_eq!(sf2.column_names(), &["user_id", "user_name", "score"]);
+    }
+
+    #[test]
+    fn test_swap_columns() {
+        let sf = make_test_sf();
+        let sf2 = sf.swap_columns("id", "score").unwrap();
+        assert_eq!(sf2.column_names(), &["score", "name", "id"]);
+        assert_eq!(sf2.column_types()[0], FlexTypeEnum::Float);
+        assert_eq!(sf2.column_types()[2], FlexTypeEnum::Integer);
+    }
+
+    #[test]
+    fn test_dropna_any() {
+        let sf = make_test_sf();
+        // Drop rows where ANY column is Undefined
+        let cleaned = sf.dropna(None, "any").unwrap();
+        assert_eq!(cleaned.num_rows().unwrap(), 2); // rows 0 and 3 survive
+        let ids = cleaned.column("id").unwrap().to_vec().unwrap();
+        assert_eq!(ids, vec![FlexType::Integer(1), FlexType::Integer(4)]);
+    }
+
+    #[test]
+    fn test_dropna_all() {
+        let sf = make_test_sf();
+        // Drop rows where ALL columns are Undefined (none in our test data)
+        let cleaned = sf.dropna(None, "all").unwrap();
+        assert_eq!(cleaned.num_rows().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_dropna_single_column() {
+        let sf = make_test_sf();
+        let cleaned = sf.dropna(Some("name"), "any").unwrap();
+        assert_eq!(cleaned.num_rows().unwrap(), 3); // row 2 dropped (name=Undefined)
+    }
+
+    #[test]
+    fn test_fillna_sframe() {
+        let sf = make_test_sf();
+        let filled = sf.fillna("name", FlexType::String("unknown".into())).unwrap();
+        let names = filled.column("name").unwrap().to_vec().unwrap();
+        assert_eq!(names[2], FlexType::String("unknown".into()));
+    }
+
+    #[test]
+    fn test_sample_sframe() {
+        let sf = make_test_sf();
+        let sampled = sf.sample(0.5, Some(123)).unwrap();
+        assert!(sampled.num_rows().unwrap() <= 4);
+        assert_eq!(sampled.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_random_split() {
+        let sf = make_test_sf();
+        let (train, test) = sf.random_split(0.5, Some(42)).unwrap();
+        // All rows accounted for
+        assert_eq!(
+            train.num_rows().unwrap() + test.num_rows().unwrap(),
+            4
+        );
+        assert_eq!(train.num_columns(), 3);
+        assert_eq!(test.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_topk() {
+        let sf = make_test_sf();
+        let top2 = sf.topk("id", 2, false).unwrap();
+        assert_eq!(top2.num_rows().unwrap(), 2);
+        let ids = top2.column("id").unwrap().to_vec().unwrap();
+        // Descending by default, so top 2 are 4 and 3
+        assert_eq!(ids[0], FlexType::Integer(4));
+        assert_eq!(ids[1], FlexType::Integer(3));
+    }
+
+    #[test]
+    fn test_topk_reverse() {
+        let sf = make_test_sf();
+        let bottom2 = sf.topk("id", 2, true).unwrap();
+        let ids = bottom2.column("id").unwrap().to_vec().unwrap();
+        // Ascending (reverse=true), so bottom 2 are 1 and 2
+        assert_eq!(ids[0], FlexType::Integer(1));
+        assert_eq!(ids[1], FlexType::Integer(2));
+    }
+
+    #[test]
+    fn test_unique_sframe() {
+        let sf = SFrame::from_columns(vec![
+            ("x", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(1), FlexType::Integer(3)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("y", SArray::from_vec(
+                vec![
+                    FlexType::String("a".into()),
+                    FlexType::String("b".into()),
+                    FlexType::String("a".into()),
+                    FlexType::String("c".into()),
+                ],
+                FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+
+        let unique = sf.unique().unwrap();
+        assert_eq!(unique.num_rows().unwrap(), 3); // (1,a) appears twice
+    }
+
+    #[test]
+    fn test_tail_sframe() {
+        let sf = make_test_sf();
+        let last2 = sf.tail(2).unwrap();
+        assert_eq!(last2.num_rows().unwrap(), 2);
+        let ids = last2.column("id").unwrap().to_vec().unwrap();
+        assert_eq!(ids[0], FlexType::Integer(3));
+        assert_eq!(ids[1], FlexType::Integer(4));
     }
 }
