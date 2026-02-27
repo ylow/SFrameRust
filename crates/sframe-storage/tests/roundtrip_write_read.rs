@@ -346,3 +346,97 @@ fn test_streaming_writer_variable_batch_sizes() {
         assert_eq!(col[i], FlexType::Integer(i as i64), "Mismatch at row {}", i);
     }
 }
+
+/// Test multi-segment writing with a small rows_per_segment threshold.
+///
+/// Writes 2500 rows with rows_per_segment=1000. Should produce 3 segments:
+/// segment 0: 1000 rows, segment 1: 1000 rows, segment 2: 500 rows.
+#[test]
+fn test_multi_segment_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("multi_seg.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["id", "value"];
+    let col_types = &[FlexTypeEnum::Integer, FlexTypeEnum::Float];
+
+    let mut writer =
+        SFrameWriter::with_segment_size(out_path_str, col_names, col_types, 1000).unwrap();
+
+    let total_rows = 2500usize;
+    for batch_start in (0..total_rows).step_by(100) {
+        let batch_end = (batch_start + 100).min(total_rows);
+        let ids: Vec<FlexType> = (batch_start..batch_end)
+            .map(|i| FlexType::Integer(i as i64))
+            .collect();
+        let values: Vec<FlexType> = (batch_start..batch_end)
+            .map(|i| FlexType::Float(i as f64 * 0.1))
+            .collect();
+        writer.write_columns(&[ids, values]).unwrap();
+    }
+
+    writer.finish().unwrap();
+
+    // Verify that multiple segment files were created
+    let sf = SFrameReader::open(out_path_str).unwrap();
+    assert!(
+        sf.segment_readers.len() > 1,
+        "Expected multiple segments, got {}",
+        sf.segment_readers.len()
+    );
+
+    // Read back and verify all data
+    let mut sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), total_rows as u64);
+    assert_eq!(sf.num_columns(), 2);
+
+    let ids = sf.read_column_by_name("id").unwrap();
+    assert_eq!(ids.len(), total_rows);
+    for i in 0..total_rows {
+        assert_eq!(ids[i], FlexType::Integer(i as i64), "id mismatch at row {}", i);
+    }
+
+    let values = sf.read_column_by_name("value").unwrap();
+    assert_eq!(values.len(), total_rows);
+    for i in 0..total_rows {
+        assert!(
+            flex_eq(&values[i], &FlexType::Float(i as f64 * 0.1)),
+            "value mismatch at row {}: {:?}",
+            i,
+            values[i]
+        );
+    }
+}
+
+/// Test multi-segment with exact segment boundary (no remainder).
+#[test]
+fn test_multi_segment_exact_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("exact_boundary.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["x"];
+    let col_types = &[FlexTypeEnum::Integer];
+
+    // 2000 rows, 1000 per segment → exactly 2 segments
+    let mut writer =
+        SFrameWriter::with_segment_size(out_path_str, col_names, col_types, 1000).unwrap();
+
+    let data: Vec<FlexType> = (0..2000).map(|i| FlexType::Integer(i)).collect();
+    writer.write_columns(&[data]).unwrap();
+    writer.finish().unwrap();
+
+    let sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(
+        sf.segment_readers.len(),
+        2,
+        "Expected 2 segments for 2000 rows / 1000 per segment"
+    );
+
+    let mut sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), 2000);
+    let col = sf.read_column_by_name("x").unwrap();
+    for i in 0..2000 {
+        assert_eq!(col[i as usize], FlexType::Integer(i));
+    }
+}

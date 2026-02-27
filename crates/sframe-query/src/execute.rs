@@ -148,39 +148,43 @@ pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     }
 }
 
-/// Compile an SFrame source: reads all columns and emits them as batches.
+/// Compile an SFrame source: reads one segment at a time and emits batches.
+///
+/// Unlike the previous implementation that loaded all columns eagerly,
+/// this reads segment-by-segment. Only one segment's data is in memory
+/// at a time, limiting peak memory usage.
 fn compile_sframe_source(
     path: &str,
     column_types: &[FlexTypeEnum],
     _num_rows: u64,
 ) -> Result<BatchStream> {
-    // Read all columns eagerly (segment reader requires mutable access)
     let mut reader = SFrameReader::open(path)?;
-    let num_cols = reader.num_columns();
+    let num_segments = reader.num_segments();
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
 
-    let mut all_data: Vec<Vec<FlexType>> = Vec::with_capacity(num_cols);
-    for col in 0..num_cols {
-        all_data.push(reader.read_column(col)?);
-    }
-
-    let total_rows = if all_data.is_empty() { 0 } else { all_data[0].len() };
-
-    // Emit in batches
+    // Read segment-at-a-time: for each segment, read all columns,
+    // then emit as batches of SOURCE_BATCH_SIZE.
     let mut batches: Vec<Result<SFrameRows>> = Vec::new();
-    let mut offset = 0;
-    while offset < total_rows {
-        let end = (offset + SOURCE_BATCH_SIZE).min(total_rows);
-        let mut columns = Vec::with_capacity(num_cols);
-        for (col_idx, col_data) in all_data.iter().enumerate() {
-            let mut col = ColumnData::empty(dtypes[col_idx]);
-            for val in &col_data[offset..end] {
-                col.push(val)?;
+
+    for seg_idx in 0..num_segments {
+        let seg_data = reader.read_segment_columns(seg_idx)?;
+        let seg_rows = if seg_data.is_empty() { 0 } else { seg_data[0].len() };
+
+        let mut offset = 0;
+        while offset < seg_rows {
+            let end = (offset + SOURCE_BATCH_SIZE).min(seg_rows);
+            let mut columns = Vec::with_capacity(dtypes.len());
+            for (col_idx, col_data) in seg_data.iter().enumerate() {
+                let mut col = ColumnData::empty(dtypes[col_idx]);
+                for val in &col_data[offset..end] {
+                    col.push(val)?;
+                }
+                columns.push(col);
             }
-            columns.push(col);
+            batches.push(SFrameRows::new(columns));
+            offset = end;
         }
-        batches.push(SFrameRows::new(columns));
-        offset = end;
+        // seg_data is dropped here, freeing the segment's memory
     }
 
     Ok(Box::pin(stream::iter(batches)))

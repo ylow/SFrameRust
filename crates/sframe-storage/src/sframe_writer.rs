@@ -19,6 +19,9 @@ const MIN_ROWS_PER_BLOCK: usize = 8;
 /// Maximum rows per block.
 const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
 
+/// Default number of rows per segment before auto-splitting.
+const DEFAULT_ROWS_PER_SEGMENT: u64 = 1_000_000;
+
 /// Write an SFrame to a directory.
 ///
 /// `base_path` is the directory to create (e.g. "output.sf").
@@ -63,9 +66,9 @@ pub fn write_sframe(
     let sidx_path = format!("{}/{}", base_path, sidx_file);
     write_sidx(
         &sidx_path,
-        &segment_file,
+        &[segment_file],
         column_types,
-        &segment_sizes,
+        &[segment_sizes],
     )?;
 
     // Write .frame_idx (INI)
@@ -76,6 +79,7 @@ pub fn write_sframe(
         column_names,
         &sidx_file,
         nrows,
+        1,
     )?;
 
     // Write dir_archive.ini
@@ -121,8 +125,6 @@ fn write_segment(
 
         // Adjust rows_per_block: estimate bytes per row from first block
         if row_offset == 0 && block_end > row_offset {
-            // After the first block, we could refine, but for simplicity
-            // use a fixed size that's reasonable for most data
             rows_per_block = TARGET_BLOCK_SIZE / estimate_row_size(column_types);
             rows_per_block = rows_per_block.max(MIN_ROWS_PER_BLOCK).min(MAX_ROWS_PER_BLOCK);
         }
@@ -151,25 +153,31 @@ fn estimate_row_size(column_types: &[FlexTypeEnum]) -> usize {
     size.max(1)
 }
 
-/// Write the .sidx file (JSON format).
+/// Write the .sidx file (JSON format) with support for multiple segments.
 fn write_sidx(
     path: &str,
-    segment_file: &str,
+    segment_files: &[String],
     column_types: &[FlexTypeEnum],
-    segment_sizes: &[u64],
+    all_segment_sizes: &[Vec<u64>],
 ) -> Result<()> {
     use serde_json::{json, Map, Value};
 
-    let mut segment_files = Map::new();
-    segment_files.insert("0000".to_string(), Value::String(segment_file.to_string()));
+    let num_segments = segment_files.len();
+
+    let mut seg_files_map = Map::new();
+    for (i, seg_file) in segment_files.iter().enumerate() {
+        seg_files_map.insert(format!("{:04}", i), Value::String(seg_file.clone()));
+    }
 
     let mut columns = Vec::new();
-    for (i, &dtype) in column_types.iter().enumerate() {
+    for (col_idx, &dtype) in column_types.iter().enumerate() {
         let mut seg_sizes_map = Map::new();
-        seg_sizes_map.insert(
-            "0000".to_string(),
-            Value::String(segment_sizes[i].to_string()),
-        );
+        for (seg_idx, sizes) in all_segment_sizes.iter().enumerate() {
+            seg_sizes_map.insert(
+                format!("{:04}", seg_idx),
+                Value::String(sizes[col_idx].to_string()),
+            );
+        }
 
         let mut metadata = Map::new();
         metadata.insert("__type__".to_string(), Value::String((dtype as u8).to_string()));
@@ -184,9 +192,9 @@ fn write_sidx(
     let sidx = json!({
         "sarray": {
             "version": 2,
-            "num_segments": 1,
+            "num_segments": num_segments,
         },
-        "segment_files": segment_files,
+        "segment_files": seg_files_map,
         "columns": columns,
     });
 
@@ -203,12 +211,13 @@ fn write_frame_idx(
     column_names: &[&str],
     sidx_file: &str,
     nrows: u64,
+    num_segments: usize,
 ) -> Result<()> {
     let mut content = String::new();
 
     content.push_str("[sframe]\n");
     content.push_str("version=2\n");
-    content.push_str(&format!("num_segments=1\n"));
+    content.push_str(&format!("num_segments={}\n", num_segments));
     content.push_str(&format!("num_columns={}\n", column_names.len()));
     content.push_str(&format!("nrows={}\n", nrows));
 
@@ -259,8 +268,8 @@ fn write_dir_archive_ini(base_path: &str, data_prefix: &str) -> Result<()> {
 /// never hold the entire dataset in memory.
 ///
 /// Incoming data is buffered internally and flushed to disk in blocks of
-/// `rows_per_block` rows. This means many small batches are coalesced into
-/// efficient blocks, and a single large batch is automatically split.
+/// `rows_per_block` rows. When a segment reaches `rows_per_segment` rows,
+/// it is finalized and a new segment is created automatically.
 ///
 /// # Example
 /// ```ignore
@@ -273,16 +282,24 @@ pub struct SFrameWriter {
     base_path: String,
     column_names: Vec<String>,
     column_types: Vec<FlexTypeEnum>,
-    seg_writer: SegmentWriter<BufWriter<std::fs::File>>,
-    segment_file: String,
     data_prefix: String,
-    total_rows: u64,
     rows_per_block: usize,
-    /// Internal column buffers for cross-batch accumulation.
-    /// Each inner Vec holds the buffered values for one column.
+    rows_per_segment: u64,
+    num_columns: usize,
+
+    // Current segment state
+    seg_writer: SegmentWriter<BufWriter<std::fs::File>>,
+    current_segment_idx: usize,
+    rows_in_current_segment: u64,
+
+    // Accumulated metadata across all finished segments
+    segment_files: Vec<String>,
+    all_segment_sizes: Vec<Vec<u64>>,
+
+    // Cross-batch buffering
     column_buffers: Vec<Vec<FlexType>>,
-    /// Number of buffered rows (same across all column buffers).
     buffered_rows: usize,
+    total_rows: u64,
 }
 
 impl SFrameWriter {
@@ -291,6 +308,19 @@ impl SFrameWriter {
         base_path: &str,
         column_names: &[&str],
         column_types: &[FlexTypeEnum],
+    ) -> Result<Self> {
+        Self::with_segment_size(base_path, column_names, column_types, DEFAULT_ROWS_PER_SEGMENT)
+    }
+
+    /// Create a new writer with a custom rows-per-segment threshold.
+    ///
+    /// When the current segment accumulates this many rows, it is
+    /// finalized and a new segment is created.
+    pub fn with_segment_size(
+        base_path: &str,
+        column_names: &[&str],
+        column_types: &[FlexTypeEnum],
+        rows_per_segment: u64,
     ) -> Result<Self> {
         let num_columns = column_names.len();
         if num_columns != column_types.len() {
@@ -301,31 +331,34 @@ impl SFrameWriter {
 
         let hash = generate_hash(base_path);
         let data_prefix = format!("m_{}", hash);
-        let segment_file = format!("{}.0000", data_prefix);
-        let segment_path = format!("{}/{}", base_path, segment_file);
 
         std::fs::create_dir_all(base_path).map_err(SFrameError::Io)?;
 
-        let file = std::fs::File::create(&segment_path).map_err(SFrameError::Io)?;
-        let buf_writer = BufWriter::new(file);
-        let seg_writer = SegmentWriter::new(buf_writer, num_columns);
-
         let rows_per_block = TARGET_BLOCK_SIZE / estimate_row_size(column_types);
-        let rows_per_block = rows_per_block.max(MIN_ROWS_PER_BLOCK).min(MAX_ROWS_PER_BLOCK);
+        let rows_per_block = rows_per_block
+            .max(MIN_ROWS_PER_BLOCK)
+            .min(MAX_ROWS_PER_BLOCK)
+            .min(rows_per_segment as usize); // Never exceed segment capacity
 
-        let column_buffers = vec![Vec::new(); num_columns];
+        let (seg_writer, _segment_file) =
+            create_segment_writer(base_path, &data_prefix, 0, num_columns)?;
 
         Ok(SFrameWriter {
             base_path: base_path.to_string(),
             column_names: column_names.iter().map(|s| s.to_string()).collect(),
             column_types: column_types.to_vec(),
-            seg_writer,
-            segment_file,
             data_prefix,
-            total_rows: 0,
             rows_per_block,
-            column_buffers,
+            rows_per_segment,
+            num_columns,
+            seg_writer,
+            current_segment_idx: 0,
+            rows_in_current_segment: 0,
+            segment_files: Vec::new(),
+            all_segment_sizes: Vec::new(),
+            column_buffers: vec![Vec::new(); num_columns],
             buffered_rows: 0,
+            total_rows: 0,
         })
     }
 
@@ -334,6 +367,7 @@ impl SFrameWriter {
     ///
     /// Data is buffered internally and flushed in blocks of `rows_per_block`.
     /// Small batches are accumulated; large batches are split into blocks.
+    /// When a segment fills up, a new segment is created automatically.
     pub fn write_columns(&mut self, columns: &[Vec<FlexType>]) -> Result<()> {
         if columns.is_empty() {
             return Ok(());
@@ -344,10 +378,10 @@ impl SFrameWriter {
             return Ok(());
         }
 
-        if columns.len() != self.column_buffers.len() {
+        if columns.len() != self.num_columns {
             return Err(SFrameError::Format(format!(
                 "Expected {} columns, got {}",
-                self.column_buffers.len(),
+                self.num_columns,
                 columns.len()
             )));
         }
@@ -366,10 +400,16 @@ impl SFrameWriter {
     }
 
     /// Flush all complete blocks from the internal buffers.
-    /// Leaves any partial block (< rows_per_block) in the buffer.
+    /// Handles segment splitting when the current segment reaches capacity.
     fn flush_full_blocks(&mut self) -> Result<()> {
         while self.buffered_rows >= self.rows_per_block {
-            for col_idx in 0..self.column_buffers.len() {
+            // Check if we need to start a new segment
+            if self.rows_in_current_segment >= self.rows_per_segment {
+                self.finish_current_segment()?;
+                self.start_new_segment()?;
+            }
+
+            for col_idx in 0..self.num_columns {
                 let block: Vec<FlexType> = self.column_buffers[col_idx]
                     .drain(..self.rows_per_block)
                     .collect();
@@ -380,6 +420,7 @@ impl SFrameWriter {
                 )?;
             }
             self.buffered_rows -= self.rows_per_block;
+            self.rows_in_current_segment += self.rows_per_block as u64;
         }
         Ok(())
     }
@@ -387,7 +428,7 @@ impl SFrameWriter {
     /// Flush any remaining buffered rows as a final partial block.
     fn flush_remaining(&mut self) -> Result<()> {
         if self.buffered_rows > 0 {
-            for col_idx in 0..self.column_buffers.len() {
+            for col_idx in 0..self.num_columns {
                 let block: Vec<FlexType> = self.column_buffers[col_idx].drain(..).collect();
                 self.seg_writer.write_column_block(
                     col_idx,
@@ -395,8 +436,42 @@ impl SFrameWriter {
                     self.column_types[col_idx],
                 )?;
             }
+            self.rows_in_current_segment += self.buffered_rows as u64;
             self.buffered_rows = 0;
         }
+        Ok(())
+    }
+
+    /// Finish the current segment: write its footer and record its metadata.
+    fn finish_current_segment(&mut self) -> Result<()> {
+        // Take the current seg_writer and finish it.
+        // We swap in a dummy that will be replaced by start_new_segment.
+        let seg_writer = std::mem::replace(
+            &mut self.seg_writer,
+            SegmentWriter::new(BufWriter::new(
+                tempfile_placeholder()?,
+            ), self.num_columns),
+        );
+
+        let segment_sizes = seg_writer.finish()?;
+        let segment_file = segment_filename(&self.data_prefix, self.current_segment_idx);
+        self.segment_files.push(segment_file);
+        self.all_segment_sizes.push(segment_sizes);
+        Ok(())
+    }
+
+    /// Start writing to a new segment.
+    fn start_new_segment(&mut self) -> Result<()> {
+        self.current_segment_idx += 1;
+        self.rows_in_current_segment = 0;
+
+        let (seg_writer, _segment_file) = create_segment_writer(
+            &self.base_path,
+            &self.data_prefix,
+            self.current_segment_idx,
+            self.num_columns,
+        )?;
+        self.seg_writer = seg_writer;
         Ok(())
     }
 
@@ -406,24 +481,35 @@ impl SFrameWriter {
         // Flush any remaining buffered rows as a partial block
         self.flush_remaining()?;
 
+        // Finish the current (last) segment
         let segment_sizes = self.seg_writer.finish()?;
+        let segment_file = segment_filename(&self.data_prefix, self.current_segment_idx);
+        self.segment_files.push(segment_file);
+        self.all_segment_sizes.push(segment_sizes);
 
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
+        let num_segments = self.segment_files.len();
 
         // Write .sidx
         let sidx_file = format!("{}.sidx", self.data_prefix);
         let sidx_path = format!("{}/{}", self.base_path, sidx_file);
         write_sidx(
             &sidx_path,
-            &self.segment_file,
+            &self.segment_files,
             &self.column_types,
-            &segment_sizes,
+            &self.all_segment_sizes,
         )?;
 
         // Write .frame_idx
         let frame_idx_file = format!("{}.frame_idx", self.data_prefix);
         let frame_idx_path = format!("{}/{}", self.base_path, frame_idx_file);
-        write_frame_idx(&frame_idx_path, &col_names, &sidx_file, self.total_rows)?;
+        write_frame_idx(
+            &frame_idx_path,
+            &col_names,
+            &sidx_file,
+            self.total_rows,
+            num_segments,
+        )?;
 
         // Write dir_archive.ini
         write_dir_archive_ini(&self.base_path, &self.data_prefix)?;
@@ -433,6 +519,41 @@ impl SFrameWriter {
             .map_err(SFrameError::Io)?;
 
         Ok(())
+    }
+}
+
+/// Create a segment file name like "m_xxx.0000".
+fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
+    format!("{}.{:04}", data_prefix, segment_idx)
+}
+
+/// Create a new SegmentWriter for the given segment index.
+fn create_segment_writer(
+    base_path: &str,
+    data_prefix: &str,
+    segment_idx: usize,
+    num_columns: usize,
+) -> Result<(SegmentWriter<BufWriter<std::fs::File>>, String)> {
+    let segment_file = segment_filename(data_prefix, segment_idx);
+    let segment_path = format!("{}/{}", base_path, segment_file);
+    let file = std::fs::File::create(&segment_path).map_err(SFrameError::Io)?;
+    let buf_writer = BufWriter::new(file);
+    Ok((SegmentWriter::new(buf_writer, num_columns), segment_file))
+}
+
+/// Create a placeholder file for std::mem::replace in finish_current_segment.
+/// This file is never written to — it exists only to satisfy the type system.
+fn tempfile_placeholder() -> Result<std::fs::File> {
+    // Use /dev/null (unix) as a throwaway write target
+    #[cfg(unix)]
+    {
+        std::fs::File::create("/dev/null").map_err(SFrameError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-unix, create a temp file
+        let tmp = std::env::temp_dir().join(".sframe_writer_placeholder");
+        std::fs::File::create(&tmp).map_err(SFrameError::Io)
     }
 }
 

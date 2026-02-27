@@ -113,6 +113,35 @@ impl SFrameReader {
         Ok(result)
     }
 
+    /// Number of segments.
+    pub fn num_segments(&self) -> usize {
+        self.segment_readers.len()
+    }
+
+    /// Read all columns from a single segment.
+    ///
+    /// Returns one `Vec<FlexType>` per column. This avoids loading all
+    /// segments at once, limiting peak memory to one segment's worth of data.
+    pub fn read_segment_columns(
+        &mut self,
+        segment: usize,
+    ) -> Result<Vec<Vec<sframe_types::flex_type::FlexType>>> {
+        if segment >= self.segment_readers.len() {
+            return Err(SFrameError::Format(format!(
+                "Segment index {} out of range ({})",
+                segment,
+                self.segment_readers.len()
+            )));
+        }
+        let seg = &mut self.segment_readers[segment];
+        let num_cols = seg.num_columns();
+        let mut columns = Vec::with_capacity(num_cols);
+        for col in 0..num_cols {
+            columns.push(seg.read_column(col)?);
+        }
+        Ok(columns)
+    }
+
     /// Number of rows.
     pub fn num_rows(&self) -> u64 {
         self.frame_index.nrows
