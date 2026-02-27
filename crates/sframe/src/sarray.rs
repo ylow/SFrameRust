@@ -588,6 +588,323 @@ impl SArray {
         self.countna()
     }
 
+    // === Phase 10.5: String Operations ===
+
+    /// Count word frequencies in each string element.
+    ///
+    /// Returns a Dict-typed SArray where each element maps word → count.
+    pub fn count_bag_of_words(&self, to_lower: bool) -> SArray {
+        self.apply(
+            Arc::new(move |v| {
+                let s = match v {
+                    FlexType::String(s) => s.to_string(),
+                    _ => return FlexType::Undefined,
+                };
+                let text = if to_lower { s.to_lowercase() } else { s };
+                let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                for word in text.split_whitespace() {
+                    // Strip leading/trailing non-alphanumeric characters
+                    let trimmed: String = word.chars()
+                        .skip_while(|c| !c.is_alphanumeric())
+                        .collect::<String>();
+                    let trimmed: String = trimmed.chars().rev()
+                        .skip_while(|c| !c.is_alphanumeric())
+                        .collect::<String>().chars().rev().collect();
+                    if !trimmed.is_empty() {
+                        *counts.entry(trimmed).or_insert(0) += 1;
+                    }
+                }
+                let dict: Vec<(FlexType, FlexType)> = counts
+                    .into_iter()
+                    .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
+                    .collect();
+                FlexType::Dict(Arc::from(dict))
+            }),
+            FlexTypeEnum::Dict,
+        )
+    }
+
+    /// Count character n-gram frequencies in each string element.
+    pub fn count_character_ngrams(&self, n: usize, to_lower: bool) -> SArray {
+        self.apply(
+            Arc::new(move |v| {
+                let s = match v {
+                    FlexType::String(s) => s.to_string(),
+                    _ => return FlexType::Undefined,
+                };
+                let text = if to_lower { s.to_lowercase() } else { s };
+                let chars: Vec<char> = text.chars().collect();
+                let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                if chars.len() >= n {
+                    for window in chars.windows(n) {
+                        let ngram: String = window.iter().collect();
+                        *counts.entry(ngram).or_insert(0) += 1;
+                    }
+                }
+                let dict: Vec<(FlexType, FlexType)> = counts
+                    .into_iter()
+                    .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
+                    .collect();
+                FlexType::Dict(Arc::from(dict))
+            }),
+            FlexTypeEnum::Dict,
+        )
+    }
+
+    /// Count word n-gram frequencies in each string element.
+    pub fn count_ngrams(&self, n: usize, to_lower: bool) -> SArray {
+        self.apply(
+            Arc::new(move |v| {
+                let s = match v {
+                    FlexType::String(s) => s.to_string(),
+                    _ => return FlexType::Undefined,
+                };
+                let text = if to_lower { s.to_lowercase() } else { s };
+                let words: Vec<&str> = text.split_whitespace().collect();
+                let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                if words.len() >= n {
+                    for window in words.windows(n) {
+                        let ngram = window.join(" ");
+                        *counts.entry(ngram).or_insert(0) += 1;
+                    }
+                }
+                let dict: Vec<(FlexType, FlexType)> = counts
+                    .into_iter()
+                    .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
+                    .collect();
+                FlexType::Dict(Arc::from(dict))
+            }),
+            FlexTypeEnum::Dict,
+        )
+    }
+
+    /// Check if each string contains a substring.
+    /// Returns an Integer SArray (1 if contains, 0 otherwise).
+    pub fn contains(&self, substring: &str) -> SArray {
+        let sub = substring.to_string();
+        self.apply(
+            Arc::new(move |v| {
+                match v {
+                    FlexType::String(s) => {
+                        FlexType::Integer(if s.contains(&*sub) { 1 } else { 0 })
+                    }
+                    _ => FlexType::Integer(0),
+                }
+            }),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    // === Phase 10.6: Dict Operations ===
+
+    /// Extract keys from each Dict element as a List.
+    pub fn dict_keys(&self) -> SArray {
+        self.apply(
+            Arc::new(|v| match v {
+                FlexType::Dict(d) => {
+                    let keys: Vec<FlexType> = d.iter().map(|(k, _)| k.clone()).collect();
+                    FlexType::List(Arc::from(keys))
+                }
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::List,
+        )
+    }
+
+    /// Extract values from each Dict element as a List.
+    pub fn dict_values(&self) -> SArray {
+        self.apply(
+            Arc::new(|v| match v {
+                FlexType::Dict(d) => {
+                    let vals: Vec<FlexType> = d.iter().map(|(_, v)| v.clone()).collect();
+                    FlexType::List(Arc::from(vals))
+                }
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::List,
+        )
+    }
+
+    /// Filter dict entries to only include specified keys.
+    /// If `exclude` is true, removes the specified keys instead.
+    pub fn dict_trim_by_keys(&self, keys: Vec<FlexType>, exclude: bool) -> SArray {
+        let keys = Arc::new(keys);
+        self.apply(
+            Arc::new(move |v| match v {
+                FlexType::Dict(d) => {
+                    let filtered: Vec<(FlexType, FlexType)> = d
+                        .iter()
+                        .filter(|(k, _)| {
+                            let has_key = keys.contains(k);
+                            if exclude { !has_key } else { has_key }
+                        })
+                        .cloned()
+                        .collect();
+                    FlexType::Dict(Arc::from(filtered))
+                }
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Dict,
+        )
+    }
+
+    /// Filter dict entries by value range.
+    pub fn dict_trim_by_values(&self, lower: FlexType, upper: FlexType) -> SArray {
+        let lo = lower.clone();
+        let hi = upper.clone();
+        self.apply(
+            Arc::new(move |v| match v {
+                FlexType::Dict(d) => {
+                    let filtered: Vec<(FlexType, FlexType)> = d
+                        .iter()
+                        .filter(|(_, v)| v >= &lo && v <= &hi)
+                        .cloned()
+                        .collect();
+                    FlexType::Dict(Arc::from(filtered))
+                }
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Dict,
+        )
+    }
+
+    /// Check if each Dict contains any of the specified keys.
+    pub fn dict_has_any_keys(&self, keys: Vec<FlexType>) -> SArray {
+        let keys = Arc::new(keys);
+        self.apply(
+            Arc::new(move |v| match v {
+                FlexType::Dict(d) => {
+                    let has = d.iter().any(|(k, _)| keys.contains(k));
+                    FlexType::Integer(if has { 1 } else { 0 })
+                }
+                _ => FlexType::Integer(0),
+            }),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Check if each Dict contains all of the specified keys.
+    pub fn dict_has_all_keys(&self, keys: Vec<FlexType>) -> SArray {
+        let keys = Arc::new(keys);
+        self.apply(
+            Arc::new(move |v| match v {
+                FlexType::Dict(d) => {
+                    let dict_keys: Vec<&FlexType> = d.iter().map(|(k, _)| k).collect();
+                    let has_all = keys.iter().all(|k| dict_keys.contains(&k));
+                    FlexType::Integer(if has_all { 1 } else { 0 })
+                }
+                _ => FlexType::Integer(0),
+            }),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    // === Phase 10.7: Structured Data Operations ===
+
+    /// Length of each element (string len, vector/list/dict size).
+    pub fn item_length(&self) -> SArray {
+        self.apply(
+            Arc::new(|v| match v {
+                FlexType::String(s) => FlexType::Integer(s.len() as i64),
+                FlexType::Vector(v) => FlexType::Integer(v.len() as i64),
+                FlexType::List(l) => FlexType::Integer(l.len() as i64),
+                FlexType::Dict(d) => FlexType::Integer(d.len() as i64),
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Slice vector subarrays.
+    pub fn vector_slice(&self, start: usize, end: Option<usize>) -> SArray {
+        self.apply(
+            Arc::new(move |v| match v {
+                FlexType::Vector(vec) => {
+                    let s = start.min(vec.len());
+                    let e = end.unwrap_or(vec.len()).min(vec.len());
+                    if s >= e {
+                        FlexType::Vector(Arc::from(Vec::<f64>::new()))
+                    } else {
+                        FlexType::Vector(Arc::from(vec[s..e].to_vec()))
+                    }
+                }
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Vector,
+        )
+    }
+
+    // === Phase 10.8: Rolling / Windowed Aggregations ===
+
+    /// Rolling sum with a window of [before, after] around each element.
+    pub fn rolling_sum(&self, before: usize, after: usize, min_observations: usize) -> Result<SArray> {
+        self.rolling_agg(before, after, min_observations, |vals| {
+            vals.iter().cloned().reduce(|a, b| a + b).unwrap_or(FlexType::Integer(0))
+        })
+    }
+
+    /// Rolling mean.
+    pub fn rolling_mean(&self, before: usize, after: usize, min_observations: usize) -> Result<SArray> {
+        self.rolling_agg(before, after, min_observations, |vals| {
+            let count = vals.len() as f64;
+            if count == 0.0 {
+                return FlexType::Undefined;
+            }
+            let sum: f64 = vals.iter().map(|v| match v {
+                FlexType::Integer(i) => *i as f64,
+                FlexType::Float(f) => *f,
+                _ => 0.0,
+            }).sum();
+            FlexType::Float(sum / count)
+        })
+    }
+
+    /// Rolling min.
+    pub fn rolling_min(&self, before: usize, after: usize, min_observations: usize) -> Result<SArray> {
+        self.rolling_agg(before, after, min_observations, |vals| {
+            vals.iter().cloned().reduce(|a, b| if a < b { a } else { b })
+                .unwrap_or(FlexType::Undefined)
+        })
+    }
+
+    /// Rolling max.
+    pub fn rolling_max(&self, before: usize, after: usize, min_observations: usize) -> Result<SArray> {
+        self.rolling_agg(before, after, min_observations, |vals| {
+            vals.iter().cloned().reduce(|a, b| if a > b { a } else { b })
+                .unwrap_or(FlexType::Undefined)
+        })
+    }
+
+    /// Generic rolling aggregation helper.
+    fn rolling_agg(
+        &self,
+        before: usize,
+        after: usize,
+        min_observations: usize,
+        agg: impl Fn(&[FlexType]) -> FlexType,
+    ) -> Result<SArray> {
+        let values = self.to_vec()?;
+        let n = values.len();
+        let mut result = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let start = if i >= before { i - before } else { 0 };
+            let end = (i + after + 1).min(n);
+            let window: Vec<FlexType> = values[start..end]
+                .iter()
+                .filter(|v| !matches!(v, FlexType::Undefined))
+                .cloned()
+                .collect();
+            if window.len() >= min_observations {
+                result.push(agg(&window));
+            } else {
+                result.push(FlexType::Undefined);
+            }
+        }
+
+        SArray::from_vec(result, self.dtype)
+    }
+
     /// Access the underlying plan node.
     pub(crate) fn plan(&self) -> &Arc<PlannerNode> {
         &self.plan
@@ -1126,5 +1443,249 @@ mod tests {
             clipped.to_vec().unwrap(),
             vec![FlexType::Integer(3), FlexType::Integer(5), FlexType::Integer(7)]
         );
+    }
+
+    // === Phase 10.5-10.8 Tests ===
+
+    #[test]
+    fn test_count_bag_of_words() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::String("hello world hello".into()),
+                FlexType::String("foo bar".into()),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let bow = sa.count_bag_of_words(true);
+        let vals = bow.to_vec().unwrap();
+        // First element: {"hello": 2, "world": 1}
+        if let FlexType::Dict(d) = &vals[0] {
+            let hello_count = d.iter().find(|(k, _)| k == &FlexType::String("hello".into())).map(|(_, v)| v.clone());
+            assert_eq!(hello_count, Some(FlexType::Integer(2)));
+        } else {
+            panic!("Expected Dict");
+        }
+    }
+
+    #[test]
+    fn test_count_character_ngrams() {
+        let sa = SArray::from_vec(
+            vec![FlexType::String("abcabc".into())],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let ngrams = sa.count_character_ngrams(2, false);
+        let vals = ngrams.to_vec().unwrap();
+        if let FlexType::Dict(d) = &vals[0] {
+            // "ab" appears 2 times, "bc" appears 2 times, "ca" appears 1 time
+            let ab_count = d.iter().find(|(k, _)| k == &FlexType::String("ab".into())).map(|(_, v)| v.clone());
+            assert_eq!(ab_count, Some(FlexType::Integer(2)));
+        } else {
+            panic!("Expected Dict");
+        }
+    }
+
+    #[test]
+    fn test_count_ngrams() {
+        let sa = SArray::from_vec(
+            vec![FlexType::String("the cat sat on the mat".into())],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let ngrams = sa.count_ngrams(2, true);
+        let vals = ngrams.to_vec().unwrap();
+        if let FlexType::Dict(d) = &vals[0] {
+            // "the cat" appears 1 time, "the mat" appears 1 time
+            assert!(d.len() >= 4); // 5 bigrams from 6 words
+        } else {
+            panic!("Expected Dict");
+        }
+    }
+
+    #[test]
+    fn test_contains() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::String("hello world".into()),
+                FlexType::String("goodbye".into()),
+                FlexType::String("hello there".into()),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let result = sa.contains("hello");
+        assert_eq!(
+            result.to_vec().unwrap(),
+            vec![FlexType::Integer(1), FlexType::Integer(0), FlexType::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn test_dict_keys_values() {
+        let d1: Vec<(FlexType, FlexType)> = vec![
+            (FlexType::String("a".into()), FlexType::Integer(1)),
+            (FlexType::String("b".into()), FlexType::Integer(2)),
+        ];
+        let sa = SArray::from_vec(
+            vec![FlexType::Dict(Arc::from(d1))],
+            FlexTypeEnum::Dict,
+        ).unwrap();
+
+        let keys = sa.dict_keys().to_vec().unwrap();
+        if let FlexType::List(l) = &keys[0] {
+            assert_eq!(l.len(), 2);
+            assert!(l.contains(&FlexType::String("a".into())));
+        } else { panic!("Expected List"); }
+
+        let vals = sa.dict_values().to_vec().unwrap();
+        if let FlexType::List(l) = &vals[0] {
+            assert_eq!(l.len(), 2);
+            assert!(l.contains(&FlexType::Integer(1)));
+        } else { panic!("Expected List"); }
+    }
+
+    #[test]
+    fn test_dict_trim_by_keys() {
+        let d1: Vec<(FlexType, FlexType)> = vec![
+            (FlexType::String("a".into()), FlexType::Integer(1)),
+            (FlexType::String("b".into()), FlexType::Integer(2)),
+            (FlexType::String("c".into()), FlexType::Integer(3)),
+        ];
+        let sa = SArray::from_vec(
+            vec![FlexType::Dict(Arc::from(d1))],
+            FlexTypeEnum::Dict,
+        ).unwrap();
+
+        // Include only "a" and "c"
+        let trimmed = sa.dict_trim_by_keys(
+            vec![FlexType::String("a".into()), FlexType::String("c".into())],
+            false,
+        );
+        if let FlexType::Dict(d) = &trimmed.to_vec().unwrap()[0] {
+            assert_eq!(d.len(), 2);
+        } else { panic!("Expected Dict"); }
+
+        // Exclude "b"
+        let trimmed = sa.dict_trim_by_keys(
+            vec![FlexType::String("b".into())],
+            true,
+        );
+        if let FlexType::Dict(d) = &trimmed.to_vec().unwrap()[0] {
+            assert_eq!(d.len(), 2); // "a" and "c"
+        } else { panic!("Expected Dict"); }
+    }
+
+    #[test]
+    fn test_dict_has_keys() {
+        let d1: Vec<(FlexType, FlexType)> = vec![
+            (FlexType::String("a".into()), FlexType::Integer(1)),
+            (FlexType::String("b".into()), FlexType::Integer(2)),
+        ];
+        let sa = SArray::from_vec(
+            vec![FlexType::Dict(Arc::from(d1))],
+            FlexTypeEnum::Dict,
+        ).unwrap();
+
+        let has_any = sa.dict_has_any_keys(vec![FlexType::String("a".into()), FlexType::String("z".into())]);
+        assert_eq!(has_any.to_vec().unwrap(), vec![FlexType::Integer(1)]);
+
+        let has_all = sa.dict_has_all_keys(vec![FlexType::String("a".into()), FlexType::String("z".into())]);
+        assert_eq!(has_all.to_vec().unwrap(), vec![FlexType::Integer(0)]);
+
+        let has_all2 = sa.dict_has_all_keys(vec![FlexType::String("a".into()), FlexType::String("b".into())]);
+        assert_eq!(has_all2.to_vec().unwrap(), vec![FlexType::Integer(1)]);
+    }
+
+    #[test]
+    fn test_item_length() {
+        // Test with strings
+        let sa_str = SArray::from_vec(
+            vec![FlexType::String("hello".into()), FlexType::String("hi".into())],
+            FlexTypeEnum::String,
+        ).unwrap();
+        let lengths = sa_str.item_length().to_vec().unwrap();
+        assert_eq!(lengths[0], FlexType::Integer(5));
+        assert_eq!(lengths[1], FlexType::Integer(2));
+
+        // Test with vectors
+        let sa_vec = SArray::from_vec(
+            vec![FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]))],
+            FlexTypeEnum::Vector,
+        ).unwrap();
+        let lengths = sa_vec.item_length().to_vec().unwrap();
+        assert_eq!(lengths[0], FlexType::Integer(3));
+    }
+
+    #[test]
+    fn test_vector_slice() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+                FlexType::Vector(Arc::from(vec![10.0, 20.0])),
+            ],
+            FlexTypeEnum::Vector,
+        ).unwrap();
+
+        let sliced = sa.vector_slice(1, Some(3));
+        let vals = sliced.to_vec().unwrap();
+        assert_eq!(vals[0], FlexType::Vector(Arc::from(vec![2.0, 3.0])));
+        assert_eq!(vals[1], FlexType::Vector(Arc::from(vec![20.0])));
+    }
+
+    #[test]
+    fn test_rolling_sum() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3),
+                FlexType::Integer(4), FlexType::Integer(5),
+            ],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+
+        // Window: 1 before, 1 after (size 3)
+        let rolled = sa.rolling_sum(1, 1, 1).unwrap();
+        let vals = rolled.to_vec().unwrap();
+        assert_eq!(vals[0], FlexType::Integer(3));  // 1+2
+        assert_eq!(vals[1], FlexType::Integer(6));  // 1+2+3
+        assert_eq!(vals[2], FlexType::Integer(9));  // 2+3+4
+        assert_eq!(vals[3], FlexType::Integer(12)); // 3+4+5
+        assert_eq!(vals[4], FlexType::Integer(9));  // 4+5
+    }
+
+    #[test]
+    fn test_rolling_mean() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::Float(1.0), FlexType::Float(2.0), FlexType::Float(3.0),
+                FlexType::Float(4.0), FlexType::Float(5.0),
+            ],
+            FlexTypeEnum::Float,
+        ).unwrap();
+
+        let rolled = sa.rolling_mean(1, 1, 1).unwrap();
+        let vals = rolled.to_vec().unwrap();
+        if let FlexType::Float(f) = vals[2] {
+            assert!((f - 3.0).abs() < 1e-9); // mean of [2, 3, 4]
+        } else { panic!("Expected Float"); }
+    }
+
+    #[test]
+    fn test_rolling_min_max() {
+        let sa = SArray::from_vec(
+            vec![
+                FlexType::Integer(5), FlexType::Integer(1), FlexType::Integer(3),
+                FlexType::Integer(2), FlexType::Integer(4),
+            ],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+
+        let rolled_min = sa.rolling_min(1, 1, 1).unwrap();
+        let min_vals = rolled_min.to_vec().unwrap();
+        assert_eq!(min_vals[1], FlexType::Integer(1)); // min of [5, 1, 3]
+
+        let rolled_max = sa.rolling_max(1, 1, 1).unwrap();
+        let max_vals = rolled_max.to_vec().unwrap();
+        assert_eq!(max_vals[1], FlexType::Integer(5)); // max of [5, 1, 3]
     }
 }

@@ -220,10 +220,6 @@ fn emit_right_only(
 struct CompositeKey(Vec<FlexType>);
 
 impl CompositeKey {
-    fn single(val: FlexType) -> Self {
-        CompositeKey(vec![val])
-    }
-
     fn from_row(batch: &SFrameRows, row: usize, columns: &[usize]) -> Self {
         CompositeKey(columns.iter().map(|&c| batch.column(c).get(row)).collect())
     }
