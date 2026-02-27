@@ -11,10 +11,12 @@ use sframe_query::algorithms::groupby;
 use sframe_query::algorithms::join::{self, JoinOn, JoinType};
 use sframe_query::algorithms::sort::{self, SortKey, SortOrder};
 use sframe_query::batch::SFrameRows;
-use sframe_query::execute::{compile, materialize_sync};
+use sframe_query::execute::{
+    compile, for_each_batch_sync, materialize_head_sync, materialize_sync,
+};
 use sframe_query::planner::PlannerNode;
 use sframe_storage::sframe_reader::SFrameReader;
-use sframe_storage::sframe_writer::write_sframe;
+use sframe_storage::sframe_writer::SFrameWriter;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
@@ -173,20 +175,46 @@ impl SFrame {
     }
 
     /// Filter rows by a predicate on a named column.
+    ///
+    /// Returns a lazy SFrame whose plan wraps a filter operator. No
+    /// materialization occurs until the result is consumed (e.g., by
+    /// `head()`, `save()`, or `num_rows()`).
     pub fn filter(
         &self,
         column_name: &str,
         pred: Arc<dyn Fn(&FlexType) -> bool + Send + Sync>,
     ) -> Result<SFrame> {
-        let filter_col = self.column_index(column_name)?;
+        let filter_col_idx = self.column_index(column_name)?;
 
-        // Materialize all columns, filter, rebuild
+        // Lazy path: if all columns share the same plan, build a filter node
+        if let Some(plan) = self.shared_plan() {
+            let plan_col_idx = self.columns[filter_col_idx].column_index();
+            let filtered_plan = PlannerNode::filter(plan.clone(), plan_col_idx, pred);
+
+            let columns: Vec<SArray> = self
+                .columns
+                .iter()
+                .map(|c| {
+                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, c.column_index())
+                })
+                .collect();
+
+            return Ok(SFrame {
+                columns,
+                column_names: self.column_names.clone(),
+            });
+        }
+
+        // Fallback: materialize, filter, rebuild
         let batch = self.materialize_batch()?;
-        let filtered = batch.filter_by_column(filter_col, &*pred)?;
+        let filtered = batch.filter_by_column(filter_col_idx, &*pred)?;
         self.from_batch(filtered)
     }
 
     /// Append another SFrame vertically.
+    ///
+    /// Returns a lazy SFrame backed by an Append plan node when possible,
+    /// avoiding immediate materialization of both sides.
     pub fn append(&self, other: &SFrame) -> Result<SFrame> {
         if self.column_names != other.column_names {
             return Err(SFrameError::Format(
@@ -194,6 +222,33 @@ impl SFrame {
             ));
         }
 
+        // Lazy path: build an Append plan node
+        if self.shared_plan().is_some() && other.shared_plan().is_some() {
+            let self_indices: Vec<usize> =
+                self.columns.iter().map(|c| c.column_index()).collect();
+            let other_indices: Vec<usize> =
+                other.columns.iter().map(|c| c.column_index()).collect();
+
+            let left =
+                PlannerNode::project(self.shared_plan().unwrap().clone(), self_indices);
+            let right =
+                PlannerNode::project(other.shared_plan().unwrap().clone(), other_indices);
+            let appended = PlannerNode::append(left, right);
+
+            let columns: Vec<SArray> = self
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| SArray::from_plan(appended.clone(), c.dtype(), None, i))
+                .collect();
+
+            return Ok(SFrame {
+                columns,
+                column_names: self.column_names.clone(),
+            });
+        }
+
+        // Fallback: materialize both sides
         let mut batch1 = self.materialize_batch()?;
         let batch2 = other.materialize_batch()?;
         batch1.append(&batch2)?;
@@ -201,12 +256,18 @@ impl SFrame {
     }
 
     /// Return the first n rows as a new SFrame.
+    ///
+    /// Only pulls enough batches from the stream to fill n rows, then stops.
+    /// This avoids materializing the entire dataset for small head requests.
     pub fn head(&self, n: usize) -> Result<SFrame> {
-        let batch = self.materialize_batch()?;
-        let take = n.min(batch.num_rows());
-        let indices: Vec<usize> = (0..take).collect();
-        let taken = batch.take(&indices)?;
-        self.from_batch(taken)
+        if n == 0 {
+            let dtypes = self.column_types();
+            let batch = SFrameRows::empty(&dtypes);
+            return self.from_batch(batch);
+        }
+        let stream = self.compile_stream()?;
+        let batch = materialize_head_sync(stream, n)?;
+        self.from_batch(batch)
     }
 
     /// Sort by one or more columns.
@@ -222,10 +283,7 @@ impl SFrame {
             })
             .collect::<Result<_>>()?;
 
-        let batch = self.materialize_batch()?;
-        let plan = PlannerNode::materialized(batch);
-        let stream = compile(&plan)?;
-
+        let stream = self.compile_stream()?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
         let sorted = rt.block_on(sort::sort(stream, &sort_keys))?;
@@ -243,14 +301,8 @@ impl SFrame {
         let left_idx = self.column_index(left_col)?;
         let right_idx = other.column_index(right_col)?;
 
-        let left_batch = self.materialize_batch()?;
-        let right_batch = other.materialize_batch()?;
-
-        let left_plan = PlannerNode::materialized(left_batch);
-        let right_plan = PlannerNode::materialized(right_batch);
-
-        let left_stream = compile(&left_plan)?;
-        let right_stream = compile(&right_plan)?;
+        let left_stream = self.compile_stream()?;
+        let right_stream = other.compile_stream()?;
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
@@ -299,10 +351,7 @@ impl SFrame {
             .map(|name| self.column_index(name))
             .collect::<Result<_>>()?;
 
-        let batch = self.materialize_batch()?;
-        let plan = PlannerNode::materialized(batch);
-        let stream = compile(&plan)?;
-
+        let stream = self.compile_stream()?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
 
@@ -337,12 +386,21 @@ impl SFrame {
     }
 
     /// Save to disk as an SFrame directory.
+    ///
+    /// Streams batches directly to the segment writer without collecting
+    /// the entire dataset into memory first.
     pub fn save(&self, path: &str) -> Result<()> {
-        let batch = self.materialize_batch()?;
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
-        let dtypes = batch.dtypes();
-        let rows = batch.to_rows();
-        write_sframe(path, &col_names, &dtypes, &rows)
+        let dtypes = self.column_types();
+        let mut writer = SFrameWriter::new(path, &col_names, &dtypes)?;
+
+        let stream = self.compile_stream()?;
+        for_each_batch_sync(stream, |batch| {
+            let col_vecs = batch.to_column_vecs();
+            writer.write_columns(&col_vecs)
+        })?;
+
+        writer.finish()
     }
 
     /// Iterate over rows.
@@ -352,6 +410,43 @@ impl SFrame {
     }
 
     // --- Internal helpers ---
+
+    /// Get the shared plan if all columns use the same plan node.
+    fn shared_plan(&self) -> Option<&Arc<PlannerNode>> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let first = self.columns[0].plan();
+        if self.columns.iter().all(|c| Arc::ptr_eq(c.plan(), first)) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    /// Compile the SFrame's plan into a BatchStream.
+    ///
+    /// If all columns share a plan, projects to the needed columns and
+    /// compiles once. Otherwise falls back to materializing all columns
+    /// and wrapping the result.
+    fn compile_stream(&self) -> Result<sframe_query::execute::BatchStream> {
+        if self.columns.is_empty() {
+            let plan = PlannerNode::materialized(SFrameRows::empty(&[]));
+            return compile(&plan);
+        }
+
+        if let Some(plan) = self.shared_plan() {
+            let indices: Vec<usize> =
+                self.columns.iter().map(|c| c.column_index()).collect();
+            let projected = PlannerNode::project(plan.clone(), indices);
+            compile(&projected)
+        } else {
+            // Different plans: materialize all columns and wrap as a single batch
+            let batch = self.materialize_batch()?;
+            let plan = PlannerNode::materialized(batch);
+            compile(&plan)
+        }
+    }
 
     fn column_index(&self, name: &str) -> Result<usize> {
         self.column_names

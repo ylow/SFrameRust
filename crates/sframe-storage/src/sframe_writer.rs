@@ -252,6 +252,134 @@ fn write_dir_archive_ini(base_path: &str, data_prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Incremental SFrame writer that accepts column data batch-by-batch.
+///
+/// Unlike [`write_sframe`] which requires all rows in memory at once, this
+/// writer accepts batches incrementally, enabling streaming pipelines that
+/// never hold the entire dataset in memory.
+///
+/// # Example
+/// ```ignore
+/// let mut writer = SFrameWriter::new("output.sf", &["id", "name"], &[Integer, String])?;
+/// writer.write_columns(&batch1_columns)?;
+/// writer.write_columns(&batch2_columns)?;
+/// writer.finish()?;
+/// ```
+pub struct SFrameWriter {
+    base_path: String,
+    column_names: Vec<String>,
+    column_types: Vec<FlexTypeEnum>,
+    seg_writer: SegmentWriter<BufWriter<std::fs::File>>,
+    segment_file: String,
+    data_prefix: String,
+    total_rows: u64,
+    rows_per_block: usize,
+}
+
+impl SFrameWriter {
+    /// Create a new writer targeting the given directory.
+    pub fn new(
+        base_path: &str,
+        column_names: &[&str],
+        column_types: &[FlexTypeEnum],
+    ) -> Result<Self> {
+        let num_columns = column_names.len();
+        if num_columns != column_types.len() {
+            return Err(SFrameError::Format(
+                "column_names and column_types length mismatch".to_string(),
+            ));
+        }
+
+        let hash = generate_hash(base_path);
+        let data_prefix = format!("m_{}", hash);
+        let segment_file = format!("{}.0000", data_prefix);
+        let segment_path = format!("{}/{}", base_path, segment_file);
+
+        std::fs::create_dir_all(base_path).map_err(SFrameError::Io)?;
+
+        let file = std::fs::File::create(&segment_path).map_err(SFrameError::Io)?;
+        let buf_writer = BufWriter::new(file);
+        let seg_writer = SegmentWriter::new(buf_writer, num_columns);
+
+        let rows_per_block = TARGET_BLOCK_SIZE / estimate_row_size(column_types);
+        let rows_per_block = rows_per_block.max(MIN_ROWS_PER_BLOCK).min(MAX_ROWS_PER_BLOCK);
+
+        Ok(SFrameWriter {
+            base_path: base_path.to_string(),
+            column_names: column_names.iter().map(|s| s.to_string()).collect(),
+            column_types: column_types.to_vec(),
+            seg_writer,
+            segment_file,
+            data_prefix,
+            total_rows: 0,
+            rows_per_block,
+        })
+    }
+
+    /// Write a batch of column data. Each element of `columns` contains
+    /// the values for one column. All columns must have the same length.
+    pub fn write_columns(&mut self, columns: &[Vec<FlexType>]) -> Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+
+        let num_rows = columns[0].len();
+        if num_rows == 0 {
+            return Ok(());
+        }
+
+        // Write in blocks of rows_per_block
+        let mut offset = 0;
+        while offset < num_rows {
+            let block_end = (offset + self.rows_per_block).min(num_rows);
+
+            for (col_idx, col_data) in columns.iter().enumerate() {
+                self.seg_writer.write_column_block(
+                    col_idx,
+                    &col_data[offset..block_end],
+                    self.column_types[col_idx],
+                )?;
+            }
+
+            offset = block_end;
+        }
+
+        self.total_rows += num_rows as u64;
+        Ok(())
+    }
+
+    /// Finalize the SFrame: write segment footer and all metadata files.
+    pub fn finish(self) -> Result<()> {
+        let segment_sizes = self.seg_writer.finish()?;
+
+        let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
+
+        // Write .sidx
+        let sidx_file = format!("{}.sidx", self.data_prefix);
+        let sidx_path = format!("{}/{}", self.base_path, sidx_file);
+        write_sidx(
+            &sidx_path,
+            &self.segment_file,
+            &self.column_types,
+            &segment_sizes,
+        )?;
+
+        // Write .frame_idx
+        let frame_idx_file = format!("{}.frame_idx", self.data_prefix);
+        let frame_idx_path = format!("{}/{}", self.base_path, frame_idx_file);
+        write_frame_idx(&frame_idx_path, &col_names, &sidx_file, self.total_rows)?;
+
+        // Write dir_archive.ini
+        write_dir_archive_ini(&self.base_path, &self.data_prefix)?;
+
+        // Write empty objects.bin (legacy)
+        std::fs::write(format!("{}/objects.bin", self.base_path), b"")
+            .map_err(SFrameError::Io)?;
+
+        Ok(())
+    }
+}
+
 /// Generate a deterministic hash prefix from the path.
 fn generate_hash(path: &str) -> String {
     // Simple hash - not cryptographic, just for unique file naming

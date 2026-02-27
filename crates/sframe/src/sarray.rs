@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use sframe_query::batch::{ColumnData, SFrameRows};
-use sframe_query::execute::{compile, materialize_sync};
+use sframe_query::execute::{compile, materialize_head_sync, materialize_sync};
 use sframe_query::planner::PlannerNode;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -80,10 +80,26 @@ impl SArray {
     }
 
     /// Return the first n values.
+    ///
+    /// Only pulls enough batches from the stream to fill n rows, then stops.
     pub fn head(&self, n: usize) -> Result<Vec<FlexType>> {
-        let data = self.materialize_column()?;
-        let take = n.min(data.len());
-        Ok((0..take).map(|i| data.get(i)).collect())
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let stream = compile(&self.plan)?;
+        let batch = materialize_head_sync(stream, n)?;
+        if batch.num_rows() == 0 {
+            return Ok(vec![]);
+        }
+        if self.column_index >= batch.num_columns() {
+            return Err(SFrameError::Format(format!(
+                "Column index {} out of range ({})",
+                self.column_index,
+                batch.num_columns()
+            )));
+        }
+        let col = batch.column(self.column_index);
+        Ok((0..col.len()).map(|i| col.get(i)).collect())
     }
 
     /// Apply a unary transform, producing a new SArray.

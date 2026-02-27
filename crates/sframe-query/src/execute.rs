@@ -317,6 +317,63 @@ pub fn materialize_sync(stream: BatchStream) -> Result<SFrameRows> {
     rt.block_on(materialize(stream))
 }
 
+/// Materialize at most `limit` rows from a stream, then stop pulling.
+///
+/// This enables efficient `head(n)` operations: only enough batches are
+/// consumed to fill the requested row count. Remaining batches are never
+/// read from the source.
+pub async fn materialize_head(mut stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+    let mut result: Option<SFrameRows> = None;
+    let mut remaining = limit;
+
+    while remaining > 0 {
+        match stream.next().await {
+            None => break,
+            Some(Err(e)) => return Err(e),
+            Some(Ok(batch)) => {
+                let batch = if batch.num_rows() > remaining {
+                    let indices: Vec<usize> = (0..remaining).collect();
+                    batch.take(&indices)?
+                } else {
+                    batch
+                };
+                remaining -= batch.num_rows();
+                match &mut result {
+                    None => result = Some(batch),
+                    Some(existing) => existing.append(&batch)?,
+                }
+            }
+        }
+    }
+
+    Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
+}
+
+/// Synchronous version of [`materialize_head`].
+pub fn materialize_head_sync(stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
+    rt.block_on(materialize_head(stream, limit))
+}
+
+/// Consume a stream batch-by-batch synchronously, calling `callback` for
+/// each batch. This avoids collecting the entire stream into memory.
+pub fn for_each_batch_sync<F>(stream: BatchStream, mut callback: F) -> Result<()>
+where
+    F: FnMut(SFrameRows) -> Result<()>,
+{
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
+    rt.block_on(async move {
+        let mut stream = stream;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            callback(batch)?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +562,53 @@ mod tests {
             assert!(matches!(&row[0], FlexType::String(_)));
             assert!(matches!(&row[1], FlexType::String(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn test_materialize_head_partial() {
+        // 10 elements, head(3) should only take 3
+        let node = PlannerNode::range(0, 1, 10);
+        let stream = compile(&node).unwrap();
+        let result = materialize_head(stream, 3).await.unwrap();
+
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.row(0), vec![FlexType::Integer(0)]);
+        assert_eq!(result.row(1), vec![FlexType::Integer(1)]);
+        assert_eq!(result.row(2), vec![FlexType::Integer(2)]);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_head_exceeds_total() {
+        // 5 elements, head(100) should return all 5
+        let node = PlannerNode::range(0, 1, 5);
+        let stream = compile(&node).unwrap();
+        let result = materialize_head(stream, 100).await.unwrap();
+
+        assert_eq!(result.num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_head_zero() {
+        let node = PlannerNode::range(0, 1, 10);
+        let stream = compile(&node).unwrap();
+        let result = materialize_head(stream, 0).await.unwrap();
+
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_for_each_batch_sync() {
+        let node = PlannerNode::range(0, 1, 10);
+        let stream = compile(&node).unwrap();
+
+        let mut total_rows = 0usize;
+        for_each_batch_sync(stream, |batch| {
+            total_rows += batch.num_rows();
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(total_rows, 10);
     }
 
     #[tokio::test]
