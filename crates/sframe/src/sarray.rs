@@ -317,6 +317,277 @@ impl SArray {
         )
     }
 
+    // === Phase 10.1: Core operations ===
+
+    /// Return the last n values.
+    pub fn tail(&self, n: usize) -> Result<Vec<FlexType>> {
+        let all = self.to_vec()?;
+        let start = all.len().saturating_sub(n);
+        Ok(all[start..].to_vec())
+    }
+
+    /// Sort the array.
+    pub fn sort(&self, ascending: bool) -> Result<SArray> {
+        let mut values = self.to_vec()?;
+        values.sort_by(|a, b| {
+            let cmp = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+            if ascending { cmp } else { cmp.reverse() }
+        });
+        SArray::from_vec(values, self.dtype)
+    }
+
+    /// Deduplicated values (preserves first occurrence order).
+    pub fn unique(&self) -> Result<SArray> {
+        let values = self.to_vec()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for v in values {
+            let key = format!("{:?}", v);
+            if seen.insert(key) {
+                result.push(v);
+            }
+        }
+        SArray::from_vec(result, self.dtype)
+    }
+
+    /// Concatenate with another SArray.
+    pub fn append(&self, other: &SArray) -> Result<SArray> {
+        let plan = PlannerNode::append(self.plan.clone(), other.plan.clone());
+        let new_len = match (self.len, other.len) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+        Ok(SArray {
+            plan: PlannerNode::project(plan, vec![self.column_index]),
+            dtype: self.dtype,
+            len: new_len,
+            column_index: 0,
+        })
+    }
+
+    /// Random sample of the array (fraction between 0.0 and 1.0).
+    pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SArray> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let values = self.to_vec()?;
+        let mut result = Vec::new();
+        let seed = seed.unwrap_or(42);
+
+        for (i, v) in values.into_iter().enumerate() {
+            let mut hasher = DefaultHasher::new();
+            (seed, i as u64).hash(&mut hasher);
+            let hash = hasher.finish();
+            let threshold = (fraction * u64::MAX as f64) as u64;
+            if hash < threshold {
+                result.push(v);
+            }
+        }
+
+        SArray::from_vec(result, self.dtype)
+    }
+
+    // === Phase 10.2: Missing value handling ===
+
+    /// Count Undefined values.
+    pub fn countna(&self) -> Result<u64> {
+        let values = self.to_vec()?;
+        Ok(values.iter().filter(|v| matches!(v, FlexType::Undefined)).count() as u64)
+    }
+
+    /// Remove Undefined values.
+    pub fn dropna(&self) -> SArray {
+        self.filter(Arc::new(|v| !matches!(v, FlexType::Undefined)))
+    }
+
+    /// Replace Undefined with a fill value.
+    pub fn fillna(&self, value: FlexType) -> SArray {
+        let v = value.clone();
+        self.apply(
+            Arc::new(move |x| {
+                if matches!(x, FlexType::Undefined) {
+                    v.clone()
+                } else {
+                    x.clone()
+                }
+            }),
+            self.dtype,
+        )
+    }
+
+    /// Returns Integer array: 1 where Undefined, 0 otherwise.
+    pub fn is_na(&self) -> SArray {
+        self.apply(
+            Arc::new(|v| {
+                FlexType::Integer(if matches!(v, FlexType::Undefined) { 1 } else { 0 })
+            }),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    // === Phase 10.3: Numeric operations ===
+
+    /// Clamp values to [lower, upper].
+    pub fn clip(&self, lower: FlexType, upper: FlexType) -> SArray {
+        let lo = lower.clone();
+        let hi = upper.clone();
+        self.apply(
+            Arc::new(move |v| {
+                if v < &lo {
+                    lo.clone()
+                } else if v > &hi {
+                    hi.clone()
+                } else {
+                    v.clone()
+                }
+            }),
+            self.dtype,
+        )
+    }
+
+    // === Phase 10.4: Reduction operations ===
+
+    /// Sum of all values.
+    pub fn sum(&self) -> Result<FlexType> {
+        let values = self.to_vec()?;
+        let mut result = FlexType::Integer(0);
+        for v in values {
+            if !matches!(v, FlexType::Undefined) {
+                result = result + v;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Minimum value.
+    pub fn min_val(&self) -> Result<FlexType> {
+        let values = self.to_vec()?;
+        let mut result: Option<FlexType> = None;
+        for v in values {
+            if matches!(v, FlexType::Undefined) {
+                continue;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) => {
+                    if v < cur { v } else { cur }
+                }
+            });
+        }
+        Ok(result.unwrap_or(FlexType::Undefined))
+    }
+
+    /// Maximum value.
+    pub fn max_val(&self) -> Result<FlexType> {
+        let values = self.to_vec()?;
+        let mut result: Option<FlexType> = None;
+        for v in values {
+            if matches!(v, FlexType::Undefined) {
+                continue;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) => {
+                    if v > cur { v } else { cur }
+                }
+            });
+        }
+        Ok(result.unwrap_or(FlexType::Undefined))
+    }
+
+    /// Mean of numeric values.
+    pub fn mean(&self) -> Result<FlexType> {
+        let values = self.to_vec()?;
+        let mut sum = 0.0;
+        let mut count = 0u64;
+        for v in &values {
+            match v {
+                FlexType::Integer(i) => {
+                    sum += *i as f64;
+                    count += 1;
+                }
+                FlexType::Float(f) => {
+                    sum += f;
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        if count == 0 {
+            Ok(FlexType::Undefined)
+        } else {
+            Ok(FlexType::Float(sum / count as f64))
+        }
+    }
+
+    /// Standard deviation (sample, ddof=1).
+    pub fn std_dev(&self, ddof: u8) -> Result<FlexType> {
+        match self.variance(ddof)? {
+            FlexType::Float(v) => Ok(FlexType::Float(v.sqrt())),
+            other => Ok(other),
+        }
+    }
+
+    /// Variance (sample by default, ddof=1).
+    pub fn variance(&self, ddof: u8) -> Result<FlexType> {
+        let values = self.to_vec()?;
+        let mut count = 0u64;
+        let mut mean = 0.0;
+        let mut m2 = 0.0;
+
+        for v in &values {
+            let x = match v {
+                FlexType::Integer(i) => *i as f64,
+                FlexType::Float(f) => *f,
+                _ => continue,
+            };
+            count += 1;
+            let delta = x - mean;
+            mean += delta / count as f64;
+            let delta2 = x - mean;
+            m2 += delta * delta2;
+        }
+
+        if count <= ddof as u64 {
+            Ok(FlexType::Undefined)
+        } else {
+            Ok(FlexType::Float(m2 / (count - ddof as u64) as f64))
+        }
+    }
+
+    /// True if any element is non-zero (for integer arrays).
+    pub fn any(&self) -> Result<bool> {
+        let values = self.to_vec()?;
+        Ok(values.iter().any(|v| matches!(v, FlexType::Integer(i) if *i != 0)))
+    }
+
+    /// True if all elements are non-zero (for integer arrays).
+    pub fn all(&self) -> Result<bool> {
+        let values = self.to_vec()?;
+        Ok(values
+            .iter()
+            .filter(|v| !matches!(v, FlexType::Undefined))
+            .all(|v| matches!(v, FlexType::Integer(i) if *i != 0)))
+    }
+
+    /// Count non-zero elements.
+    pub fn nnz(&self) -> Result<u64> {
+        let values = self.to_vec()?;
+        Ok(values
+            .iter()
+            .filter(|v| match v {
+                FlexType::Integer(i) => *i != 0,
+                FlexType::Float(f) => *f != 0.0,
+                _ => false,
+            })
+            .count() as u64)
+    }
+
+    /// Count Undefined/missing values (alias for countna).
+    pub fn num_missing(&self) -> Result<u64> {
+        self.countna()
+    }
+
     /// Access the underlying plan node.
     pub(crate) fn plan(&self) -> &Arc<PlannerNode> {
         &self.plan
@@ -658,5 +929,202 @@ mod tests {
             FlexType::Float(v) => assert!((v - 11.0).abs() < 1e-10),
             other => panic!("Expected Float, got {:?}", other),
         }
+    }
+
+    // === Phase 10 operation tests ===
+
+    #[test]
+    fn test_tail() {
+        let sa = SArray::from_vec(
+            (0..10).map(|i| FlexType::Integer(i)).collect(),
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let t = sa.tail(3).unwrap();
+        assert_eq!(t, vec![FlexType::Integer(7), FlexType::Integer(8), FlexType::Integer(9)]);
+    }
+
+    #[test]
+    fn test_sort_array() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(4), FlexType::Integer(1), FlexType::Integer(5)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let sorted = sa.sort(true).unwrap();
+        assert_eq!(
+            sorted.to_vec().unwrap(),
+            vec![FlexType::Integer(1), FlexType::Integer(1), FlexType::Integer(3), FlexType::Integer(4), FlexType::Integer(5)]
+        );
+    }
+
+    #[test]
+    fn test_unique() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(1), FlexType::Integer(3), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let u = sa.unique().unwrap();
+        assert_eq!(
+            u.to_vec().unwrap(),
+            vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_dropna() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Undefined, FlexType::Integer(3), FlexType::Undefined],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let cleaned = sa.dropna();
+        assert_eq!(
+            cleaned.to_vec().unwrap(),
+            vec![FlexType::Integer(1), FlexType::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_fillna() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Undefined, FlexType::Integer(3)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let filled = sa.fillna(FlexType::Integer(0));
+        assert_eq!(
+            filled.to_vec().unwrap(),
+            vec![FlexType::Integer(1), FlexType::Integer(0), FlexType::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_is_na() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Undefined, FlexType::Integer(3)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let na_mask = sa.is_na();
+        assert_eq!(
+            na_mask.to_vec().unwrap(),
+            vec![FlexType::Integer(0), FlexType::Integer(1), FlexType::Integer(0)]
+        );
+    }
+
+    #[test]
+    fn test_countna() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Undefined, FlexType::Undefined],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        assert_eq!(sa.countna().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_sum_reduction() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        assert_eq!(sa.sum().unwrap(), FlexType::Integer(6));
+    }
+
+    #[test]
+    fn test_min_max_reduction() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(5)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        assert_eq!(sa.min_val().unwrap(), FlexType::Integer(1));
+        assert_eq!(sa.max_val().unwrap(), FlexType::Integer(5));
+    }
+
+    #[test]
+    fn test_mean_reduction() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Float(2.0), FlexType::Float(4.0), FlexType::Float(6.0)],
+            FlexTypeEnum::Float,
+        )
+        .unwrap();
+
+        match sa.mean().unwrap() {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_variance_reduction() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Float(2.0), FlexType::Float(4.0), FlexType::Float(4.0), FlexType::Float(4.0), FlexType::Float(5.0), FlexType::Float(5.0), FlexType::Float(7.0), FlexType::Float(9.0)],
+            FlexTypeEnum::Float,
+        )
+        .unwrap();
+
+        // Population variance = 4.0
+        match sa.variance(0).unwrap() {
+            FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_any_all() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(0), FlexType::Integer(1), FlexType::Integer(0)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        assert!(sa.any().unwrap());
+        assert!(!sa.all().unwrap());
+
+        let sa2 = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(1)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+        assert!(sa2.all().unwrap());
+    }
+
+    #[test]
+    fn test_nnz() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(0), FlexType::Integer(1), FlexType::Integer(0), FlexType::Integer(3)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        assert_eq!(sa.nnz().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_clip() {
+        let sa = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(5), FlexType::Integer(10)],
+            FlexTypeEnum::Integer,
+        )
+        .unwrap();
+
+        let clipped = sa.clip(FlexType::Integer(3), FlexType::Integer(7));
+        assert_eq!(
+            clipped.to_vec().unwrap(),
+            vec![FlexType::Integer(3), FlexType::Integer(5), FlexType::Integer(7)]
+        );
     }
 }

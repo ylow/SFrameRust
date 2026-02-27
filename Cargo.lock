@@ -392,7 +392,6 @@ dependencies = [
 name = "sframe-query"
 version = "0.1.0"
 dependencies = [
- "csv",
  "futures",
  "pin-project-lite",
  "sframe-storage",
