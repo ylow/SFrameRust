@@ -4,7 +4,7 @@
 //! SFrame using the writer, then reads it back and verifies every value matches.
 
 use sframe_storage::sframe_reader::SFrameReader;
-use sframe_storage::sframe_writer::write_sframe;
+use sframe_storage::sframe_writer::{write_sframe, SFrameWriter};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 fn samples_dir() -> String {
@@ -224,4 +224,125 @@ fn test_roundtrip_empty() {
     assert_eq!(sf.num_columns(), 2);
     assert_eq!(sf.column_names()[0], "x");
     assert_eq!(sf.column_names()[1], "y");
+}
+
+/// Test SFrameWriter with many small batches (cross-batch buffering).
+///
+/// Sends 100 batches of 10 rows each. The writer should coalesce them
+/// into proper-sized blocks instead of writing 100 tiny blocks.
+#[test]
+fn test_streaming_writer_small_batches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("small_batches.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["id", "value"];
+    let col_types = &[FlexTypeEnum::Integer, FlexTypeEnum::Float];
+
+    let mut writer = SFrameWriter::new(out_path_str, col_names, col_types).unwrap();
+
+    let total_rows = 1000;
+    let batch_size = 10;
+    for batch_start in (0..total_rows).step_by(batch_size) {
+        let ids: Vec<FlexType> = (batch_start..batch_start + batch_size as i64)
+            .map(FlexType::Integer)
+            .collect();
+        let values: Vec<FlexType> = (batch_start..batch_start + batch_size as i64)
+            .map(|i| FlexType::Float(i as f64 * 0.5))
+            .collect();
+        writer.write_columns(&[ids, values]).unwrap();
+    }
+
+    writer.finish().unwrap();
+
+    // Read back and verify
+    let mut sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), total_rows as u64);
+    assert_eq!(sf.num_columns(), 2);
+
+    let ids = sf.read_column_by_name("id").unwrap();
+    assert_eq!(ids.len(), total_rows as usize);
+    assert_eq!(ids[0], FlexType::Integer(0));
+    assert_eq!(ids[999], FlexType::Integer(999));
+
+    let values = sf.read_column_by_name("value").unwrap();
+    assert!(flex_eq(&values[0], &FlexType::Float(0.0)));
+    assert!(flex_eq(&values[999], &FlexType::Float(499.5)));
+}
+
+/// Test SFrameWriter with a single large batch.
+#[test]
+fn test_streaming_writer_large_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("large_batch.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["x"];
+    let col_types = &[FlexTypeEnum::Integer];
+
+    let mut writer = SFrameWriter::new(out_path_str, col_names, col_types).unwrap();
+
+    let n = 50_000;
+    let data: Vec<FlexType> = (0..n).map(|i| FlexType::Integer(i)).collect();
+    writer.write_columns(&[data]).unwrap();
+    writer.finish().unwrap();
+
+    let mut sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), n as u64);
+    let col = sf.read_column_by_name("x").unwrap();
+    assert_eq!(col[0], FlexType::Integer(0));
+    assert_eq!(col[(n - 1) as usize], FlexType::Integer(n - 1));
+}
+
+/// Test SFrameWriter with empty finish (no data written).
+#[test]
+fn test_streaming_writer_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("empty_stream.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["a", "b"];
+    let col_types = &[FlexTypeEnum::String, FlexTypeEnum::Integer];
+
+    let writer = SFrameWriter::new(out_path_str, col_names, col_types).unwrap();
+    writer.finish().unwrap();
+
+    let sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), 0);
+    assert_eq!(sf.num_columns(), 2);
+}
+
+/// Test SFrameWriter with batches of varying sizes.
+#[test]
+fn test_streaming_writer_variable_batch_sizes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("variable_batches.sf");
+    let out_path_str = out_path.to_str().unwrap();
+
+    let col_names = &["val"];
+    let col_types = &[FlexTypeEnum::Integer];
+
+    let mut writer = SFrameWriter::new(out_path_str, col_names, col_types).unwrap();
+
+    // Write batches of varying sizes: 1, 5, 100, 3, 50, 1000, 7
+    let batch_sizes = [1, 5, 100, 3, 50, 1000, 7];
+    let mut next_val: i64 = 0;
+    let total: usize = batch_sizes.iter().sum();
+
+    for &size in &batch_sizes {
+        let data: Vec<FlexType> = (next_val..next_val + size as i64)
+            .map(FlexType::Integer)
+            .collect();
+        writer.write_columns(&[data]).unwrap();
+        next_val += size as i64;
+    }
+
+    writer.finish().unwrap();
+
+    let mut sf = SFrameReader::open(out_path_str).unwrap();
+    assert_eq!(sf.num_rows(), total as u64);
+    let col = sf.read_column_by_name("val").unwrap();
+    for i in 0..total {
+        assert_eq!(col[i], FlexType::Integer(i as i64), "Mismatch at row {}", i);
+    }
 }

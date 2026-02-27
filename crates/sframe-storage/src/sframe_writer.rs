@@ -258,6 +258,10 @@ fn write_dir_archive_ini(base_path: &str, data_prefix: &str) -> Result<()> {
 /// writer accepts batches incrementally, enabling streaming pipelines that
 /// never hold the entire dataset in memory.
 ///
+/// Incoming data is buffered internally and flushed to disk in blocks of
+/// `rows_per_block` rows. This means many small batches are coalesced into
+/// efficient blocks, and a single large batch is automatically split.
+///
 /// # Example
 /// ```ignore
 /// let mut writer = SFrameWriter::new("output.sf", &["id", "name"], &[Integer, String])?;
@@ -274,6 +278,11 @@ pub struct SFrameWriter {
     data_prefix: String,
     total_rows: u64,
     rows_per_block: usize,
+    /// Internal column buffers for cross-batch accumulation.
+    /// Each inner Vec holds the buffered values for one column.
+    column_buffers: Vec<Vec<FlexType>>,
+    /// Number of buffered rows (same across all column buffers).
+    buffered_rows: usize,
 }
 
 impl SFrameWriter {
@@ -304,6 +313,8 @@ impl SFrameWriter {
         let rows_per_block = TARGET_BLOCK_SIZE / estimate_row_size(column_types);
         let rows_per_block = rows_per_block.max(MIN_ROWS_PER_BLOCK).min(MAX_ROWS_PER_BLOCK);
 
+        let column_buffers = vec![Vec::new(); num_columns];
+
         Ok(SFrameWriter {
             base_path: base_path.to_string(),
             column_names: column_names.iter().map(|s| s.to_string()).collect(),
@@ -313,11 +324,16 @@ impl SFrameWriter {
             data_prefix,
             total_rows: 0,
             rows_per_block,
+            column_buffers,
+            buffered_rows: 0,
         })
     }
 
     /// Write a batch of column data. Each element of `columns` contains
     /// the values for one column. All columns must have the same length.
+    ///
+    /// Data is buffered internally and flushed in blocks of `rows_per_block`.
+    /// Small batches are accumulated; large batches are split into blocks.
     pub fn write_columns(&mut self, columns: &[Vec<FlexType>]) -> Result<()> {
         if columns.is_empty() {
             return Ok(());
@@ -328,28 +344,68 @@ impl SFrameWriter {
             return Ok(());
         }
 
-        // Write in blocks of rows_per_block
-        let mut offset = 0;
-        while offset < num_rows {
-            let block_end = (offset + self.rows_per_block).min(num_rows);
-
-            for (col_idx, col_data) in columns.iter().enumerate() {
-                self.seg_writer.write_column_block(
-                    col_idx,
-                    &col_data[offset..block_end],
-                    self.column_types[col_idx],
-                )?;
-            }
-
-            offset = block_end;
+        if columns.len() != self.column_buffers.len() {
+            return Err(SFrameError::Format(format!(
+                "Expected {} columns, got {}",
+                self.column_buffers.len(),
+                columns.len()
+            )));
         }
 
+        // Append incoming data to internal buffers
+        for (buf, col_data) in self.column_buffers.iter_mut().zip(columns.iter()) {
+            buf.extend_from_slice(col_data);
+        }
+        self.buffered_rows += num_rows;
         self.total_rows += num_rows as u64;
+
+        // Flush complete blocks
+        self.flush_full_blocks()?;
+
         Ok(())
     }
 
-    /// Finalize the SFrame: write segment footer and all metadata files.
-    pub fn finish(self) -> Result<()> {
+    /// Flush all complete blocks from the internal buffers.
+    /// Leaves any partial block (< rows_per_block) in the buffer.
+    fn flush_full_blocks(&mut self) -> Result<()> {
+        while self.buffered_rows >= self.rows_per_block {
+            for col_idx in 0..self.column_buffers.len() {
+                let block: Vec<FlexType> = self.column_buffers[col_idx]
+                    .drain(..self.rows_per_block)
+                    .collect();
+                self.seg_writer.write_column_block(
+                    col_idx,
+                    &block,
+                    self.column_types[col_idx],
+                )?;
+            }
+            self.buffered_rows -= self.rows_per_block;
+        }
+        Ok(())
+    }
+
+    /// Flush any remaining buffered rows as a final partial block.
+    fn flush_remaining(&mut self) -> Result<()> {
+        if self.buffered_rows > 0 {
+            for col_idx in 0..self.column_buffers.len() {
+                let block: Vec<FlexType> = self.column_buffers[col_idx].drain(..).collect();
+                self.seg_writer.write_column_block(
+                    col_idx,
+                    &block,
+                    self.column_types[col_idx],
+                )?;
+            }
+            self.buffered_rows = 0;
+        }
+        Ok(())
+    }
+
+    /// Finalize the SFrame: flush remaining data, write segment footer
+    /// and all metadata files.
+    pub fn finish(mut self) -> Result<()> {
+        // Flush any remaining buffered rows as a partial block
+        self.flush_remaining()?;
+
         let segment_sizes = self.seg_writer.finish()?;
 
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();

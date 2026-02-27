@@ -392,12 +392,11 @@ impl SFrame {
     pub fn save(&self, path: &str) -> Result<()> {
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
         let dtypes = self.column_types();
-        let mut writer = SFrameWriter::new(path, &col_names, &dtypes)?;
+        let mut writer = SFrameStreamWriter::new(path, &col_names, &dtypes)?;
 
         let stream = self.compile_stream()?;
         for_each_batch_sync(stream, |batch| {
-            let col_vecs = batch.to_column_vecs();
-            writer.write_columns(&col_vecs)
+            writer.write_batch(&batch)
         })?;
 
         writer.finish()
@@ -593,6 +592,52 @@ impl std::fmt::Display for SFrame {
     }
 }
 
+/// Streaming SFrame writer that accepts `SFrameRows` batches.
+///
+/// Wraps the low-level [`SFrameWriter`] from `sframe-storage`, bridging
+/// the columnar `SFrameRows` batch type to the storage writer's
+/// column-vector interface. Data is buffered internally and flushed
+/// to disk in blocks.
+///
+/// # Example
+/// ```ignore
+/// let mut writer = SFrameStreamWriter::new("output.sf", &["id", "name"], &[Integer, String])?;
+/// writer.write_batch(&batch1)?;
+/// writer.write_batch(&batch2)?;
+/// writer.finish()?;
+/// ```
+pub struct SFrameStreamWriter {
+    inner: SFrameWriter,
+}
+
+impl SFrameStreamWriter {
+    /// Create a new streaming writer targeting the given directory.
+    pub fn new(
+        path: &str,
+        column_names: &[&str],
+        column_types: &[FlexTypeEnum],
+    ) -> Result<Self> {
+        let inner = SFrameWriter::new(path, column_names, column_types)?;
+        Ok(SFrameStreamWriter { inner })
+    }
+
+    /// Write a batch of rows. Data is buffered internally and flushed
+    /// to disk when enough rows accumulate for a full block.
+    pub fn write_batch(&mut self, batch: &SFrameRows) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let col_vecs = batch.to_column_vecs();
+        self.inner.write_columns(&col_vecs)
+    }
+
+    /// Finalize: flush remaining buffered data, write segment footer
+    /// and metadata files.
+    pub fn finish(self) -> Result<()> {
+        self.inner.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +816,42 @@ mod tests {
         let sf3 = sf2.remove_column("x").unwrap();
         assert_eq!(sf3.num_columns(), 1);
         assert_eq!(sf3.column_names(), &["y"]);
+    }
+
+    #[test]
+    fn test_stream_writer_batch_api() {
+        use sframe_query::batch::{ColumnData, SFrameRows};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("streamed.sf");
+        let path_str = path.to_str().unwrap();
+
+        let dtypes = &[FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let mut writer = SFrameStreamWriter::new(path_str, &["id", "name"], dtypes).unwrap();
+
+        // Write two batches
+        let batch1 = SFrameRows::new(vec![
+            ColumnData::Integer(vec![Some(1), Some(2)]),
+            ColumnData::String(vec![Some("alice".into()), Some("bob".into())]),
+        ]).unwrap();
+        writer.write_batch(&batch1).unwrap();
+
+        let batch2 = SFrameRows::new(vec![
+            ColumnData::Integer(vec![Some(3)]),
+            ColumnData::String(vec![Some("charlie".into())]),
+        ]).unwrap();
+        writer.write_batch(&batch2).unwrap();
+
+        writer.finish().unwrap();
+
+        // Verify via SFrame::read
+        let sf = SFrame::read(path_str).unwrap();
+        assert_eq!(sf.num_rows().unwrap(), 3);
+        assert_eq!(sf.num_columns(), 2);
+
+        let rows = sf.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String("alice".into())]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String("bob".into())]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String("charlie".into())]);
     }
 }
