@@ -53,7 +53,7 @@ fn ensure_init() {
 
 /// Parse a byte size string. Supports plain integers and suffixes:
 /// `K`/`KB`, `M`/`MB`, `G`/`GB` (case-insensitive).
-fn parse_byte_size(s: &str) -> Result<usize, ()> {
+pub fn parse_byte_size(s: &str) -> Result<usize, ()> {
     let s = s.trim();
     let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")).or_else(|| s.strip_suffix("G").or_else(|| s.strip_suffix("g"))) {
         (n.trim(), 1024 * 1024 * 1024)

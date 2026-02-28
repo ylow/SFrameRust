@@ -8,6 +8,7 @@ sframe-types = { path = "../sframe-types" }
 sframe-io = { path = "../sframe-io" }
 sframe-storage = { path = "../sframe-storage" }
 sframe-query = { path = "../sframe-query" }
+sframe-config = { path = "../sframe-config" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 futures = "0.3"
 

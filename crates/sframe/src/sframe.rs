@@ -48,7 +48,7 @@ impl Drop for AnonymousStore {
 /// memory at once. Call `finish()` to finalize the SFrame; if the builder
 /// is dropped without `finish()`, the directory is cleaned up (for
 /// anonymous builders only).
-struct SFrameBuilder {
+pub(crate) struct SFrameBuilder {
     writer: Option<SFrameWriter>,
     column_names: Vec<String>,
     dtypes: Vec<FlexTypeEnum>,
@@ -82,7 +82,7 @@ impl SFrameBuilder {
     ///
     /// Allocates a fresh cache directory and arranges for it to be cleaned
     /// up if the builder is dropped without calling `finish()`.
-    fn anonymous(column_names: Vec<String>, dtypes: Vec<FlexTypeEnum>) -> Result<Self> {
+    pub(crate) fn anonymous(column_names: Vec<String>, dtypes: Vec<FlexTypeEnum>) -> Result<Self> {
         let cache_fs = global_cache_fs();
         let dir_path = cache_fs.alloc_dir();
         let vfs: Arc<dyn VirtualFileSystem> = Arc::new(ArcCacheFsVfs(cache_fs.clone()));
@@ -92,7 +92,7 @@ impl SFrameBuilder {
     }
 
     /// Write pre-built column vectors directly.
-    fn write_columns(&mut self, cols: &[Vec<FlexType>]) -> Result<()> {
+    pub(crate) fn write_columns(&mut self, cols: &[Vec<FlexType>]) -> Result<()> {
         self.writer
             .as_mut()
             .expect("write_columns called after finish")
@@ -100,7 +100,7 @@ impl SFrameBuilder {
     }
 
     /// Write an `SFrameRows` batch in chunks to limit peak memory.
-    fn write_batch_chunked(&mut self, batch: &SFrameRows, chunk_size: usize) -> Result<()> {
+    pub(crate) fn write_batch_chunked(&mut self, batch: &SFrameRows, chunk_size: usize) -> Result<()> {
         let nrows = batch.num_rows();
         let ncols = batch.num_columns();
         let mut offset = 0;
@@ -127,7 +127,7 @@ impl SFrameBuilder {
 
     /// Write rows from `batch` in the order given by `indices`, in chunks.
     /// This avoids building a full sorted copy of the batch.
-    fn write_indexed_chunked(
+    pub(crate) fn write_indexed_chunked(
         &mut self,
         batch: &SFrameRows,
         indices: &[usize],
@@ -162,7 +162,7 @@ impl SFrameBuilder {
     /// For anonymous builders (created via `anonymous()`), the returned
     /// SFrame holds an `AnonymousStore` keep-alive that cleans up the
     /// cache directory when the SFrame is dropped.
-    fn finish(mut self) -> Result<SFrame> {
+    pub(crate) fn finish(mut self) -> Result<SFrame> {
         let writer = self
             .writer
             .take()
@@ -248,7 +248,7 @@ pub struct SFrame {
 
 impl SFrame {
     /// Internal constructor with default empty metadata.
-    fn new_with_columns(columns: Vec<SArray>, column_names: Vec<String>) -> Self {
+    pub(crate) fn new_with_columns(columns: Vec<SArray>, column_names: Vec<String>) -> Self {
         SFrame {
             columns,
             column_names,
@@ -563,10 +563,23 @@ impl SFrame {
             })
             .collect::<Result<_>>()?;
 
+        // Estimate data size and decide between in-memory vs external sort
+        let estimated_size = self.estimate_size();
+        let budget = sframe_query::config::SFrameConfig::global().sort_memory_budget;
+
+        if estimated_size <= budget {
+            self.sort_in_memory(&sort_keys)
+        } else {
+            crate::external_sort::external_sort(self, &sort_keys)
+        }
+    }
+
+    /// Sort entirely in memory. Used when data fits within the sort memory budget.
+    pub(crate) fn sort_in_memory(&self, sort_keys: &[SortKey]) -> Result<SFrame> {
         let stream = self.compile_stream()?;
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-        let (batch, indices) = rt.block_on(sort::sort_indices(stream, &sort_keys))?;
+        let (batch, indices) = rt.block_on(sort::sort_indices(stream, sort_keys))?;
 
         if batch.num_rows() == 0 {
             return self.from_batch(batch);
@@ -576,6 +589,21 @@ impl SFrame {
             SFrameBuilder::anonymous(self.column_names.clone(), self.column_types())?;
         builder.write_indexed_chunked(&batch, &indices, DEFAULT_CHUNK_SIZE)?;
         builder.finish()
+    }
+
+    /// Estimate the in-memory size of this SFrame's data in bytes.
+    pub(crate) fn estimate_size(&self) -> usize {
+        let num_rows = self.num_rows().unwrap_or(0) as usize;
+        let per_row: usize = self
+            .column_types()
+            .iter()
+            .map(|dt| match dt {
+                FlexTypeEnum::Integer | FlexTypeEnum::Float => 9,
+                FlexTypeEnum::String => 32,
+                _ => 64,
+            })
+            .sum();
+        num_rows * per_row
     }
 
     /// Join with another SFrame on a single column.
@@ -1234,7 +1262,7 @@ impl SFrame {
     /// If all columns share a plan, projects to the needed columns and
     /// compiles once. Otherwise falls back to materializing all columns
     /// and wrapping the result.
-    fn compile_stream(&self) -> Result<sframe_query::execute::BatchStream> {
+    pub(crate) fn compile_stream(&self) -> Result<sframe_query::execute::BatchStream> {
         if self.columns.is_empty() {
             let plan = PlannerNode::materialized(SFrameRows::empty(&[]));
             return compile(&plan);

@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use futures::stream::{self, Stream, StreamExt};
 
-use rayon::prelude::*;
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
@@ -23,9 +22,6 @@ use crate::planner::{LogicalOp, PlannerNode};
 
 /// A stream of SFrameRows batches.
 pub type BatchStream = Pin<Box<dyn Stream<Item = Result<SFrameRows>> + Send>>;
-
-/// Target batch size for source operators.
-const SOURCE_BATCH_SIZE: usize = 4096;
 
 /// Compile a logical plan node into a BatchStream.
 ///
@@ -163,11 +159,23 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     }
 }
 
-/// Compile an SFrame source: reads segments in parallel and emits batches.
+/// State for lazy segment-by-segment source reading.
+struct LazySourceState {
+    vfs: Arc<dyn VirtualFileSystem>,
+    segment_paths: Vec<String>,
+    dtypes: Vec<FlexTypeEnum>,
+    batch_size: usize,
+    // Current position
+    segment_idx: usize,
+    // Column data for the current segment (column-major)
+    seg_data: Option<Vec<Vec<FlexType>>>,
+    row_offset: usize,
+}
+
+/// Compile an SFrame source: lazily reads one segment at a time.
 ///
-/// Uses rayon to read multiple segments concurrently when the SFrame has
-/// more than one segment. Each segment opens its own file handle, enabling
-/// true parallel I/O on SSDs.
+/// Memory usage is O(one segment) instead of O(all segments). Each segment
+/// is loaded on demand and dropped before the next segment is read.
 ///
 /// For `cache://` paths, reads go through the global CacheFs VFS so that
 /// in-memory cached segments are served without disk I/O.
@@ -184,10 +192,10 @@ fn compile_sframe_source(
     };
 
     let reader = SFrameReader::open_with_fs(&*vfs, path)?;
-    let num_segments = reader.num_segments();
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
+    let batch_size = crate::config::SFrameConfig::global().source_batch_size;
 
-    // Collect segment file paths for parallel reading
+    // Collect segment file paths
     let segment_paths: Vec<String> = reader
         .group_index
         .segment_files
@@ -195,46 +203,72 @@ fn compile_sframe_source(
         .map(|f| format!("{}/{}", path, f))
         .collect();
 
-    // Read segments in parallel using rayon.
-    // Each segment opens its own file handle for independent I/O.
-    let vfs_ref: &dyn VirtualFileSystem = &*vfs;
-    let all_segment_data: Vec<Result<Vec<Vec<FlexType>>>> = if num_segments <= 1 {
-        // Single segment: no parallelism overhead
-        segment_paths
-            .iter()
-            .map(|seg_path| read_segment_independently(vfs_ref, seg_path, &dtypes))
-            .collect()
-    } else {
-        // Multiple segments: parallel reads
-        segment_paths
-            .par_iter()
-            .map(|seg_path| read_segment_independently(vfs_ref, seg_path, &dtypes))
-            .collect()
+    let state = LazySourceState {
+        vfs,
+        segment_paths,
+        dtypes,
+        batch_size,
+        segment_idx: 0,
+        seg_data: None,
+        row_offset: 0,
     };
 
-    // Convert to batches
-    let mut batches: Vec<Result<SFrameRows>> = Vec::new();
-    for seg_result in all_segment_data {
-        let seg_data = seg_result?;
-        let seg_rows = if seg_data.is_empty() { 0 } else { seg_data[0].len() };
-
-        let mut offset = 0;
-        while offset < seg_rows {
-            let end = (offset + SOURCE_BATCH_SIZE).min(seg_rows);
-            let mut columns = Vec::with_capacity(dtypes.len());
-            for (col_idx, col_data) in seg_data.iter().enumerate() {
-                let mut col = ColumnData::empty(dtypes[col_idx]);
-                for val in &col_data[offset..end] {
-                    col.push(val)?;
+    Ok(Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            // If we have segment data, emit next batch from it
+            if let Some(ref data) = state.seg_data {
+                let seg_rows = if data.is_empty() { 0 } else { data[0].len() };
+                if state.row_offset < seg_rows {
+                    let end = (state.row_offset + state.batch_size).min(seg_rows);
+                    let batch = slice_columns_to_batch(
+                        data,
+                        &state.dtypes,
+                        state.row_offset,
+                        end,
+                    );
+                    state.row_offset = end;
+                    return Some((batch, state));
                 }
-                columns.push(col);
+                // Segment exhausted — drop its data
+                state.seg_data = None;
+                state.row_offset = 0;
             }
-            batches.push(SFrameRows::new(columns));
-            offset = end;
-        }
-    }
 
-    Ok(Box::pin(stream::iter(batches)))
+            // Load next segment
+            if state.segment_idx >= state.segment_paths.len() {
+                return None; // All segments done
+            }
+            let seg_path = state.segment_paths[state.segment_idx].clone();
+            state.segment_idx += 1;
+            match read_segment_independently(&*state.vfs, &seg_path, &state.dtypes) {
+                Ok(data) => {
+                    if data.is_empty() || data[0].is_empty() {
+                        continue;
+                    }
+                    state.seg_data = Some(data);
+                }
+                Err(e) => return Some((Err(e), state)),
+            }
+        }
+    })))
+}
+
+/// Slice column data into an SFrameRows batch for rows [start..end).
+fn slice_columns_to_batch(
+    data: &[Vec<FlexType>],
+    dtypes: &[FlexTypeEnum],
+    start: usize,
+    end: usize,
+) -> Result<SFrameRows> {
+    let mut columns = Vec::with_capacity(dtypes.len());
+    for (col_idx, col_data) in data.iter().enumerate() {
+        let mut col = ColumnData::empty(dtypes[col_idx]);
+        for val in &col_data[start..end] {
+            col.push(val)?;
+        }
+        columns.push(col);
+    }
+    SFrameRows::new(columns)
 }
 
 /// Read all columns from a segment file independently.
@@ -262,11 +296,12 @@ fn read_segment_independently(
 
 /// Compile a range source.
 fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchStream> {
+    let batch_size = crate::config::SFrameConfig::global().source_batch_size;
     let mut batches: Vec<Result<SFrameRows>> = Vec::new();
     let total = count as usize;
     let mut offset = 0;
     while offset < total {
-        let end = (offset + SOURCE_BATCH_SIZE).min(total);
+        let end = (offset + batch_size).min(total);
         let values: Vec<Option<i64>> = (offset..end)
             .map(|i| Some(start + (i as i64) * step))
             .collect();

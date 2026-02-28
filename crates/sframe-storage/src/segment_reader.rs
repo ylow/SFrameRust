@@ -57,6 +57,24 @@ impl SegmentReader {
         self.block_index[column].iter().map(|b| b.num_elem).sum()
     }
 
+    /// Number of blocks in a column.
+    pub fn num_blocks(&self, column: usize) -> usize {
+        self.block_index[column].len()
+    }
+
+    /// Number of rows in a specific block.
+    pub fn block_num_elem(&self, column: usize, block_idx: usize) -> u64 {
+        self.block_index[column][block_idx].num_elem
+    }
+
+    /// Read and decode a single block by column and block index.
+    pub fn read_block(&mut self, column: usize, block_idx: usize) -> Result<Vec<FlexType>> {
+        let block_info = self.block_index[column][block_idx].clone();
+        let raw = self.read_raw_block(&block_info)?;
+        let decompressed = Self::decompress_block(&raw, &block_info)?;
+        decode_typed_block(&decompressed, &block_info)
+    }
+
     /// Read and decode a single raw block.
     pub fn read_raw_block(&mut self, block_info: &BlockInfo) -> Result<Vec<u8>> {
         self.file.seek(SeekFrom::Start(block_info.offset))?;
@@ -88,25 +106,17 @@ impl SegmentReader {
             )));
         }
 
-        let num_blocks = self.block_index[column].len();
         let total_elems: u64 = self.column_len(column);
         let mut result = Vec::with_capacity(total_elems as usize);
 
-        for block_idx in 0..num_blocks {
-            // Clone BlockInfo to avoid borrow conflict
-            let block_info = self.block_index[column][block_idx].clone();
+        for block_idx in 0..self.num_blocks(column) {
+            let values = self.read_block(column, block_idx)?;
 
-            let raw = self.read_raw_block(&block_info)?;
-            let decompressed = Self::decompress_block(&raw, &block_info)?;
-            let values = decode_typed_block(&decompressed, &block_info)?;
-
-            if values.len() != block_info.num_elem as usize {
+            let expected = self.block_num_elem(column, block_idx) as usize;
+            if values.len() != expected {
                 return Err(SFrameError::Format(format!(
                     "Column {} block {}: decoded {} values, expected {}",
-                    column,
-                    block_idx,
-                    values.len(),
-                    block_info.num_elem
+                    column, block_idx, values.len(), expected
                 )));
             }
 

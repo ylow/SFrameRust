@@ -248,4 +248,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_read_block_matches_read_column() {
+        let mut sf = SFrameReader::open(&format!("{}/business.sf", samples_dir())).unwrap();
+
+        // Test on the first segment, first column (business_id, String)
+        let seg = &mut sf.segment_readers[0];
+        let col = 0;
+        let full_column = seg.read_column(col).unwrap();
+
+        // Now read block-by-block and concatenate
+        let num_blocks = seg.num_blocks(col);
+        assert!(num_blocks > 0);
+
+        let mut block_concat = Vec::new();
+        for b in 0..num_blocks {
+            let block_data = seg.read_block(col, b).unwrap();
+            assert_eq!(block_data.len(), seg.block_num_elem(col, b) as usize);
+            block_concat.extend(block_data);
+        }
+
+        assert_eq!(block_concat.len(), full_column.len());
+        for (i, (a, b)) in full_column.iter().zip(block_concat.iter()).enumerate() {
+            assert_eq!(a, b, "Mismatch at row {} for column {}", i, col);
+        }
+    }
 }

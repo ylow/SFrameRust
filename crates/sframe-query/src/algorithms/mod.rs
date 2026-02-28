@@ -5,4 +5,5 @@ pub mod csv_writer;
 pub mod groupby;
 pub mod join;
 pub mod json;
+pub mod quantile_sketch;
 pub mod sort;

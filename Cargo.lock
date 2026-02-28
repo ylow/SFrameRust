@@ -569,6 +569,7 @@ name = "sframe"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "sframe-config",
  "sframe-io",
  "sframe-query",
  "sframe-storage",
@@ -599,6 +600,7 @@ dependencies = [
  "pin-project-lite",
  "rayon",
  "serde_json",
+ "sframe-config",
  "sframe-io",
  "sframe-storage",
  "sframe-types",
