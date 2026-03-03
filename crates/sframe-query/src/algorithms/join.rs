@@ -381,4 +381,76 @@ mod tests {
         // (right.dept and right.region excluded as join keys)
         assert_eq!(result.num_columns(), 4);
     }
+
+    #[tokio::test]
+    async fn test_join_returns_stream() {
+        // Test that join returns a BatchStream, not SFrameRows
+        let left_rows = vec![
+            vec![FlexType::Integer(1), FlexType::String("alice".into())],
+            vec![FlexType::Integer(2), FlexType::String("bob".into())],
+        ];
+        let left = SFrameRows::from_rows(
+            &left_rows,
+            &[FlexTypeEnum::Integer, FlexTypeEnum::String],
+        ).unwrap();
+
+        let right_rows = vec![
+            vec![FlexType::Integer(1), FlexType::Float(90.0)],
+        ];
+        let right = SFrameRows::from_rows(
+            &right_rows,
+            &[FlexTypeEnum::Integer, FlexTypeEnum::Float],
+        ).unwrap();
+
+        let mut result_stream = join(
+            make_stream(left),
+            make_stream(right),
+            &JoinOn::new(0, 0),
+            JoinType::Inner,
+        ).await.unwrap();
+
+        // Consume the stream and collect all rows
+        let mut total_rows = 0;
+        while let Some(batch_result) = result_stream.next().await {
+            let batch = batch_result.unwrap();
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn test_join_large_dataset_partitioned() {
+        // Test with enough data to trigger GRACE partitioning
+        // (when join_buffer_num_cells is set low)
+        let n = 1000;
+        let left_rows: Vec<Vec<FlexType>> = (0..n)
+            .map(|i| vec![FlexType::Integer(i), FlexType::String(format!("left_{}", i).into())])
+            .collect();
+        let left = SFrameRows::from_rows(
+            &left_rows,
+            &[FlexTypeEnum::Integer, FlexTypeEnum::String],
+        ).unwrap();
+
+        let right_rows: Vec<Vec<FlexType>> = (0..n)
+            .map(|i| vec![FlexType::Integer(i), FlexType::Float(i as f64 * 10.0)])
+            .collect();
+        let right = SFrameRows::from_rows(
+            &right_rows,
+            &[FlexTypeEnum::Integer, FlexTypeEnum::Float],
+        ).unwrap();
+
+        let mut result_stream = join(
+            make_stream(left),
+            make_stream(right),
+            &JoinOn::new(0, 0),
+            JoinType::Inner,
+        ).await.unwrap();
+
+        let mut total_rows = 0;
+        while let Some(batch_result) = result_stream.next().await {
+            let batch = batch_result.unwrap();
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, n as usize);
+    }
 }
