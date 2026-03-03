@@ -27,6 +27,45 @@ pub enum ColumnData {
     DateTime(Vec<Option<FlexDateTime>>),
 }
 
+/// Dispatch on ColumnData variant, binding the inner Vec to `$vec`.
+/// Use for operations where the logic is the same across all variants.
+macro_rules! with_column_data {
+    ($col:expr, $vec:ident => $body:expr) => {
+        match $col {
+            ColumnData::Integer($vec) => $body,
+            ColumnData::Float($vec) => $body,
+            ColumnData::String($vec) => $body,
+            ColumnData::Vector($vec) => $body,
+            ColumnData::List($vec) => $body,
+            ColumnData::Dict($vec) => $body,
+            ColumnData::DateTime($vec) => $body,
+        }
+    };
+}
+
+/// Dispatch on two ColumnData values of the same variant.
+/// Returns Err on type mismatch.
+macro_rules! with_column_data_pair {
+    ($a:expr, $b:expr, $va:ident, $vb:ident => $body:expr) => {
+        match ($a, $b) {
+            (ColumnData::Integer($va), ColumnData::Integer($vb)) => $body,
+            (ColumnData::Float($va), ColumnData::Float($vb)) => $body,
+            (ColumnData::String($va), ColumnData::String($vb)) => $body,
+            (ColumnData::Vector($va), ColumnData::Vector($vb)) => $body,
+            (ColumnData::List($va), ColumnData::List($vb)) => $body,
+            (ColumnData::Dict($va), ColumnData::Dict($vb)) => $body,
+            (ColumnData::DateTime($va), ColumnData::DateTime($vb)) => $body,
+            (a, b) => {
+                return Err(SFrameError::Type(format!(
+                    "Column type mismatch: {:?} vs {:?}",
+                    a.dtype(),
+                    b.dtype()
+                )));
+            }
+        }
+    };
+}
+
 impl ColumnData {
     /// Create an empty column of the given type.
     pub fn empty(dtype: FlexTypeEnum) -> Self {
@@ -44,15 +83,7 @@ impl ColumnData {
 
     /// Number of elements in this column.
     pub fn len(&self) -> usize {
-        match self {
-            ColumnData::Integer(v) => v.len(),
-            ColumnData::Float(v) => v.len(),
-            ColumnData::String(v) => v.len(),
-            ColumnData::Vector(v) => v.len(),
-            ColumnData::List(v) => v.len(),
-            ColumnData::Dict(v) => v.len(),
-            ColumnData::DateTime(v) => v.len(),
-        }
+        with_column_data!(self, v => v.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,22 +167,7 @@ impl ColumnData {
 
     /// Extend this column with values from another column of the same type.
     pub fn extend(&mut self, other: &ColumnData) -> Result<()> {
-        match (self, other) {
-            (ColumnData::Integer(a), ColumnData::Integer(b)) => a.extend_from_slice(b),
-            (ColumnData::Float(a), ColumnData::Float(b)) => a.extend_from_slice(b),
-            (ColumnData::String(a), ColumnData::String(b)) => a.extend_from_slice(b),
-            (ColumnData::Vector(a), ColumnData::Vector(b)) => a.extend_from_slice(b),
-            (ColumnData::List(a), ColumnData::List(b)) => a.extend_from_slice(b),
-            (ColumnData::Dict(a), ColumnData::Dict(b)) => a.extend_from_slice(b),
-            (ColumnData::DateTime(a), ColumnData::DateTime(b)) => a.extend_from_slice(b),
-            (a, b) => {
-                return Err(SFrameError::Type(format!(
-                    "Cannot extend {:?} column with {:?} column",
-                    a.dtype(),
-                    b.dtype()
-                )));
-            }
-        }
+        with_column_data_pair!(self, other, a, b => a.extend_from_slice(b));
         Ok(())
     }
 }
