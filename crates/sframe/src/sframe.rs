@@ -2100,4 +2100,39 @@ mod tests {
         sf.remove_metadata("key");
         assert_eq!(sf.get_metadata("key"), None);
     }
+
+    #[test]
+    fn test_join_correctness_all_types() {
+        let n = 500i64;
+        let left = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                (0..n).map(|i| FlexType::Integer(i)).collect(),
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                (0..n).map(|i| FlexType::String(format!("left_{}", i).into())).collect(),
+                FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+
+        let right = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                (0..n).step_by(2).map(|i| FlexType::Integer(i)).collect(),
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("score", SArray::from_vec(
+                (0..n).step_by(2).map(|i| FlexType::Float(i as f64 * 1.5)).collect(),
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        // Inner join: should have n/2 rows (only even ids match)
+        let inner = left.join(&right, "id", "id", JoinType::Inner).unwrap();
+        assert_eq!(inner.num_rows().unwrap(), (n / 2) as u64);
+        assert_eq!(inner.num_columns(), 3); // id, name, score
+
+        // Left join: all left rows present
+        let left_join = left.join(&right, "id", "id", JoinType::Left).unwrap();
+        assert_eq!(left_join.num_rows().unwrap(), n as u64);
+    }
 }
