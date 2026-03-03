@@ -4,7 +4,9 @@
 //! Materializes both sides, builds a hash table on the right, probes with the left.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
+use futures::stream;
 use futures::StreamExt;
 
 use sframe_types::error::Result;
@@ -62,14 +64,24 @@ pub async fn join(
     on: &JoinOn,
     join_type: JoinType,
 ) -> Result<BatchStream> {
-    // Materialize both sides
+    // Materialize both sides to estimate sizes
     let left = materialize_stream(&mut left_stream).await?;
     let right = materialize_stream(&mut right_stream).await?;
 
-    // For now, always use in-memory path
-    // TODO: Add GRACE partitioning for large inputs in Task 10
-    let result = in_memory_join(left, right, on, join_type)?;
-    Ok(Box::pin(futures::stream::once(async { Ok(result) })))
+    let left_cells = left.num_rows() * left.num_columns().max(1);
+    let right_cells = right.num_rows() * right.num_columns().max(1);
+    let budget = sframe_config::global().join_buffer_num_cells;
+
+    let smaller_cells = left_cells.min(right_cells);
+
+    if smaller_cells <= budget {
+        // In-memory fast path
+        let result = in_memory_join(left, right, on, join_type)?;
+        Ok(Box::pin(stream::once(async { Ok(result) })))
+    } else {
+        // GRACE hash join
+        grace_hash_join(left, right, on, join_type, budget)
+    }
 }
 
 /// In-memory hash join on already-materialized inputs.
@@ -229,6 +241,130 @@ fn emit_right_only(
     }
 
     Ok(())
+}
+
+/// GRACE hash join: partition both sides by hash(key), then join each partition.
+fn grace_hash_join(
+    left: SFrameRows,
+    right: SFrameRows,
+    on: &JoinOn,
+    join_type: JoinType,
+    budget: usize,
+) -> Result<BatchStream> {
+    let left_key_cols = on.left_columns();
+    let right_key_cols = on.right_columns();
+
+    // Determine number of partitions
+    let smaller_cells =
+        left.num_rows().min(right.num_rows()) * left.num_columns().max(right.num_columns()).max(1);
+    let num_partitions = (smaller_cells / budget.max(1)).max(2);
+
+    // Partition both sides
+    let left_partitions = partition_rows(&left, &left_key_cols, num_partitions)?;
+    let right_partitions = partition_rows(&right, &right_key_cols, num_partitions)?;
+
+    // Drop the full materialized inputs
+    drop(left);
+    drop(right);
+
+    // Stream partitions: for each partition, do in-memory join and yield batches
+    let on_owned = on.clone();
+    Ok(Box::pin(stream::unfold(
+        (left_partitions, right_partitions, on_owned, join_type, 0usize),
+        |(left_parts, right_parts, on, jt, idx)| async move {
+            loop {
+                if idx >= left_parts.len() {
+                    return None;
+                }
+                let left_part = left_parts[idx].clone();
+                let right_part = right_parts[idx].clone();
+                let next_idx = idx + 1;
+
+                let result = match (left_part, right_part) {
+                    (Some(lp), Some(rp)) => in_memory_join(lp, rp, &on, jt),
+                    (Some(lp), None) => {
+                        // Left rows with no match on right
+                        match jt {
+                            JoinType::Left | JoinType::Full => {
+                                // Emit left rows with NULL-padded right columns
+                                // We need to know right non-key columns — use empty right
+                                in_memory_join(lp, SFrameRows::empty(&[]), &on, jt)
+                            }
+                            _ => {
+                                // Inner/Right: skip partitions with no right data
+                                return Some((
+                                    Ok(SFrameRows::empty(&[])),
+                                    (left_parts, right_parts, on, jt, next_idx),
+                                ));
+                            }
+                        }
+                    }
+                    (None, Some(rp)) => {
+                        // Right rows with no match on left
+                        match jt {
+                            JoinType::Right | JoinType::Full => {
+                                in_memory_join(SFrameRows::empty(&[]), rp, &on, jt)
+                            }
+                            _ => {
+                                return Some((
+                                    Ok(SFrameRows::empty(&[])),
+                                    (left_parts, right_parts, on, jt, next_idx),
+                                ));
+                            }
+                        }
+                    }
+                    (None, None) => {
+                        return Some((
+                            Ok(SFrameRows::empty(&[])),
+                            (left_parts, right_parts, on, jt, next_idx),
+                        ));
+                    }
+                };
+
+                match &result {
+                    Ok(batch) if batch.num_rows() == 0 => {
+                        // Skip empty results, advance to next partition
+                        return Some((
+                            result,
+                            (left_parts, right_parts, on, jt, next_idx),
+                        ));
+                    }
+                    _ => {
+                        return Some((result, (left_parts, right_parts, on, jt, next_idx)));
+                    }
+                }
+            }
+        },
+    )))
+}
+
+/// Partition rows by hash(key) into N buckets.
+/// Returns Vec<Option<SFrameRows>> — None for empty partitions.
+fn partition_rows(
+    batch: &SFrameRows,
+    key_cols: &[usize],
+    num_partitions: usize,
+) -> Result<Vec<Option<SFrameRows>>> {
+    let mut partition_indices: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+
+    for row_idx in 0..batch.num_rows() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for &col in key_cols {
+            batch.column(col).get(row_idx).hash(&mut hasher);
+        }
+        let partition = (hasher.finish() as usize) % num_partitions;
+        partition_indices[partition].push(row_idx);
+    }
+
+    let mut partitions = Vec::with_capacity(num_partitions);
+    for indices in partition_indices {
+        if indices.is_empty() {
+            partitions.push(None);
+        } else {
+            partitions.push(Some(batch.take(&indices)?));
+        }
+    }
+    Ok(partitions)
 }
 
 #[cfg(test)]
