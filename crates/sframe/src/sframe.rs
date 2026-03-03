@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use sframe_io::cache_fs::{global_cache_fs, CacheFs};
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::algorithms::aggregators::AggSpec;
@@ -642,15 +643,9 @@ impl SFrame {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
 
-        let joined = rt.block_on(join::join(
-            left_stream,
-            right_stream,
-            &JoinOn::multi(pairs),
-            how,
-        ))?;
-
         // Build output column names: all left cols + right cols (minus join keys)
         let mut names: Vec<String> = self.column_names.clone();
+        let mut output_dtypes: Vec<FlexTypeEnum> = self.column_types();
         for (i, name) in other.column_names.iter().enumerate() {
             if !right_key_indices.contains(&i) {
                 let out_name = if names.contains(name) {
@@ -659,10 +654,28 @@ impl SFrame {
                     name.clone()
                 };
                 names.push(out_name);
+                output_dtypes.push(other.columns[i].dtype());
             }
         }
 
-        write_to_cache(joined, names)
+        let mut join_stream = rt.block_on(join::join(
+            left_stream,
+            right_stream,
+            &JoinOn::multi(pairs),
+            how,
+        ))?;
+
+        // Consume the stream into a builder
+        let mut builder = SFrameBuilder::anonymous(names.clone(), output_dtypes)?;
+        rt.block_on(async {
+            while let Some(batch_result) = join_stream.next().await {
+                let batch = batch_result?;
+                builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
+            }
+            Ok::<(), SFrameError>(())
+        })?;
+
+        builder.finish()
     }
 
     /// Group by columns and aggregate.

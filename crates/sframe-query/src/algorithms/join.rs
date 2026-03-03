@@ -52,17 +52,33 @@ impl JoinOn {
 
 /// Perform a hash join of two streams.
 ///
-/// Output schema: all left columns followed by all right columns (except join key column).
+/// Returns a stream of result batches. For small inputs, uses an in-memory
+/// hash join. For large inputs, will use GRACE hash partitioned join.
+///
+/// Output schema: all left columns followed by all right columns (except join key columns).
 pub async fn join(
     mut left_stream: BatchStream,
     mut right_stream: BatchStream,
     on: &JoinOn,
     join_type: JoinType,
-) -> Result<SFrameRows> {
+) -> Result<BatchStream> {
     // Materialize both sides
     let left = materialize_stream(&mut left_stream).await?;
     let right = materialize_stream(&mut right_stream).await?;
 
+    // For now, always use in-memory path
+    // TODO: Add GRACE partitioning for large inputs in Task 10
+    let result = in_memory_join(left, right, on, join_type)?;
+    Ok(Box::pin(futures::stream::once(async { Ok(result) })))
+}
+
+/// In-memory hash join on already-materialized inputs.
+fn in_memory_join(
+    left: SFrameRows,
+    right: SFrameRows,
+    on: &JoinOn,
+    join_type: JoinType,
+) -> Result<SFrameRows> {
     let left_rows = left.num_rows();
     let right_rows = right.num_rows();
 
@@ -224,6 +240,19 @@ mod tests {
         Box::pin(stream::once(async { Ok(batch) }))
     }
 
+    /// Consume a join result stream into a single batch for testing.
+    async fn collect_stream(mut stream: BatchStream) -> SFrameRows {
+        let mut result: Option<SFrameRows> = None;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.unwrap();
+            match &mut result {
+                None => result = Some(batch),
+                Some(existing) => existing.append(&batch).unwrap(),
+            }
+        }
+        result.unwrap_or_else(|| SFrameRows::empty(&[]))
+    }
+
     #[tokio::test]
     async fn test_inner_join() {
         // Left: id, name
@@ -250,7 +279,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = join(
+        let result_stream = join(
             make_stream(left),
             make_stream(right),
             &JoinOn::new(0, 0),
@@ -258,6 +287,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let result = collect_stream(result_stream).await;
 
         // Should have 2 matched rows (ids 1 and 3)
         assert_eq!(result.num_rows(), 2);
@@ -286,7 +316,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = join(
+        let result_stream = join(
             make_stream(left),
             make_stream(right),
             &JoinOn::new(0, 0),
@@ -294,6 +324,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let result = collect_stream(result_stream).await;
 
         // Both left rows should appear
         assert_eq!(result.num_rows(), 2);
@@ -330,7 +361,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = join(
+        let result_stream = join(
             make_stream(left),
             make_stream(right),
             &JoinOn::new(0, 0),
@@ -338,6 +369,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let result = collect_stream(result_stream).await;
 
         // Both rows should appear (no match between them)
         assert_eq!(result.num_rows(), 2);
@@ -368,12 +400,13 @@ mod tests {
         ).unwrap();
 
         // Join on (dept, region)
-        let result = join(
+        let result_stream = join(
             make_stream(left),
             make_stream(right),
             &JoinOn::multi(vec![(0, 0), (1, 1)]),
             JoinType::Inner,
         ).await.unwrap();
+        let result = collect_stream(result_stream).await;
 
         // eng+us → alice, eng+eu → bob. sales+us has no match.
         assert_eq!(result.num_rows(), 2);
