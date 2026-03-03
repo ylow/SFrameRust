@@ -320,7 +320,7 @@ fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchStream> {
 /// Threshold for intra-batch rayon parallelism.
 const PARALLEL_BATCH_THRESHOLD: usize = 1000;
 
-/// Apply a unary transform: append a new column from transforming an input column.
+/// Apply a unary transform: produce a single output column from an input column.
 fn apply_transform(
     batch: &SFrameRows,
     input_column: usize,
@@ -351,12 +351,10 @@ fn apply_transform(
         new_col.push(val)?;
     }
 
-    let mut columns: Vec<ColumnData> = batch.columns().to_vec();
-    columns.push(new_col);
-    SFrameRows::new(columns)
+    SFrameRows::new(vec![new_col])
 }
 
-/// Apply a binary transform: append a new column from two input columns.
+/// Apply a binary transform: produce a single output column from two input columns.
 fn apply_binary_transform(
     batch: &SFrameRows,
     left_col: usize,
@@ -390,9 +388,7 @@ fn apply_binary_transform(
         new_col.push(val)?;
     }
 
-    let mut columns: Vec<ColumnData> = batch.columns().to_vec();
-    columns.push(new_col);
-    SFrameRows::new(columns)
+    SFrameRows::new(vec![new_col])
 }
 
 /// Apply a generalized transform: replace all columns with transform output.
@@ -635,10 +631,10 @@ mod tests {
         let stream = compile(&transformed).unwrap();
         let result = materialize(stream).await.unwrap();
 
-        // Original column + new column
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.row(0), vec![FlexType::Integer(10), FlexType::Float(15.0)]);
-        assert_eq!(result.row(1), vec![FlexType::Integer(20), FlexType::Float(30.0)]);
+        // Transform outputs a single column
+        assert_eq!(result.num_columns(), 1);
+        assert_eq!(result.row(0), vec![FlexType::Float(15.0)]);
+        assert_eq!(result.row(1), vec![FlexType::Float(30.0)]);
     }
 
     #[tokio::test]
@@ -798,13 +794,12 @@ mod tests {
             }),
             FlexTypeEnum::Integer,
         );
-        // Project just the new column (column 1)
-        let projected = PlannerNode::project(transformed, vec![1]);
-
-        let stream = compile(&projected).unwrap();
+        // Transform outputs a single column — no Project needed
+        let stream = compile(&transformed).unwrap();
         let result = materialize(stream).await.unwrap();
 
         assert_eq!(result.num_rows(), 4); // 6,7,8,9
+        assert_eq!(result.num_columns(), 1);
         assert_eq!(result.row(0), vec![FlexType::Integer(12)]); // 6*2
         assert_eq!(result.row(1), vec![FlexType::Integer(14)]); // 7*2
         assert_eq!(result.row(2), vec![FlexType::Integer(16)]); // 8*2

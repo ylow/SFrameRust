@@ -126,27 +126,8 @@ pub fn pushdown_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
                 }
             }
 
-            // Project over Transform: push project below transform
-            // (only if the transform's input column is in the projected set)
-            if let LogicalOp::Transform { input_column, func, output_type } = &plan.inputs[0].op {
-                if plan.inputs[0].inputs.len() == 1 {
-                    // The transform appends a column. The output has input_ncols + 1 columns.
-                    // If the projected columns include the transformed output (last column),
-                    // we need to keep the input_column.
-                    let input = &plan.inputs[0].inputs[0];
-                    let input_ncols = count_output_columns(input);
-
-                    if let Some(n) = input_ncols {
-                        let transform_output_idx = n; // appended column
-                        let needs_transform = column_indices.contains(&transform_output_idx);
-
-                        if !needs_transform {
-                            // We don't need the transform output at all — push project below
-                            return PlannerNode::project(input.clone(), column_indices.clone());
-                        }
-                    }
-                }
-            }
+            // Transform outputs a single column, so Project([0]) over Transform
+            // is an identity — handled by eliminate_identity_projects.
         }
     }
 
@@ -224,56 +205,22 @@ fn is_empty_source(plan: &PlannerNode) -> bool {
     }
 }
 
-/// Push Filter below Transform when the filter does not reference the
-/// transform's output column.
+/// Push Filter below Transform when the filter references a column from
+/// the transform's input rather than the transform's output.
 ///
-/// `Filter(col=c) -> Transform(output_at=N) -> input` becomes
-/// `Transform -> Filter(col=c) -> input` when `c != N`.
+/// Since Transform now produces a single column (index 0), this only
+/// applies when Filter is on a column that exists in the input plan but
+/// not in the Transform output. In practice, Filter → Transform where
+/// the filter is on column 0 (the transform output) cannot be pushed.
+/// This pass is kept for GeneralizedTransform which may output multiple
+/// columns.
 pub fn push_filter_through_transform(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     let new_inputs: Vec<Arc<PlannerNode>> = plan
         .inputs
         .iter()
         .map(|i| push_filter_through_transform(i))
         .collect();
-    let plan = rebuild_with_inputs(plan, new_inputs);
-
-    if let LogicalOp::Filter {
-        column: filter_col,
-        predicate,
-    } = &plan.op
-    {
-        if plan.inputs.len() == 1 {
-            if let LogicalOp::Transform {
-                input_column,
-                func,
-                output_type,
-            } = &plan.inputs[0].op
-            {
-                if plan.inputs[0].inputs.len() == 1 {
-                    let transform_input = &plan.inputs[0].inputs[0];
-                    if let Some(n) = count_output_columns(transform_input) {
-                        // Transform appends at index n
-                        if *filter_col != n {
-                            // Safe to push filter below transform
-                            let new_filter = PlannerNode::filter(
-                                transform_input.clone(),
-                                *filter_col,
-                                predicate.clone(),
-                            );
-                            return PlannerNode::transform(
-                                new_filter,
-                                *input_column,
-                                func.clone(),
-                                *output_type,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    plan
+    rebuild_with_inputs(plan, new_inputs)
 }
 
 /// Count the number of output columns for a plan node (if known statically).
@@ -283,13 +230,8 @@ fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
         LogicalOp::MaterializedSource { data } => Some(data.num_columns()),
         LogicalOp::Project { column_indices } => Some(column_indices.len()),
         LogicalOp::Range { .. } => Some(1),
-        LogicalOp::Transform { .. } => {
-            // Transform appends one column
-            plan.inputs.first().and_then(|i| count_output_columns(i)).map(|n| n + 1)
-        }
-        LogicalOp::BinaryTransform { .. } => {
-            plan.inputs.first().and_then(|i| count_output_columns(i)).map(|n| n + 1)
-        }
+        LogicalOp::Transform { .. } => Some(1),
+        LogicalOp::BinaryTransform { .. } => Some(1),
         LogicalOp::GeneralizedTransform { output_types, .. } => {
             // GeneralizedTransform replaces all input columns with output_types
             Some(output_types.len())
@@ -531,11 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn test_push_filter_through_transform() {
+    fn test_filter_over_transform_unchanged() {
         use sframe_types::flex_type::FlexType;
-        // Source(1 col) → Transform(input=0, output at col 1) → Filter(col=0)
-        // Filter on col 0 (original column), not on transform output (col 1).
-        // Should push filter below transform.
+        // Transform outputs a single column. Filter over Transform
+        // is left unchanged (filter is always on the transform output).
         let source = PlannerNode::sframe_source(
             "test.sf",
             vec!["a".into()],
@@ -554,35 +495,6 @@ mod tests {
             Arc::new(|v: &FlexType| matches!(v, FlexType::Integer(i) if *i > 0)),
         );
         let optimized = push_filter_through_transform(&filtered);
-        // After pushdown: Transform → Filter → Source
-        assert!(matches!(optimized.op, LogicalOp::Transform { .. }));
-        assert!(matches!(optimized.inputs[0].op, LogicalOp::Filter { .. }));
-    }
-
-    #[test]
-    fn test_no_push_filter_on_transform_output() {
-        use sframe_types::flex_type::FlexType;
-        // Source(1 col) → Transform(output at col 1) → Filter(col=1)
-        // Filter is on the transform's output column — should NOT push.
-        let source = PlannerNode::sframe_source(
-            "test.sf",
-            vec!["a".into()],
-            vec![FlexTypeEnum::Integer],
-            10,
-        );
-        let transformed = PlannerNode::transform(
-            source,
-            0,
-            Arc::new(|v: &FlexType| v.clone()),
-            FlexTypeEnum::Integer,
-        );
-        let filtered = PlannerNode::filter(
-            transformed,
-            1, // transform output column
-            Arc::new(|v: &FlexType| matches!(v, FlexType::Integer(i) if *i > 0)),
-        );
-        let optimized = push_filter_through_transform(&filtered);
-        // Should remain: Filter → Transform → Source
         assert!(matches!(optimized.op, LogicalOp::Filter { .. }));
         assert!(matches!(optimized.inputs[0].op, LogicalOp::Transform { .. }));
     }

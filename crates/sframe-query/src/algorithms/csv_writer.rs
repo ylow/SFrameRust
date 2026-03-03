@@ -1,6 +1,8 @@
 //! CSV writer for SFrameRows data.
 
-use sframe_types::error::Result;
+use std::io::Write;
+
+use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexType;
 
 use crate::batch::SFrameRows;
@@ -91,6 +93,55 @@ pub fn write_csv_file(
     let content = write_csv_string(batch, column_names, options)?;
     std::fs::write(path, content)
         .map_err(sframe_types::error::SFrameError::Io)
+}
+
+/// Write just the CSV header line to a writer.
+pub fn write_csv_header<W: Write>(
+    writer: &mut W,
+    column_names: &[String],
+    options: &CsvWriterOptions,
+) -> Result<()> {
+    for (i, name) in column_names.iter().enumerate() {
+        if i > 0 {
+            writer
+                .write_all(options.delimiter.as_bytes())
+                .map_err(SFrameError::Io)?;
+        }
+        writer
+            .write_all(quote_field(name, options).as_bytes())
+            .map_err(SFrameError::Io)?;
+    }
+    writer
+        .write_all(options.line_terminator.as_bytes())
+        .map_err(SFrameError::Io)?;
+    Ok(())
+}
+
+/// Write the rows of an SFrameRows batch to a writer (no header).
+pub fn write_csv_batch<W: Write>(
+    writer: &mut W,
+    batch: &SFrameRows,
+    options: &CsvWriterOptions,
+) -> Result<()> {
+    let ncols = batch.num_columns();
+    for row in 0..batch.num_rows() {
+        for col in 0..ncols {
+            if col > 0 {
+                writer
+                    .write_all(options.delimiter.as_bytes())
+                    .map_err(SFrameError::Io)?;
+            }
+            let val = batch.column(col).get(row);
+            let field = format_value(&val, &options.na_rep);
+            writer
+                .write_all(quote_field(&field, options).as_bytes())
+                .map_err(SFrameError::Io)?;
+        }
+        writer
+            .write_all(options.line_terminator.as_bytes())
+            .map_err(SFrameError::Io)?;
+    }
+    Ok(())
 }
 
 fn format_value(val: &FlexType, na_rep: &str) -> String {

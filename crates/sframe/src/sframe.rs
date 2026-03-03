@@ -1230,10 +1230,23 @@ impl SFrame {
     }
 
     /// Write to CSV file.
+    ///
+    /// Streams batches to disk — does not materialize the full frame in memory.
     pub fn to_csv(&self, path: &str, options: Option<CsvWriterOptions>) -> Result<()> {
         let opts = options.unwrap_or_default();
-        let batch = self.materialize_batch()?;
-        csv_writer::write_csv_file(path, &batch, &self.column_names, &opts)
+        let file = std::fs::File::create(path).map_err(SFrameError::Io)?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        if opts.header {
+            csv_writer::write_csv_header(&mut writer, &self.column_names, &opts)?;
+        }
+
+        let stream = self.compile_stream()?;
+        for_each_batch_sync(stream, |batch| {
+            csv_writer::write_csv_batch(&mut writer, &batch, &opts)
+        })?;
+
+        std::io::Write::flush(&mut writer).map_err(SFrameError::Io)
     }
 
     /// Write to JSON Lines file.

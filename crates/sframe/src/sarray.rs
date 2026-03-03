@@ -114,10 +114,9 @@ impl SArray {
             func,
             output_type,
         );
-        // The new column is appended at the end
-        let new_col_index = self.column_index + 1; // simplified — transform appends
+        // Transform outputs a single column at index 0.
         SArray {
-            plan: PlannerNode::project(plan, vec![new_col_index]),
+            plan,
             dtype: output_type,
             len: self.len,
             column_index: 0,
@@ -699,6 +698,38 @@ impl SArray {
     /// Count Undefined/missing values (alias for countna).
     pub fn num_missing(&self) -> Result<u64> {
         self.countna()
+    }
+
+    // === Phase 10.4: Approximate Analytics ===
+
+    /// Approximate number of distinct values using HyperLogLog.
+    ///
+    /// Uses precision=12 (4 KB memory, ~1.6% relative error).
+    /// Much faster than `unique().len()` for large arrays.
+    pub fn approx_count_distinct(&self) -> Result<u64> {
+        use sframe_query::algorithms::hyperloglog::HyperLogLog;
+        let values = self.to_vec()?;
+        let mut hll = HyperLogLog::new(12);
+        for v in &values {
+            hll.insert(v);
+        }
+        Ok(hll.estimate())
+    }
+
+    /// Find the most frequent items using the Space-Saving algorithm.
+    ///
+    /// Returns up to `k` items sorted by estimated frequency (descending).
+    /// Each entry is `(value, estimated_count)`. Uses O(k) memory.
+    ///
+    /// Any item with true frequency > N/k is guaranteed to appear in the result.
+    pub fn frequent_items(&self, k: usize) -> Result<Vec<(FlexType, u64)>> {
+        use sframe_query::algorithms::space_saving::SpaceSaving;
+        let values = self.to_vec()?;
+        let mut ss = SpaceSaving::new(k.max(1) * 4);
+        for v in &values {
+            ss.insert(v);
+        }
+        Ok(ss.top_k(k))
     }
 
     // === Phase 10.5: String Operations ===
@@ -1914,5 +1945,44 @@ mod tests {
         let doubled = a.add(&a).unwrap();
         let v = doubled.to_vec().unwrap();
         assert_eq!(v, vec![FlexType::Integer(6), FlexType::Integer(10)]);
+    }
+
+    #[test]
+    fn test_approx_count_distinct() {
+        let values: Vec<FlexType> = (0..1000)
+            .map(|i| FlexType::Integer(i % 100)) // 100 distinct values
+            .collect();
+        let sa = SArray::from_vec(values, FlexTypeEnum::Integer).unwrap();
+        let est = sa.approx_count_distinct().unwrap();
+        // HLL with p=12 should be within ~5% for 100 distinct values
+        assert!(
+            est >= 85 && est <= 115,
+            "Expected ~100 distinct, got {}",
+            est
+        );
+    }
+
+    #[test]
+    fn test_frequent_items() {
+        let mut values = Vec::new();
+        // "hot" appears 100 times, "warm" 30 times, 50 others appear once
+        for _ in 0..100 {
+            values.push(FlexType::String("hot".into()));
+        }
+        for _ in 0..30 {
+            values.push(FlexType::String("warm".into()));
+        }
+        for i in 0..50 {
+            values.push(FlexType::String(format!("rare_{}", i).into()));
+        }
+        let sa = SArray::from_vec(values, FlexTypeEnum::String).unwrap();
+        let top = sa.frequent_items(3).unwrap();
+        assert!(!top.is_empty());
+        // "hot" should be the most frequent
+        assert_eq!(top[0].0, FlexType::String("hot".into()));
+        assert_eq!(top[0].1, 100);
+        // "warm" should be second
+        assert_eq!(top[1].0, FlexType::String("warm".into()));
+        assert_eq!(top[1].1, 30);
     }
 }

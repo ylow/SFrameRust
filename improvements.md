@@ -96,8 +96,9 @@ newer integer-encoded-float approach. The Rust float codec uses direct
 
 #### 8. S3 and HDFS Backends
 
-Only config stubs exist. The C++ has full S3 (via libcurl) and HDFS (via
-libhdfs) implementations including streaming read/write.
+S3 backend implemented behind `s3` feature flag using `aws-sdk-s3` (requires
+Rust 1.91+). Full-fetch read, buffered write, list/exists/remove.
+HDFS remains a config stub.
 
 #### 9. ODBC / Database Connector
 
@@ -108,32 +109,26 @@ SFrame -> SQL table). Nothing exists in Rust.
 
 The C++ has an Apache Avro reader. Nothing in Rust.
 
-#### 11. CSV Parser -- Streaming/Parallel
+#### 11. CSV Parser -- Streaming/Parallel (DONE)
 
-Documented in `csv_improvements.md` but not implemented:
+Two-pass streaming CSV with parallel parse via rayon. O(50MB) memory.
+Remaining: no `continue_on_failure` error recovery; tokenizer operates
+on `&str` not `&[u8]` (P3 optimization).
 
-- `from_csv` currently uses `read_to_string` (peak memory ~2x file size)
-- No parallel chunk parsing
-- No `continue_on_failure` error recovery
-- Tokenizer operates on `&str` not `&[u8]`
+#### 12. Streaming CSV Writer (DONE)
 
-#### 12. Streaming CSV Writer
-
-`to_csv` materializes the entire frame before writing.
+`to_csv` now streams batches to disk via `for_each_batch_sync`.
 
 ### Tier 3 -- Correctness and Quality Gaps
 
-#### 13. `SFrame::unique()` Hashing
+#### 13. `SFrame::unique()` Hashing (DONE)
 
-Still uses `format!("{:?}", row_values)` as a hash key rather than proper
-`Hash+Eq` on `Vec<FlexType>`. (`SArray::unique()` was fixed;
-`SFrame::unique()` was not.)
+Fixed: uses `HashSet<Vec<FlexType>>` with proper `Hash+Eq`.
 
-#### 14. SArray Binary Ops Materialization
+#### 14. SArray Binary Ops Materialization (DONE)
 
-`SArray::binary_op()` materializes the RHS entirely before element-wise
-application, breaking the streaming/out-of-core model for large array-array
-arithmetic.
+Fixed: same-plan case uses `GeneralizedTransform` (lazy streaming);
+different-plan case materializes both sides eagerly (correct on re-execution).
 
 #### 15. Block Statistics for Predicate Pushdown
 
@@ -168,20 +163,22 @@ decoded block caching.
 | Priority | Item | Rationale |
 |---|---|---|
 | **P0** | Parallel CSV parsing | CSV is the primary ingestion path; currently single-threaded and memory-heavy |
-| **P0** | Parallel execution (rayon for transforms, source reading) | The whole point of segments is parallelism -- without it, Rust leaves most performance on the table |
-| **P1** | Float compression (FoR encoding) | Direct 8-byte floats waste significant disk space vs C++ |
-| **P1** | String dictionary encoding | Common strings are stored redundantly |
-| **P1** | LZ4 compression on write (verify) | Blocks may be uncompressed on write |
-| **P1** | Missing optimizer passes (filter combining, append merging) | Important for complex query plans |
-| **P1** | Fix `SFrame::unique()` hashing | Correctness issue -- `Debug` format is fragile |
-| **P1** | Fix SArray binary op materialization | Breaks out-of-core for large array arithmetic |
-| **P2** | Streaming CSV writer | Avoids full materialization |
-| **P2** | Sketch data structures (HyperLogLog, Space-Saving) | Enables approximate analytics |
-| **P2** | General rolling aggregation framework | Replaces hardcoded rolling ops |
-| **P2** | S3 backend | Opens up cloud-native workflows |
-| **P3** | ODBC connector | Nice to have; users can use CSV as interchange |
-| **P3** | Avro reader | Niche format |
-| **P3** | File handle pool / block cache | Performance polish |
+| **P0** | Parallel CSV parsing | **DONE** — two-pass streaming + rayon parallel parse |
+| **P0** | Parallel execution (rayon for transforms, source reading) | **DONE** — segment prefetch + intra-batch rayon |
+| **P1** | Float compression (FoR encoding) | **DONE** — was already implemented |
+| **P1** | String dictionary encoding | **DONE** — was already implemented |
+| **P1** | LZ4 compression on write | **DONE** — was already implemented |
+| **P1** | Missing optimizer passes | **DONE** — trivial unions, empty appends, filter-through-transform |
+| **P1** | Fix `SFrame::unique()` hashing | **DONE** — proper `HashSet<Vec<FlexType>>` |
+| **P1** | Fix SArray binary op materialization | **DONE** — GeneralizedTransform for same-plan |
+| **P1** | Fix SArray::apply column index bug | **DONE** — Transform now outputs single column |
+| **P2** | Streaming CSV writer | **DONE** — streams via `for_each_batch_sync` |
+| **P2** | Sketch data structures (HyperLogLog, Space-Saving) | **DONE** — `approx_count_distinct`, `frequent_items` on SArray |
+| **P2** | S3 backend | **DONE** — behind `s3` feature flag (requires Rust 1.91+) |
+| **P2** | General rolling aggregation framework | Skipped — hardcoded rolling ops sufficient for now |
+| **P3** | ODBC connector | Not started |
+| **P3** | Avro reader | Not started |
+| **P3** | File handle pool / block cache | Not started |
 
 ---
 

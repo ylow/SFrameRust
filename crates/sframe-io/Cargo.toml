@@ -7,10 +7,15 @@ edition = "2021"
 sframe-types = { path = "../sframe-types" }
 sframe-config = { path = "../sframe-config" }
 ureq = { version = "3", optional = true }
+# S3 backend (requires Rust 1.91+)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [features]
 default = []
 http = ["ureq"]
+s3 = ["aws-sdk-s3", "aws-config", "tokio"]
 
 [dev-dependencies]
 tempfile = "3"
