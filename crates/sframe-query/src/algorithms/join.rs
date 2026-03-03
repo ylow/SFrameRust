@@ -74,9 +74,9 @@ pub async fn join(
     let right_key_cols = on.right_columns();
 
     // Build hash table on the right side
-    let mut right_index: HashMap<CompositeKey, Vec<usize>> = HashMap::new();
+    let mut right_index: HashMap<Vec<FlexType>, Vec<usize>> = HashMap::new();
     for i in 0..right_rows {
-        let key = CompositeKey::from_row(&right, i, &right_key_cols);
+        let key: Vec<FlexType> = right_key_cols.iter().map(|&c| right.column(c).get(i)).collect();
         right_index.entry(key).or_default().push(i);
     }
 
@@ -102,7 +102,7 @@ pub async fn join(
 
     // Probe: for each left row, find matching right rows
     for left_idx in 0..left_rows {
-        let key = CompositeKey::from_row(&left, left_idx, &left_key_cols);
+        let key: Vec<FlexType> = left_key_cols.iter().map(|&c| left.column(c).get(left_idx)).collect();
         let matches = right_index.get(&key);
 
         if let Some(right_indices) = matches {
@@ -213,56 +213,6 @@ fn emit_right_only(
     }
 
     Ok(())
-}
-
-/// Composite hash key for single or multi-column joins.
-#[derive(Clone, Debug)]
-struct CompositeKey(Vec<FlexType>);
-
-impl CompositeKey {
-    fn from_row(batch: &SFrameRows, row: usize, columns: &[usize]) -> Self {
-        CompositeKey(columns.iter().map(|&c| batch.column(c).get(row)).collect())
-    }
-}
-
-impl PartialEq for CompositeKey {
-    fn eq(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
-            return false;
-        }
-        self.0.iter().zip(other.0.iter()).all(|(a, b)| flex_eq(a, b))
-    }
-}
-
-impl Eq for CompositeKey {}
-
-impl std::hash::Hash for CompositeKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for val in &self.0 {
-            hash_flex(val, state);
-        }
-    }
-}
-
-fn flex_eq(a: &FlexType, b: &FlexType) -> bool {
-    match (a, b) {
-        (FlexType::Integer(a), FlexType::Integer(b)) => a == b,
-        (FlexType::Float(a), FlexType::Float(b)) => a.to_bits() == b.to_bits(),
-        (FlexType::String(a), FlexType::String(b)) => a == b,
-        (FlexType::Undefined, FlexType::Undefined) => true,
-        _ => false,
-    }
-}
-
-fn hash_flex<H: std::hash::Hasher>(val: &FlexType, state: &mut H) {
-    use std::hash::Hash;
-    std::mem::discriminant(val).hash(state);
-    match val {
-        FlexType::Integer(i) => i.hash(state),
-        FlexType::Float(f) => f.to_bits().hash(state),
-        FlexType::String(s) => s.hash(state),
-        _ => {}
-    }
 }
 
 #[cfg(test)]
