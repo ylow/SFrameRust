@@ -50,16 +50,34 @@ impl std::fmt::Display for FlexTypeEnum {
 
 /// Date/time with timezone and microsecond precision.
 /// Matches C++ flex_date_time layout.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct FlexDateTime {
     pub posix_timestamp: i64,
     pub tz_offset_quarter_hours: i8,
     pub microsecond: u32,
 }
 
+impl PartialEq for FlexDateTime {
+    fn eq(&self, other: &Self) -> bool {
+        self.posix_timestamp == other.posix_timestamp
+            && self.tz_offset_quarter_hours == other.tz_offset_quarter_hours
+            && self.microsecond == other.microsecond
+    }
+}
+
+impl Eq for FlexDateTime {}
+
+impl std::hash::Hash for FlexDateTime {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.posix_timestamp.hash(state);
+        self.tz_offset_quarter_hours.hash(state);
+        self.microsecond.hash(state);
+    }
+}
+
 /// The core value type, mirroring C++ flexible_type.
 /// Uses Arc for shared ownership of heap-allocated data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum FlexType {
     Integer(i64),
     Float(f64),
@@ -69,6 +87,50 @@ pub enum FlexType {
     Dict(Arc<[(FlexType, FlexType)]>),
     DateTime(FlexDateTime),
     Undefined,
+}
+
+impl PartialEq for FlexType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FlexType::Integer(a), FlexType::Integer(b)) => a == b,
+            (FlexType::Float(a), FlexType::Float(b)) => a.to_bits() == b.to_bits(),
+            (FlexType::String(a), FlexType::String(b)) => a == b,
+            (FlexType::Vector(a), FlexType::Vector(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (FlexType::List(a), FlexType::List(b)) => a == b,
+            (FlexType::Dict(a), FlexType::Dict(b)) => a == b,
+            (FlexType::DateTime(a), FlexType::DateTime(b)) => a == b,
+            (FlexType::Undefined, FlexType::Undefined) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FlexType {}
+
+impl std::hash::Hash for FlexType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            FlexType::Integer(i) => i.hash(state),
+            FlexType::Float(f) => f.to_bits().hash(state),
+            FlexType::String(s) => s.hash(state),
+            FlexType::Vector(v) => {
+                v.len().hash(state);
+                for x in v.iter() {
+                    x.to_bits().hash(state);
+                }
+            }
+            FlexType::List(l) => l.hash(state),
+            FlexType::Dict(d) => d.hash(state),
+            FlexType::DateTime(dt) => dt.hash(state),
+            FlexType::Undefined => {}
+        }
+    }
 }
 
 impl FlexType {
