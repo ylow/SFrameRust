@@ -149,7 +149,7 @@ it avoids shuffling non-key columns during partitioning.
 
 ---
 
-## Improvement 3: GRACE Hash Join
+## Improvement 3: GRACE Hash Join ✅ DONE
 
 **Problem**: `join.rs:56-64` materializes both sides of the join into
 memory and builds a single hash table on the right side. If either input
@@ -199,7 +199,7 @@ and joins each partition independently.
 
 ---
 
-## Improvement 4: Streaming Unique / Dedup
+## Improvement 4: Streaming Unique / Dedup ✅ DONE
 
 **Problem**: `SArray::unique()` likely materializes the entire array to
 compute unique values. For sorted input, this could be streaming.
@@ -291,28 +291,30 @@ streaming pipeline.
 |----------|-------------|--------|--------|--------|
 | **P0** | 1. Lazy source reading | Eliminates the #1 source of unnecessary memory use | Medium | **DONE** |
 | **P0** | 2. External sort | Unblocks sorting of large datasets | High | **DONE** |
-| **P1** | 3. GRACE hash join | Unblocks joining of large datasets | High | TODO |
+| **P1** | 3. GRACE hash join | Unblocks joining of large datasets | High | **DONE** |
 | **P1** | 5. Config system | Prerequisite infrastructure for memory budgets | Low | **DONE** |
 | **P2** | 6. Block-level random access | Enables lazy source + future predicate pushdown | Medium | **DONE** |
-| **P2** | 4. Streaming unique | Dedup of large arrays | Low | TODO |
-| **P3** | 7. Buffer pool | Throughput optimization | Medium | TODO |
+| **P2** | 4. Streaming unique | Dedup of large arrays | Low | **DONE** |
+| **P3** | 7. Buffer pool | Throughput optimization | Medium | **DROPPED** |
 
 ### Suggested implementation order
 1. **Config system** (P1 but low effort, prerequisite for others) — **DONE**
 2. **Block-level random access** (P2 but enables #3) — **DONE**
 3. **Lazy source reading** (P0, builds on block-level access) — **DONE**
 4. **External sort** (P0, needs quantile sketch + temp SFrame writing) — **DONE**
-5. **GRACE hash join** (P1, same partitioning infrastructure as sort)
-6. **Streaming unique** (P2, reuses sort or groupby spill)
-7. **Buffer pool** (P3, performance polish)
+5. **GRACE hash join** (P1, same partitioning infrastructure as sort) — **DONE**
+6. **Streaming unique** (P2, reuses sort or groupby spill) — **DONE**
+7. **Buffer pool** (P3, performance polish) — **DROPPED** (premature optimization; allocation pressure not yet a bottleneck)
 
 ### Implementation notes (completed items)
 
-**Config system** (`sframe-query/src/config.rs`): `SFrameConfig` now uses
-`LazyLock` to read env vars on first access: `SFRAME_SOURCE_BATCH_SIZE`,
-`SFRAME_SORT_BUFFER_SIZE`, `SFRAME_GROUPBY_BUFFER_NUM_ROWS`,
-`SFRAME_JOIN_BUFFER_NUM_CELLS`, `SFRAME_SOURCE_PREFETCH_SEGMENTS`.
-`parse_byte_size` made public in `sframe-config`.
+**Config system** (`sframe-config/src/lib.rs`): All configuration unified
+into `sframe-config` crate. `SFrameConfig` uses `LazyLock` with `AtomicUsize`
+for cache settings and plain fields for algorithm settings:
+`source_batch_size`, `rows_per_segment`, `sort_memory_budget`,
+`groupby_buffer_num_rows`, `join_buffer_num_cells`, `source_prefetch_segments`.
+Environment variable overrides via `SFRAME_*` prefix. The separate
+`sframe-query/src/config.rs` was removed.
 
 **Block-level random access** (`sframe-storage/src/segment_reader.rs`):
 Added `num_blocks()`, `block_num_elem()`, `read_block()`. `read_column()`
@@ -328,6 +330,22 @@ Greenwald-Khanna quantile sketch (`sframe-query/src/algorithms/quantile_sketch.r
 for partition boundaries. `SFrame::sort()` dispatches to `sort_in_memory()`
 or `external_sort()` based on `estimate_size()` vs `sort_memory_budget`.
 Partitions on primary key; full multi-key sort within each partition.
+
+**GRACE hash join** (`sframe-query/src/algorithms/join.rs`): `join()` now
+returns `BatchStream` instead of `SFrameRows`. Dispatches to `in_memory_join()`
+when smaller side fits in budget, otherwise `grace_hash_join()` which
+hash-partitions both sides into N buckets and joins each partition
+independently. Supports all 4 join types (Inner, Left, Right, Full).
+`CompositeKey` removed; join keys are `Vec<FlexType>` directly (enabled by
+FlexType Hash+Eq). Also added foundational refactors: `with_column_data!`
+and `with_column_data_pair!` macros in `batch.rs`, and `FlexTypeKey` wrapper
+removed from `groupby.rs`.
+
+**Streaming unique** (`sframe/src/sarray.rs`): Size-aware dispatch —
+`unique()` uses `unique_in_memory()` (HashSet) for small arrays and
+`unique_via_sort()` (sort + streaming dedup) for large arrays. The
+`format!("{:?}")` hack for deduplication was replaced with proper
+`HashSet<FlexType>` (enabled by FlexType Hash+Eq).
 
 ---
 
