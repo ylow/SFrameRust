@@ -16,7 +16,6 @@ use sframe_types::error::Result;
 use sframe_types::flex_type::FlexType;
 
 use crate::batch::SFrameRows;
-use crate::config::SFrameConfig;
 use crate::execute::BatchStream;
 
 /// Sort order for a column.
@@ -136,8 +135,7 @@ pub fn estimate_batch_size(batch: &SFrameRows) -> usize {
         return 0;
     }
 
-    let config = SFrameConfig::global();
-    let _ = config; // future use
+    let _config = sframe_config::global();
 
     let mut size = 0usize;
     for col_idx in 0..batch.num_columns() {

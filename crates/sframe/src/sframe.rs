@@ -565,7 +565,7 @@ impl SFrame {
 
         // Estimate data size and decide between in-memory vs external sort
         let estimated_size = self.estimate_size();
-        let budget = sframe_query::config::SFrameConfig::global().sort_memory_budget;
+        let budget = sframe_config::global().sort_memory_budget;
 
         if estimated_size <= budget {
             self.sort_in_memory(&sort_keys)

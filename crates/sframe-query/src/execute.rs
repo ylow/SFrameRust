@@ -193,7 +193,7 @@ fn compile_sframe_source(
 
     let reader = SFrameReader::open_with_fs(&*vfs, path)?;
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
-    let batch_size = crate::config::SFrameConfig::global().source_batch_size;
+    let batch_size = sframe_config::global().source_batch_size;
 
     // Collect segment file paths
     let segment_paths: Vec<String> = reader
@@ -296,7 +296,7 @@ fn read_segment_independently(
 
 /// Compile a range source.
 fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchStream> {
-    let batch_size = crate::config::SFrameConfig::global().source_batch_size;
+    let batch_size = sframe_config::global().source_batch_size;
     let mut batches: Vec<Result<SFrameRows>> = Vec::new();
     let total = count as usize;
     let mut offset = 0;

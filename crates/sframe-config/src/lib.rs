@@ -1,21 +1,23 @@
 //! Global configuration for the SFrame runtime.
 //!
-//! Provides runtime-configurable globals analogous to the C++ SFrame's
-//! `globals/` system. Values are initialized from environment variables
-//! on first access and can be overridden at runtime via setter functions.
+//! All engine settings live here. Values are initialized from environment
+//! variables on first access. Cache capacity can be overridden at runtime;
+//! all other settings are immutable after initialization.
 //!
-//! # Cache configuration
+//! # Environment Variables
 //!
-//! - `SFRAME_CACHE_CAPACITY`: Maximum total bytes for the CacheFs in-memory
-//!   store. Files that fit within this budget are kept in RAM rather than
-//!   spilling to disk. Default: 2 GiB.
-//!
-//! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Maximum size of a single file that
-//!   can be stored in the CacheFs in-memory store. Files larger than this
-//!   always go to disk. Default: 128 MiB.
+//! All prefixed with `SFRAME_`:
+//! - `SFRAME_CACHE_CAPACITY`: CacheFs in-memory store limit (default 2G)
+//! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Max single file in cache (default 128M)
+//! - `SFRAME_SOURCE_BATCH_SIZE`: Rows per batch (default 4096)
+//! - `SFRAME_ROWS_PER_SEGMENT`: Max rows per segment (default 1000000)
+//! - `SFRAME_SORT_BUFFER_SIZE`: Sort memory budget (default 256M)
+//! - `SFRAME_GROUPBY_BUFFER_NUM_ROWS`: Groupby hash table limit (default 1048576)
+//! - `SFRAME_JOIN_BUFFER_NUM_CELLS`: Join hash table limit (default 50000000)
+//! - `SFRAME_SOURCE_PREFETCH_SEGMENTS`: Lazy source prefetch (default 2)
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Once;
+use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -24,32 +26,150 @@ use std::sync::Once;
 const DEFAULT_CACHE_CAPACITY: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DEFAULT_CACHE_CAPACITY_PER_FILE: usize = 128 * 1024 * 1024; // 128 MiB
 
-// ---------------------------------------------------------------------------
-// Atomic globals
-// ---------------------------------------------------------------------------
+/// Global configuration for the SFrame engine.
+///
+/// Cache capacity fields use AtomicUsize for runtime mutation. All other
+/// fields are immutable after initialization.
+pub struct SFrameConfig {
+    // --- Mutable at runtime ---
+    cache_capacity: AtomicUsize,
+    cache_capacity_per_file: AtomicUsize,
 
-static FILEIO_MAXIMUM_CACHE_CAPACITY: AtomicUsize =
-    AtomicUsize::new(DEFAULT_CACHE_CAPACITY);
-static FILEIO_MAXIMUM_CACHE_CAPACITY_PER_FILE: AtomicUsize =
-    AtomicUsize::new(DEFAULT_CACHE_CAPACITY_PER_FILE);
-
-static INIT: Once = Once::new();
-
-/// Ensure environment variable overrides are applied (idempotent).
-fn ensure_init() {
-    INIT.call_once(|| {
-        if let Ok(val) = std::env::var("SFRAME_CACHE_CAPACITY") {
-            if let Ok(n) = parse_byte_size(&val) {
-                FILEIO_MAXIMUM_CACHE_CAPACITY.store(n, Ordering::Relaxed);
-            }
-        }
-        if let Ok(val) = std::env::var("SFRAME_CACHE_CAPACITY_PER_FILE") {
-            if let Ok(n) = parse_byte_size(&val) {
-                FILEIO_MAXIMUM_CACHE_CAPACITY_PER_FILE.store(n, Ordering::Relaxed);
-            }
-        }
-    });
+    // --- Immutable after init ---
+    /// Batch size for source operators (rows per batch).
+    pub source_batch_size: usize,
+    /// Maximum rows per segment before auto-splitting on write.
+    pub rows_per_segment: u64,
+    /// Memory budget for in-memory sort. If estimated data size exceeds
+    /// this, external sort is used.
+    pub sort_memory_budget: usize,
+    /// Maximum number of rows in a groupby hash table per segment before
+    /// spilling to disk.
+    pub groupby_buffer_num_rows: usize,
+    /// Maximum number of cells (rows * columns) for the hash side of a
+    /// join before GRACE partitioned join kicks in.
+    pub join_buffer_num_cells: usize,
+    /// Number of segments to prefetch for lazy source reading.
+    pub source_prefetch_segments: usize,
 }
+
+impl SFrameConfig {
+    /// Get the cache capacity (mutable at runtime).
+    pub fn cache_capacity(&self) -> usize {
+        self.cache_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Set the cache capacity.
+    pub fn set_cache_capacity(&self, bytes: usize) {
+        self.cache_capacity.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Get the per-file cache capacity (mutable at runtime).
+    pub fn cache_capacity_per_file(&self) -> usize {
+        self.cache_capacity_per_file.load(Ordering::Relaxed)
+    }
+
+    /// Set the per-file cache capacity.
+    pub fn set_cache_capacity_per_file(&self, bytes: usize) {
+        self.cache_capacity_per_file.store(bytes, Ordering::Relaxed);
+    }
+}
+
+static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
+    let mut cache_cap = DEFAULT_CACHE_CAPACITY;
+    let mut cache_cap_per_file = DEFAULT_CACHE_CAPACITY_PER_FILE;
+    let mut source_batch_size: usize = 4096;
+    let mut rows_per_segment: u64 = 1_000_000;
+    let mut sort_memory_budget: usize = 256 * 1024 * 1024;
+    let mut groupby_buffer_num_rows: usize = 1_048_576;
+    let mut join_buffer_num_cells: usize = 50_000_000;
+    let mut source_prefetch_segments: usize = 2;
+
+    if let Ok(val) = std::env::var("SFRAME_CACHE_CAPACITY") {
+        if let Ok(n) = parse_byte_size(&val) {
+            cache_cap = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_CACHE_CAPACITY_PER_FILE") {
+        if let Ok(n) = parse_byte_size(&val) {
+            cache_cap_per_file = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_SOURCE_BATCH_SIZE") {
+        if let Ok(n) = val.parse::<usize>() {
+            source_batch_size = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_ROWS_PER_SEGMENT") {
+        if let Ok(n) = val.parse::<u64>() {
+            rows_per_segment = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_SORT_BUFFER_SIZE") {
+        if let Ok(n) = parse_byte_size(&val) {
+            sort_memory_budget = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_GROUPBY_BUFFER_NUM_ROWS") {
+        if let Ok(n) = val.parse::<usize>() {
+            groupby_buffer_num_rows = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_JOIN_BUFFER_NUM_CELLS") {
+        if let Ok(n) = val.parse::<usize>() {
+            join_buffer_num_cells = n;
+        }
+    }
+    if let Ok(val) = std::env::var("SFRAME_SOURCE_PREFETCH_SEGMENTS") {
+        if let Ok(n) = val.parse::<usize>() {
+            source_prefetch_segments = n;
+        }
+    }
+
+    SFrameConfig {
+        cache_capacity: AtomicUsize::new(cache_cap),
+        cache_capacity_per_file: AtomicUsize::new(cache_cap_per_file),
+        source_batch_size,
+        rows_per_segment,
+        sort_memory_budget,
+        groupby_buffer_num_rows,
+        join_buffer_num_cells,
+        source_prefetch_segments,
+    }
+});
+
+/// Return the global config, initialized from environment variables on first access.
+pub fn global() -> &'static SFrameConfig {
+    &GLOBAL_CONFIG
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compatible free functions
+// ---------------------------------------------------------------------------
+
+/// Get the maximum total bytes for the CacheFs in-memory store.
+pub fn get_cache_capacity() -> usize {
+    global().cache_capacity()
+}
+
+/// Set the maximum total bytes for the CacheFs in-memory store.
+pub fn set_cache_capacity(bytes: usize) {
+    global().set_cache_capacity(bytes);
+}
+
+/// Get the maximum size of a single file in the CacheFs in-memory store.
+pub fn get_cache_capacity_per_file() -> usize {
+    global().cache_capacity_per_file()
+}
+
+/// Set the maximum size of a single file in the CacheFs in-memory store.
+pub fn set_cache_capacity_per_file(bytes: usize) {
+    global().set_cache_capacity_per_file(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 /// Parse a byte size string. Supports plain integers and suffixes:
 /// `K`/`KB`, `M`/`MB`, `G`/`GB` (case-insensitive).
@@ -65,34 +185,6 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ()> {
         (s, 1)
     };
     num_str.parse::<usize>().map(|n| n * multiplier).map_err(|_| ())
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Get the maximum total bytes for the CacheFs in-memory store.
-pub fn get_cache_capacity() -> usize {
-    ensure_init();
-    FILEIO_MAXIMUM_CACHE_CAPACITY.load(Ordering::Relaxed)
-}
-
-/// Set the maximum total bytes for the CacheFs in-memory store.
-pub fn set_cache_capacity(bytes: usize) {
-    ensure_init();
-    FILEIO_MAXIMUM_CACHE_CAPACITY.store(bytes, Ordering::Relaxed);
-}
-
-/// Get the maximum size of a single file in the CacheFs in-memory store.
-pub fn get_cache_capacity_per_file() -> usize {
-    ensure_init();
-    FILEIO_MAXIMUM_CACHE_CAPACITY_PER_FILE.load(Ordering::Relaxed)
-}
-
-/// Set the maximum size of a single file in the CacheFs in-memory store.
-pub fn set_cache_capacity_per_file(bytes: usize) {
-    ensure_init();
-    FILEIO_MAXIMUM_CACHE_CAPACITY_PER_FILE.store(bytes, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -115,21 +207,19 @@ mod tests {
 
     #[test]
     fn test_defaults() {
-        // These may have been overridden by env vars in CI, so just check they're nonzero
-        assert!(get_cache_capacity() > 0);
-        assert!(get_cache_capacity_per_file() > 0);
+        let config = global();
+        assert!(config.cache_capacity() > 0);
+        assert!(config.cache_capacity_per_file() > 0);
+        assert_eq!(config.source_batch_size, 4096);
+        assert_eq!(config.rows_per_segment, 1_000_000);
     }
 
     #[test]
-    fn test_set_get() {
-        let original = get_cache_capacity();
-        set_cache_capacity(999);
-        assert_eq!(get_cache_capacity(), 999);
-        set_cache_capacity(original); // restore
-
-        let original_pf = get_cache_capacity_per_file();
-        set_cache_capacity_per_file(42);
-        assert_eq!(get_cache_capacity_per_file(), 42);
-        set_cache_capacity_per_file(original_pf); // restore
+    fn test_set_get_cache() {
+        let config = global();
+        let original = config.cache_capacity();
+        config.set_cache_capacity(999);
+        assert_eq!(config.cache_capacity(), 999);
+        config.set_cache_capacity(original);
     }
 }

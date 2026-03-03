@@ -11,7 +11,6 @@ use futures::StreamExt;
 
 use sframe_query::algorithms::quantile_sketch::QuantileSketch;
 use sframe_query::algorithms::sort::{compare_flex_type, SortKey, SortOrder};
-use sframe_query::config::SFrameConfig;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexType;
 
@@ -32,7 +31,7 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     }
 
     let primary_key = &sort_keys[0];
-    let budget = SFrameConfig::global().sort_memory_budget;
+    let budget = sframe_config::global().sort_memory_budget;
     let estimated_size = sf.estimate_size();
 
     // Phase 1: Build quantile sketch of the primary sort key
