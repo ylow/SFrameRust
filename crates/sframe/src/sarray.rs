@@ -1809,4 +1809,33 @@ mod tests {
         // Should have 3 unique values: 1.0, 2.0, NaN
         assert_eq!(result.len(), 3);
     }
+
+    #[test]
+    fn test_unique_large_preserves_values() {
+        // Create data with many duplicates
+        let n = 10000;
+        let values: Vec<FlexType> = (0..n)
+            .map(|i| FlexType::Integer(i % 100)) // 100 unique values, each repeated 100 times
+            .collect();
+        let sa = SArray::from_vec(values, FlexTypeEnum::Integer).unwrap();
+        let unique = sa.unique().unwrap();
+        let result = unique.to_vec().unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_unique_with_undefined() {
+        let values = vec![
+            FlexType::Integer(1),
+            FlexType::Undefined,
+            FlexType::Integer(1),
+            FlexType::Undefined,
+            FlexType::Integer(2),
+        ];
+        let sa = SArray::from_vec(values, FlexTypeEnum::Integer).unwrap();
+        let unique = sa.unique().unwrap();
+        let result = unique.to_vec().unwrap();
+        // Should have 3: 1, Undefined, 2
+        assert_eq!(result.len(), 3);
+    }
 }
