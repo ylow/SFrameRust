@@ -103,7 +103,7 @@ pub fn tokenize(content: &str, config: &CsvConfig) -> (Option<Vec<String>>, Vec<
         if is_comment(&line, config) {
             continue;
         }
-        if line.is_empty() {
+        if line.is_empty() || line.trim().is_empty() {
             continue;
         }
         let fields = split_fields(&line, config);
@@ -117,6 +117,14 @@ pub fn tokenize(content: &str, config: &CsvConfig) -> (Option<Vec<String>>, Vec<
 /// For standard terminators, handles \r\n, \r, \n correctly.
 /// Also handles quoted fields that span multiple lines.
 fn split_lines(content: &str, config: &CsvConfig) -> Vec<String> {
+    // Empty line terminator → entire content is one "line"
+    if config.line_terminator.is_empty() {
+        if content.is_empty() {
+            return Vec::new();
+        }
+        return vec![content.to_string()];
+    }
+
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
@@ -213,7 +221,199 @@ fn is_comment(line: &str, config: &CsvConfig) -> bool {
     }
 }
 
+/// Scan ahead from `start` to find a matching close bracket/brace.
+/// Returns the index of the closing bracket, or None if unbalanced.
+/// Respects quote nesting inside brackets. Also verifies that the closing
+/// bracket is followed by delimiter, end-of-line, or whitespace (not mid-data).
+/// The `delim_chars` parameter is used for this validation.
+fn find_balanced_close(
+    chars: &[char],
+    start: usize,
+    open: char,
+    close: char,
+    delim_chars: &[char],
+    skip_initial_space: bool,
+) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_q = false;
+    let mut esc = false;
+    let mut i = start;
+    while i < chars.len() {
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        let ch = chars[i];
+        if ch == '\\' && in_q {
+            esc = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_q = !in_q;
+        } else if !in_q {
+            if ch == open {
+                depth += 1;
+            } else if ch == close {
+                depth -= 1;
+                if depth == 0 {
+                    // Verify: the char after closing bracket must be delimiter,
+                    // whitespace, or end-of-line. Otherwise this isn't a real
+                    // structured field (e.g. `{}` in `{}\tdebugging`).
+                    let after = i + 1;
+                    if after >= chars.len() {
+                        return Some(i); // end of line — valid
+                    }
+                    // Check for delimiter BEFORE skipping whitespace (because
+                    // the delimiter itself might be whitespace).
+                    if !delim_chars.is_empty()
+                        && after + delim_chars.len() <= chars.len()
+                        && chars[after..after + delim_chars.len()] == *delim_chars
+                    {
+                        return Some(i); // delimiter follows — valid
+                    }
+                    // For space-based delimiters, any whitespace counts
+                    if !delim_chars.is_empty()
+                        && delim_chars.iter().all(|c| c.is_whitespace())
+                        && chars[after].is_whitespace()
+                    {
+                        return Some(i);
+                    }
+                    // Skip optional whitespace, then check for delimiter
+                    let mut check = after;
+                    if skip_initial_space {
+                        while check < chars.len() && chars[check] == ' ' {
+                            check += 1;
+                        }
+                    }
+                    if check >= chars.len() {
+                        return Some(i); // only whitespace left — valid
+                    }
+                    if !delim_chars.is_empty()
+                        && check + delim_chars.len() <= chars.len()
+                        && chars[check..check + delim_chars.len()] == *delim_chars
+                    {
+                        return Some(i); // delimiter after whitespace — valid
+                    }
+                    // Not followed by delimiter — not a valid bracketed field.
+                    return None;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip delimiter and whitespace after a bracket-consumed field.
+///
+/// Checks for delimiter BEFORE skipping spaces (the delimiter might BE spaces).
+/// Then skips any remaining spaces per skip_initial_space.
+fn skip_post_bracket(
+    chars: &[char],
+    i: &mut usize,
+    delim_chars: &[char],
+    config: &CsvConfig,
+    had_delimiter: &mut bool,
+) {
+    if *i >= chars.len() {
+        return;
+    }
+
+    // Check for delimiter first (it might be whitespace)
+    if !delim_chars.is_empty()
+        && *i + delim_chars.len() <= chars.len()
+        && chars[*i..*i + delim_chars.len()] == *delim_chars
+    {
+        *had_delimiter = true;
+        *i += delim_chars.len();
+        // Skip additional spaces after delimiter
+        if config.skip_initial_space {
+            while *i < chars.len() && chars[*i] == ' ' {
+                *i += 1;
+            }
+        }
+        return;
+    }
+
+    // For space-based delimiters, any whitespace counts as delimiter
+    if !delim_chars.is_empty()
+        && delim_chars.iter().all(|c| c.is_whitespace())
+        && chars[*i].is_whitespace()
+    {
+        *had_delimiter = true;
+        *i += 1;
+        if config.skip_initial_space {
+            while *i < chars.len() && chars[*i] == ' ' {
+                *i += 1;
+            }
+        }
+        return;
+    }
+
+    // Skip optional whitespace, then check for delimiter
+    if config.skip_initial_space {
+        while *i < chars.len() && chars[*i] == ' ' {
+            *i += 1;
+        }
+    }
+    if *i < chars.len()
+        && !delim_chars.is_empty()
+        && *i + delim_chars.len() <= chars.len()
+        && chars[*i..*i + delim_chars.len()] == *delim_chars
+    {
+        *had_delimiter = true;
+        *i += delim_chars.len();
+        if config.skip_initial_space {
+            while *i < chars.len() && chars[*i] == ' ' {
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// Check if a char slice contains a `:` at bracket depth 0 outside quotes.
+/// Used to validate `{...}` content looks like a dict before committing to
+/// bracket lookahead.
+fn has_colon_at_depth0(chars: &[char]) -> bool {
+    let mut depth = 0i32;
+    let mut in_q = false;
+    let mut esc = false;
+    for &ch in chars {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if ch == '\\' && in_q {
+            esc = true;
+            continue;
+        }
+        if ch == '"' {
+            in_q = !in_q;
+        } else if !in_q {
+            match ch {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                ':' if depth == 0 => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Split a line into fields, respecting quotes and bracket/brace nesting.
+///
+/// Replicates the C++ csv_line_tokenizer state machine:
+/// - When `[` or `{` appears at the start of a field, a lookahead verifies the
+///   brackets balance. If they do, the entire bracketed expression becomes one
+///   field. If they don't, the bracket is treated as a regular character (no
+///   depth tracking). This matches the C++ lookahead/canceltoken pattern.
+/// - Comment char (when set) terminates the current field AND the line, matching
+///   C++ IN_FIELD comment handling.
+/// - `skip_initial_space` skips spaces at the start of each field (including the
+///   first), matching C++ START_FIELD behavior.
 fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -222,8 +422,23 @@ fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
     let mut i = 0;
     let mut in_quote = false;
     let mut escape_next = false;
+    // Tracks whether we're in the middle of building a field (IN_FIELD state).
+    // When false, we're in START_FIELD state and a trailing empty doesn't
+    // produce an extra field.
+    let mut in_field = false;
+    // Set when a delimiter was the last thing we processed (need trailing empty).
+    let mut had_delimiter = false;
+    // When we've verified brackets via lookahead, track depth to suppress
+    // delimiter matching until the brackets close.
     let mut bracket_depth = 0i32;
     let mut brace_depth = 0i32;
+
+    // Skip leading whitespace before first field (C++ START_FIELD skip)
+    if config.skip_initial_space {
+        while i < chars.len() && chars[i] == ' ' {
+            i += 1;
+        }
+    }
 
     while i < chars.len() {
         if escape_next {
@@ -273,13 +488,74 @@ fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
         }
 
         if !in_quote {
-            // Track bracket/brace nesting
-            match ch {
-                '[' => bracket_depth += 1,
-                ']' => bracket_depth = (bracket_depth - 1).max(0),
-                '{' => brace_depth += 1,
-                '}' => brace_depth = (brace_depth - 1).max(0),
-                _ => {}
+            // Inline comment: terminates current field AND line
+            // (C++ IN_FIELD and START_FIELD both handle comment_char)
+            if let Some(cc) = config.comment_char {
+                if ch == cc && bracket_depth == 0 && brace_depth == 0 {
+                    // Push whatever we have as a field and stop
+                    fields.push(finish_field(&current, config));
+                    return fields;
+                }
+            }
+
+            // Bracket/brace lookahead at field start: verify brackets balance
+            // before committing to depth tracking. If unbalanced, treat the
+            // bracket as a regular character (C++ canceltoken pattern).
+            let at_field_start = current.is_empty()
+                || current.chars().all(|c| c.is_whitespace());
+
+            if at_field_start && bracket_depth == 0 && brace_depth == 0 {
+                if ch == '[' {
+                    if let Some(close_pos) = find_balanced_close(&chars, i, '[', ']', &delim_chars, config.skip_initial_space) {
+                        // Verified: balanced brackets. Consume the entire
+                        // bracketed expression as one field.
+                        let field_str: String = chars[i..=close_pos].iter().collect();
+                        fields.push(finish_field(&field_str, config));
+                        current = String::new();
+                        in_field = false;
+                        had_delimiter = false;
+                        i = close_pos + 1;
+                        skip_post_bracket(&chars, &mut i, &delim_chars, config, &mut had_delimiter);
+                        continue;
+                    }
+                    // Unbalanced: treat '[' as regular character, fall through
+                } else if ch == '{' {
+                    if let Some(close_pos) = find_balanced_close(&chars, i, '{', '}', &delim_chars, config.skip_initial_space) {
+                        // For `{...}` groups, verify the content looks like a
+                        // dict (contains at least one `:` at depth 0 outside
+                        // quotes). This prevents `{`, `{}`, `{foo}` from being
+                        // treated as dict fields when they're just text.
+                        let inner = &chars[i + 1..close_pos];
+                        if has_colon_at_depth0(inner) {
+                            let field_str: String =
+                                chars[i..=close_pos].iter().collect();
+                            fields.push(finish_field(&field_str, config));
+                            current = String::new();
+                            in_field = false;
+                            had_delimiter = false;
+                            i = close_pos + 1;
+                            skip_post_bracket(&chars, &mut i, &delim_chars, config, &mut had_delimiter);
+                            continue;
+                        }
+                        // Not dict-like: fall through to regular character
+                    }
+                    // Unbalanced: treat '{' as regular character, fall through
+                }
+            }
+
+            // Inside an already-open bracket group (from nested brackets within
+            // a balanced expression that was NOT consumed by lookahead — this
+            // handles cases like `[1,[2,3],4]` where the outer brackets were
+            // consumed but we're re-entered via a different path; in practice
+            // the lookahead above handles the common case).
+            if bracket_depth > 0 || brace_depth > 0 {
+                match ch {
+                    '[' => bracket_depth += 1,
+                    ']' => bracket_depth = (bracket_depth - 1).max(0),
+                    '{' => brace_depth += 1,
+                    '}' => brace_depth = (brace_depth - 1).max(0),
+                    _ => {}
+                }
             }
 
             // Check for delimiter (only at top level)
@@ -289,6 +565,8 @@ fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
                 {
                     fields.push(finish_field(&current, config));
                     current = String::new();
+                    in_field = false;
+                    had_delimiter = true;
                     i += delim_chars.len();
                     // Skip initial space after delimiter
                     if config.skip_initial_space {
@@ -302,10 +580,15 @@ fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
         }
 
         current.push(ch);
+        in_field = true;
         i += 1;
     }
 
-    fields.push(finish_field(&current, config));
+    // Push trailing field: if we were building a field (IN_FIELD) or if a
+    // delimiter was the last thing processed (trailing empty field).
+    if in_field || had_delimiter {
+        fields.push(finish_field(&current, config));
+    }
     fields
 }
 
@@ -351,7 +634,6 @@ fn unescape_csv_string(s: &str, escape_char: char) -> String {
                 Some('"') => result.push('"'),
                 Some('\'') => result.push('\''),
                 Some('/') => result.push('/'),
-                Some('0') => result.push('\0'),
                 Some('b') => result.push('\u{0008}'),
                 Some('f') => result.push('\u{000C}'),
                 Some('u') => {
@@ -384,7 +666,11 @@ fn unescape_csv_string(s: &str, escape_char: char) -> String {
                                         }
                                     }
                                 }
-                                result.push('\u{FFFD}');
+                                // Bad surrogate pair — keep literal \uXXXX
+                                // (C++ parity: bad surrogates are not decoded)
+                                result.push(escape_char);
+                                result.push('u');
+                                result.push_str(&hex);
                             } else if let Some(c) = char::from_u32(cp) {
                                 result.push(c);
                             } else {

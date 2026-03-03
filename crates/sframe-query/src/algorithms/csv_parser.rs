@@ -41,8 +41,8 @@ use super::csv_tokenizer::{self, CsvConfig};
 pub struct CsvOptions {
     /// Whether the first row is a header.
     pub has_header: bool,
-    /// Delimiter character.
-    pub delimiter: u8,
+    /// Field delimiter (supports multi-char, e.g. "::" or "\t\t").
+    pub delimiter: String,
     /// Column type hints (overrides inference).
     pub type_hints: Vec<(String, FlexTypeEnum)>,
     /// Strings that should be treated as NA/Undefined.
@@ -58,13 +58,22 @@ pub struct CsvOptions {
     /// Whether to use the custom tokenizer (bracket-aware).
     /// When false, falls back to the csv crate for performance.
     pub use_custom_tokenizer: bool,
+    /// Whether doubled quote chars represent an escaped quote. Default: true.
+    pub double_quote: bool,
+    /// Line terminator. Default: "\n" (handles \r\n and \r automatically).
+    /// Set to a custom string (e.g. "zzz") for non-standard terminators.
+    pub line_terminator: String,
+    /// Escape character. Default: '\\'.
+    pub escape_char: char,
+    /// Skip leading whitespace before each field. Default: true.
+    pub skip_initial_space: bool,
 }
 
 impl Default for CsvOptions {
     fn default() -> Self {
         CsvOptions {
             has_header: true,
-            delimiter: b',',
+            delimiter: ",".to_string(),
             type_hints: Vec::new(),
             na_values: Vec::new(),
             comment_char: Some('#'),
@@ -72,6 +81,10 @@ impl Default for CsvOptions {
             row_limit: None,
             output_columns: None,
             use_custom_tokenizer: true,
+            double_quote: true,
+            line_terminator: "\n".to_string(),
+            escape_char: '\\',
+            skip_initial_space: true,
         }
     }
 }
@@ -122,7 +135,11 @@ impl CsvSchema {
 /// [`parse_rows_range`] can convert them in independent chunks.
 pub fn tokenize_and_infer(content: &str, options: &CsvOptions) -> Result<CsvSchema> {
     let config = CsvConfig {
-        delimiter: String::from(options.delimiter as char),
+        delimiter: options.delimiter.clone(),
+        line_terminator: options.line_terminator.clone(),
+        escape_char: options.escape_char,
+        double_quote: options.double_quote,
+        skip_initial_space: options.skip_initial_space,
         has_header: options.has_header,
         comment_char: options.comment_char,
         na_values: options.na_values.clone(),
@@ -317,8 +334,16 @@ pub fn parse_rows_range(
 
 /// Parse a single cell string into a `FlexType` given the target column type.
 fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String>) -> Result<FlexType> {
-    if val.is_empty() || na_set.contains(val) {
+    // Check NA values first
+    if na_set.contains(val) {
         return Ok(FlexType::Undefined);
+    }
+    // Empty values: String columns produce String(""), all others produce Undefined.
+    if val.is_empty() {
+        return match dtype {
+            FlexTypeEnum::String => Ok(FlexType::String(Arc::from(""))),
+            _ => Ok(FlexType::Undefined),
+        };
     }
 
     match dtype {
@@ -335,12 +360,70 @@ fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String>) -> Resul
             Ok(FlexType::Float(v))
         }
         FlexTypeEnum::String => Ok(FlexType::String(Arc::from(val))),
-        FlexTypeEnum::Vector | FlexTypeEnum::List | FlexTypeEnum::Dict => {
+        FlexTypeEnum::Vector => {
             let parsed = parse_flextype(val);
-            if parsed.type_enum() == dtype {
+            match &parsed {
+                FlexType::Vector(_) => Ok(parsed),
+                // List of all-numeric can be coerced to Vector
+                FlexType::List(items) => {
+                    let mut floats = Vec::with_capacity(items.len());
+                    for item in items.iter() {
+                        match item {
+                            FlexType::Integer(i) => floats.push(*i as f64),
+                            FlexType::Float(f) => floats.push(*f),
+                            _ => return Ok(FlexType::Undefined),
+                        }
+                    }
+                    Ok(FlexType::Vector(Arc::from(floats)))
+                }
+                _ => Ok(FlexType::Undefined),
+            }
+        }
+        FlexTypeEnum::List => {
+            let parsed = parse_flextype(val);
+            match &parsed {
+                FlexType::List(_) => Ok(parsed),
+                // Vector can be coerced to List. Prefer Integer for whole
+                // numbers to match C++ recursive_parse behavior.
+                FlexType::Vector(v) => {
+                    let items: Vec<FlexType> = v
+                        .iter()
+                        .map(|&f| {
+                            if f.fract() == 0.0
+                                && f >= i64::MIN as f64
+                                && f <= i64::MAX as f64
+                            {
+                                FlexType::Integer(f as i64)
+                            } else {
+                                FlexType::Float(f)
+                            }
+                        })
+                        .collect();
+                    Ok(FlexType::List(Arc::from(items)))
+                }
+                _ => Ok(FlexType::Undefined),
+            }
+        }
+        FlexTypeEnum::Dict => {
+            let parsed = parse_flextype(val);
+            if parsed.type_enum() == FlexTypeEnum::Dict {
                 Ok(parsed)
             } else {
                 Ok(FlexType::Undefined)
+            }
+        }
+        FlexTypeEnum::Undefined => {
+            // Per-value flexible parsing: auto-detect type for each cell.
+            // This matches C++ UNDEFINED column type behavior where each
+            // value is independently parsed via general_flexible_type_parse.
+            let parsed = parse_flextype(val);
+            // parse_flextype trims whitespace, so a whitespace-only string
+            // (e.g. "\n" after escape processing) returns Undefined. In CSV
+            // context, non-empty values should be preserved as String.
+            if matches!(parsed, FlexType::Undefined) {
+                Ok(FlexType::String(Arc::from(val)))
+            } else {
+                Ok(parsed)
             }
         }
         _ => Ok(FlexType::String(Arc::from(val))),

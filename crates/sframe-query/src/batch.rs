@@ -25,6 +25,9 @@ pub enum ColumnData {
     List(Vec<Option<Arc<[FlexType]>>>),
     Dict(Vec<Option<Arc<[(FlexType, FlexType)]>>>),
     DateTime(Vec<Option<FlexDateTime>>),
+    /// Mixed-type column for UNDEFINED/per-value-parsed data.
+    /// Uses `FlexType::Undefined` for null instead of `Option` wrapping.
+    Flexible(Vec<FlexType>),
 }
 
 /// Dispatch on ColumnData variant, binding the inner Vec to `$vec`.
@@ -39,6 +42,7 @@ macro_rules! with_column_data {
             ColumnData::List($vec) => $body,
             ColumnData::Dict($vec) => $body,
             ColumnData::DateTime($vec) => $body,
+            ColumnData::Flexible($vec) => $body,
         }
     };
 }
@@ -55,6 +59,7 @@ macro_rules! with_column_data_pair {
             (ColumnData::List($va), ColumnData::List($vb)) => $body,
             (ColumnData::Dict($va), ColumnData::Dict($vb)) => $body,
             (ColumnData::DateTime($va), ColumnData::DateTime($vb)) => $body,
+            (ColumnData::Flexible($va), ColumnData::Flexible($vb)) => $body,
             (a, b) => {
                 return Err(SFrameError::Type(format!(
                     "Column type mismatch: {:?} vs {:?}",
@@ -77,7 +82,7 @@ impl ColumnData {
             FlexTypeEnum::List => ColumnData::List(Vec::new()),
             FlexTypeEnum::Dict => ColumnData::Dict(Vec::new()),
             FlexTypeEnum::DateTime => ColumnData::DateTime(Vec::new()),
-            FlexTypeEnum::Undefined => ColumnData::Integer(Vec::new()),
+            FlexTypeEnum::Undefined => ColumnData::Flexible(Vec::new()),
         }
     }
 
@@ -100,6 +105,7 @@ impl ColumnData {
             ColumnData::List(_) => FlexTypeEnum::List,
             ColumnData::Dict(_) => FlexTypeEnum::Dict,
             ColumnData::DateTime(_) => FlexTypeEnum::DateTime,
+            ColumnData::Flexible(_) => FlexTypeEnum::Undefined,
         }
     }
 
@@ -120,6 +126,7 @@ impl ColumnData {
             (ColumnData::Dict(v), FlexType::Undefined) => v.push(None),
             (ColumnData::DateTime(v), FlexType::DateTime(dt)) => v.push(Some(dt.clone())),
             (ColumnData::DateTime(v), FlexType::Undefined) => v.push(None),
+            (ColumnData::Flexible(v), val) => v.push(val.clone()),
             (col, val) => {
                 return Err(SFrameError::Type(format!(
                     "Cannot push {:?} into {:?} column",
@@ -162,6 +169,7 @@ impl ColumnData {
                 Some(dt) => FlexType::DateTime(dt.clone()),
                 None => FlexType::Undefined,
             },
+            ColumnData::Flexible(v) => v[index].clone(),
         }
     }
 
@@ -496,5 +504,31 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.dtypes(), vec![FlexTypeEnum::Integer, FlexTypeEnum::String]);
+    }
+
+    #[test]
+    fn test_flexible_column_mixed_types() {
+        let dtypes = [FlexTypeEnum::Undefined];
+        let rows = vec![
+            vec![FlexType::Integer(42)],
+            vec![FlexType::String("hello".into())],
+            vec![FlexType::Float(3.14)],
+            vec![FlexType::Undefined],
+            vec![FlexType::Dict(Arc::from(
+                vec![(FlexType::String("k".into()), FlexType::Integer(1))].as_slice(),
+            ))],
+        ];
+
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(batch.dtypes(), vec![FlexTypeEnum::Undefined]);
+        assert_eq!(batch.column(0).get(0), FlexType::Integer(42));
+        assert_eq!(batch.column(0).get(1), FlexType::String("hello".into()));
+        assert_eq!(batch.column(0).get(2), FlexType::Float(3.14));
+        assert_eq!(batch.column(0).get(3), FlexType::Undefined);
+        match batch.column(0).get(4) {
+            FlexType::Dict(d) => assert_eq!(d.len(), 1),
+            other => panic!("Expected Dict, got {:?}", other),
+        }
     }
 }

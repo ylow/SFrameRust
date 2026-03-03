@@ -7,3 +7,6 @@ pub mod join;
 pub mod json;
 pub mod quantile_sketch;
 pub mod sort;
+
+#[cfg(test)]
+mod csv_compat_tests;

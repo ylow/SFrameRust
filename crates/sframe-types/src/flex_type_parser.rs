@@ -423,8 +423,10 @@ fn unescape_string(s: &str) -> String {
                                         }
                                     }
                                 }
-                                // Invalid/incomplete surrogate pair — output replacement char
-                                result.push('\u{FFFD}');
+                                // Invalid/incomplete surrogate pair — keep literal
+                                // \uXXXX (C++ parity: bad surrogates not decoded)
+                                result.push_str("\\u");
+                                result.push_str(&hex);
                             } else if let Some(c) = char::from_u32(cp) {
                                 result.push(c);
                             } else {
