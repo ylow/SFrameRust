@@ -272,68 +272,37 @@ fn grace_hash_join(
     Ok(Box::pin(stream::unfold(
         (left_partitions, right_partitions, on_owned, join_type, 0usize),
         |(left_parts, right_parts, on, jt, idx)| async move {
-            loop {
-                if idx >= left_parts.len() {
-                    return None;
-                }
-                let left_part = left_parts[idx].clone();
-                let right_part = right_parts[idx].clone();
-                let next_idx = idx + 1;
-
-                let result = match (left_part, right_part) {
-                    (Some(lp), Some(rp)) => in_memory_join(lp, rp, &on, jt),
-                    (Some(lp), None) => {
-                        // Left rows with no match on right
-                        match jt {
-                            JoinType::Left | JoinType::Full => {
-                                // Emit left rows with NULL-padded right columns
-                                // We need to know right non-key columns — use empty right
-                                in_memory_join(lp, SFrameRows::empty(&[]), &on, jt)
-                            }
-                            _ => {
-                                // Inner/Right: skip partitions with no right data
-                                return Some((
-                                    Ok(SFrameRows::empty(&[])),
-                                    (left_parts, right_parts, on, jt, next_idx),
-                                ));
-                            }
-                        }
-                    }
-                    (None, Some(rp)) => {
-                        // Right rows with no match on left
-                        match jt {
-                            JoinType::Right | JoinType::Full => {
-                                in_memory_join(SFrameRows::empty(&[]), rp, &on, jt)
-                            }
-                            _ => {
-                                return Some((
-                                    Ok(SFrameRows::empty(&[])),
-                                    (left_parts, right_parts, on, jt, next_idx),
-                                ));
-                            }
-                        }
-                    }
-                    (None, None) => {
-                        return Some((
-                            Ok(SFrameRows::empty(&[])),
-                            (left_parts, right_parts, on, jt, next_idx),
-                        ));
-                    }
-                };
-
-                match &result {
-                    Ok(batch) if batch.num_rows() == 0 => {
-                        // Skip empty results, advance to next partition
-                        return Some((
-                            result,
-                            (left_parts, right_parts, on, jt, next_idx),
-                        ));
-                    }
-                    _ => {
-                        return Some((result, (left_parts, right_parts, on, jt, next_idx)));
-                    }
-                }
+            if idx >= left_parts.len() {
+                return None;
             }
+            let left_part = left_parts[idx].clone();
+            let right_part = right_parts[idx].clone();
+            let next_idx = idx + 1;
+
+            let result = match (left_part, right_part) {
+                (Some(lp), Some(rp)) => in_memory_join(lp, rp, &on, jt),
+                (Some(lp), None) => {
+                    // Left rows with no match on right
+                    match jt {
+                        JoinType::Left | JoinType::Full => {
+                            in_memory_join(lp, SFrameRows::empty(&[]), &on, jt)
+                        }
+                        _ => Ok(SFrameRows::empty(&[])),
+                    }
+                }
+                (None, Some(rp)) => {
+                    // Right rows with no match on left
+                    match jt {
+                        JoinType::Right | JoinType::Full => {
+                            in_memory_join(SFrameRows::empty(&[]), rp, &on, jt)
+                        }
+                        _ => Ok(SFrameRows::empty(&[])),
+                    }
+                }
+                (None, None) => Ok(SFrameRows::empty(&[])),
+            };
+
+            Some((result, (left_parts, right_parts, on, jt, next_idx)))
         },
     )))
 }
