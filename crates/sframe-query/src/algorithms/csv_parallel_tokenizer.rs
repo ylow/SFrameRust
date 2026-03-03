@@ -7,6 +7,7 @@
 //! workers can classify newlines without scanning from the start of the buffer.
 
 use super::csv_tokenizer::CsvConfig;
+use rayon::prelude::*;
 use sframe_types::error::{Result, SFrameError};
 
 /// Compact bitset -- 1 bit per byte position in a CSV buffer.
@@ -845,6 +846,202 @@ pub(crate) fn split_fields_bytes(line: &[u8], config: &ByteConfig) -> Vec<String
     fields
 }
 
+// ---------------------------------------------------------------------------
+// Parallel tokenization orchestrator
+// ---------------------------------------------------------------------------
+
+/// Result of parallel tokenization: (rows, last_parsed_byte_offset).
+/// `rows` are in document order. `last_parsed` is the byte offset past
+/// the last fully-parsed line. Bytes [last_parsed..buffer.len()] are
+/// an incomplete line that should be carried forward to the next buffer.
+pub(crate) fn parallel_tokenize(
+    buffer: &[u8],
+    config: &ByteConfig,
+) -> (Vec<Vec<String>>, usize) {
+    parallel_tokenize_inner(buffer, config, false)
+}
+
+/// Like parallel_tokenize, but treats the buffer as the final chunk (EOF).
+/// Ensures the last line is parsed even without a trailing newline.
+pub(crate) fn parallel_tokenize_eof(
+    buffer: &[u8],
+    config: &ByteConfig,
+) -> (Vec<Vec<String>>, usize) {
+    parallel_tokenize_inner(buffer, config, true)
+}
+
+/// Shared implementation for `parallel_tokenize` and `parallel_tokenize_eof`.
+fn parallel_tokenize_inner(
+    buffer: &[u8],
+    config: &ByteConfig,
+    eof: bool,
+) -> (Vec<Vec<String>>, usize) {
+    let len = buffer.len();
+    if len == 0 {
+        return (Vec::new(), 0);
+    }
+
+    // 1. Build quote parity bitset.
+    let mut parity = find_true_newline_positions(buffer, config);
+
+    // 2. At EOF, clear the parity bit of the last byte so the last line
+    //    is always treated as complete (the parity check on the last byte
+    //    won't block parse_thread from consuming it).
+    if eof && len > 0 {
+        parity.clear_bit(len - 1);
+    }
+
+    // 3. Determine thread count.
+    let nthreads = rayon::current_num_threads().max(1);
+
+    // 4. Dispatch threads.
+    let thread_results: Vec<(Vec<Vec<String>>, usize)> = (0..nthreads)
+        .into_par_iter()
+        .map(|tid| parse_thread(buffer, &parity, config, tid, nthreads, eof))
+        .collect();
+
+    // 5. Merge results in thread order.
+    let mut all_rows = Vec::new();
+    let mut last_parsed: usize = 0;
+    for (rows, thread_last) in thread_results {
+        all_rows.extend(rows);
+        if thread_last > last_parsed {
+            last_parsed = thread_last;
+        }
+    }
+
+    (all_rows, last_parsed)
+}
+
+/// Per-thread tokenization worker. Ported from C++ `parse_thread()`.
+///
+/// Each thread is assigned a roughly equal byte range of the buffer, then
+/// scans forward to the nearest real newline (using the parity bitset) to
+/// find its actual start and end positions. It then tokenizes all complete
+/// lines within its range.
+fn parse_thread(
+    buffer: &[u8],
+    parity: &DenseBitset,
+    config: &ByteConfig,
+    thread_id: usize,
+    nthreads: usize,
+    eof: bool,
+) -> (Vec<Vec<String>>, usize) {
+    let len = buffer.len();
+    let step = len / nthreads;
+
+    // Chunk boundaries (before newline alignment).
+    let pstart = thread_id * step;
+    let pend = if thread_id == nthreads - 1 { len } else { (thread_id + 1) * step };
+
+    // --- Find start position ---
+    let start = if thread_id == 0 {
+        0
+    } else {
+        // For multi-char terminators, shift back by (term.len() - 1) so we
+        // don't miss a terminator that straddles the chunk boundary.
+        let search_from = if !config.is_regular_line_terminator && config.line_terminator.len() > 1 {
+            pstart.saturating_sub(config.line_terminator.len() - 1)
+        } else {
+            pstart
+        };
+        let (pos, found) = advance_past_newline_with_parity(buffer, search_from, pend, config, parity);
+        if !found {
+            // No real newline before pend — this thread has nothing to parse.
+            return (Vec::new(), 0);
+        }
+        pos
+    };
+
+    // --- Find end position ---
+    // Search up to `len` (not just pend) for the next real newline.
+    let end = if pend >= len {
+        // Last thread: end is the full buffer length.
+        len
+    } else {
+        let search_from = if !config.is_regular_line_terminator && config.line_terminator.len() > 1 {
+            pend.saturating_sub(config.line_terminator.len() - 1)
+        } else {
+            pend
+        };
+        let (pos, found) = advance_past_newline_with_parity(buffer, search_from, len, config, parity);
+        if found {
+            pos
+        } else {
+            // No newline found after pend — everything remaining is an incomplete
+            // line (unless EOF, in which case last thread claims it).
+            len
+        }
+    };
+
+    if start >= end {
+        return (Vec::new(), 0);
+    }
+
+    // --- Parse lines in [start..end) ---
+    let mut rows = Vec::new();
+    let mut pos = start;
+    let mut last_parsed = start;
+
+    while pos < end {
+        // Find the next real newline.
+        let (next_pos, found) = advance_past_newline_with_parity(buffer, pos, end, config, parity);
+        if found {
+            // Extract the line content (excluding the terminator).
+            let line_end = find_line_content_end(buffer, pos, next_pos, config);
+            let line = &buffer[pos..line_end];
+            if !is_empty_line(line) {
+                let fields = split_fields_bytes(line, config);
+                rows.push(fields);
+            }
+            last_parsed = next_pos;
+            pos = next_pos;
+        } else {
+            // No more newlines — remaining bytes are an incomplete line.
+            if eof && pos < end {
+                // At EOF, parse the last line even without terminator.
+                let line = &buffer[pos..end];
+                if !is_empty_line(line) {
+                    let fields = split_fields_bytes(line, config);
+                    rows.push(fields);
+                }
+                last_parsed = end;
+            }
+            break;
+        }
+    }
+
+    (rows, last_parsed)
+}
+
+/// Determine where the line content ends (before the line terminator).
+/// Given that `next_pos` is past the terminator, back up to find the
+/// actual content boundary.
+#[inline]
+fn find_line_content_end(buffer: &[u8], line_start: usize, after_term: usize, config: &ByteConfig) -> usize {
+    if config.is_regular_line_terminator {
+        // Standard terminators: \n, \r, \r\n.
+        // Back up past the terminator bytes.
+        let mut end = after_term;
+        if end > line_start && buffer[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end > line_start && buffer[end - 1] == b'\r' {
+            end -= 1;
+        }
+        end
+    } else {
+        // Custom terminator: the terminator is config.line_terminator.
+        after_term - config.line_terminator.len()
+    }
+}
+
+/// Check if a line is empty (only whitespace).
+#[inline]
+fn is_empty_line(line: &[u8]) -> bool {
+    line.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1555,119 @@ mod tests {
             ..Default::default()
         };
         assert_fields_match("xxx\t[1,2,3]\t[1,2,3]", &config);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel tokenization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parallel_tokenize_basic() {
+        let input = b"a,b,c\n1,2,3\n4,5,6\n7,8,9\n";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize(input, &bcfg);
+        assert_eq!(last_parsed, input.len());
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], vec!["a", "b", "c"]);
+        assert_eq!(rows[1], vec!["1", "2", "3"]);
+        assert_eq!(rows[2], vec!["4", "5", "6"]);
+        assert_eq!(rows[3], vec!["7", "8", "9"]);
+    }
+
+    #[test]
+    fn test_parallel_tokenize_multiline_quote() {
+        let input = b"a,b\n\"line1\nline2\",42\n3,4\n";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, _) = parallel_tokenize(input, &bcfg);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["a", "b"]);
+        assert_eq!(rows[1], vec!["line1\nline2", "42"]);
+        assert_eq!(rows[2], vec!["3", "4"]);
+    }
+
+    #[test]
+    fn test_parallel_tokenize_incomplete_line() {
+        // No trailing newline on last line -- non-EOF mode should NOT parse it
+        let input = b"a,b\n1,2\n3,4";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize(input, &bcfg);
+        assert_eq!(rows.len(), 2); // "a,b" and "1,2", but not "3,4"
+        assert_eq!(last_parsed, 8); // after "a,b\n1,2\n"
+    }
+
+    #[test]
+    fn test_parallel_tokenize_eof() {
+        // At EOF, the last line is included even without terminator
+        let input = b"a,b\n1,2\n3,4";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize_eof(input, &bcfg);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], vec!["3", "4"]);
+        assert_eq!(last_parsed, input.len());
+    }
+
+    #[test]
+    fn test_parallel_matches_sequential() {
+        // Compare parallel tokenizer output against sequential tokenizer
+        let input = "name,value\n\"hello, world\",42\nfoo,[1,2,3]\n\"multi\nline\",99\nbar,{a:1}\n";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+
+        // Sequential: tokenize returns (header, data_rows)
+        let (seq_header, seq_rows) = csv_tokenizer::tokenize(input, &config);
+
+        // Parallel: returns all rows together
+        let (par_rows, _) = parallel_tokenize_eof(input.as_bytes(), &bcfg);
+
+        // Combine sequential results for comparison
+        let mut expected = Vec::new();
+        if let Some(h) = seq_header {
+            expected.push(h);
+        }
+        expected.extend(seq_rows);
+        assert_eq!(par_rows, expected);
+    }
+
+    #[test]
+    fn test_parallel_large_buffer() {
+        // Generate enough data to exercise multiple rayon threads
+        let mut input = String::new();
+        input.push_str("id,value\n");
+        for i in 0..10_000 {
+            input.push_str(&format!("{},{}\n", i, i * 2));
+        }
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize(input.as_bytes(), &bcfg);
+        assert_eq!(last_parsed, input.len());
+        assert_eq!(rows.len(), 10_001); // header + 10000 data rows
+        assert_eq!(rows[0], vec!["id", "value"]);
+        assert_eq!(rows[1], vec!["0", "0"]);
+        assert_eq!(rows[10000], vec!["9999", "19998"]);
+    }
+
+    #[test]
+    fn test_parallel_crlf() {
+        let input = b"a,b\r\n1,2\r\n3,4\r\n";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize(input, &bcfg);
+        assert_eq!(last_parsed, input.len());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_parallel_empty_buffer() {
+        let input = b"";
+        let config = CsvConfig::default();
+        let bcfg = ByteConfig::from_config(&config).unwrap();
+        let (rows, last_parsed) = parallel_tokenize(input, &bcfg);
+        assert_eq!(rows.len(), 0);
+        assert_eq!(last_parsed, 0);
     }
 }
