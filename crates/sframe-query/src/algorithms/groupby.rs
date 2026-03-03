@@ -74,9 +74,9 @@ pub(crate) async fn groupby_with_config(
         let batch = batch_result?;
         for row_idx in 0..batch.num_rows() {
             // Extract group key
-            let key: Vec<FlexTypeKey> = key_columns
+            let key: Vec<FlexType> = key_columns
                 .iter()
-                .map(|&col| FlexTypeKey(batch.column(col).get(row_idx)))
+                .map(|&col| batch.column(col).get(row_idx))
                 .collect();
 
             // Hash the key to determine segment
@@ -137,8 +137,7 @@ pub(crate) async fn groupby_with_config(
         }
 
         // Fast path: no spills for this segment, finalize in-memory
-        for (key, mut aggs) in segment.groups.drain() {
-            let keys: Vec<FlexType> = key.into_iter().map(|k| k.0).collect();
+        for (keys, mut aggs) in segment.groups.drain() {
             let mut row_aggs = Vec::with_capacity(num_agg_specs);
             for agg in aggs.iter_mut() {
                 row_aggs.push(agg.finalize());
@@ -205,7 +204,7 @@ pub(crate) async fn groupby_with_config(
 
 /// Per-segment in-memory hash table.
 struct GroupBySegment {
-    groups: HashMap<Vec<FlexTypeKey>, Vec<Box<dyn Aggregator>>>,
+    groups: HashMap<Vec<FlexType>, Vec<Box<dyn Aggregator>>>,
 }
 
 /// Metadata for a single spilled chunk: which cache:// file and how many entries.
@@ -236,90 +235,12 @@ impl SpillState {
     }
 }
 
-/// Wrapper around FlexType to implement Hash + Eq for use as HashMap keys.
-#[derive(Clone, Debug)]
-pub(crate) struct FlexTypeKey(pub FlexType);
-
-impl PartialEq for FlexTypeKey {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (FlexType::Integer(a), FlexType::Integer(b)) => a == b,
-            (FlexType::Float(a), FlexType::Float(b)) => a.to_bits() == b.to_bits(),
-            (FlexType::String(a), FlexType::String(b)) => a == b,
-            (FlexType::Undefined, FlexType::Undefined) => true,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for FlexTypeKey {}
-
-impl Hash for FlexTypeKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(&self.0).hash(state);
-        match &self.0 {
-            FlexType::Integer(i) => i.hash(state),
-            FlexType::Float(f) => f.to_bits().hash(state),
-            FlexType::String(s) => s.hash(state),
-            FlexType::Undefined => {}
-            FlexType::Vector(v) => {
-                v.len().hash(state);
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
-            }
-            FlexType::List(l) => l.len().hash(state),
-            FlexType::Dict(d) => d.len().hash(state),
-            FlexType::DateTime(dt) => {
-                dt.posix_timestamp.hash(state);
-                dt.microsecond.hash(state);
-            }
-        }
-    }
-}
-
-/// Ordering for merge: compare by (hash, keys).
-impl PartialOrd for FlexTypeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FlexTypeKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let tag = |ft: &FlexType| -> u8 {
-            match ft {
-                FlexType::Undefined => 0,
-                FlexType::Integer(_) => 1,
-                FlexType::Float(_) => 2,
-                FlexType::String(_) => 3,
-                FlexType::Vector(_) => 4,
-                FlexType::List(_) => 5,
-                FlexType::Dict(_) => 6,
-                FlexType::DateTime(_) => 7,
-            }
-        };
-        let t1 = tag(&self.0);
-        let t2 = tag(&other.0);
-        if t1 != t2 {
-            return t1.cmp(&t2);
-        }
-        match (&self.0, &other.0) {
-            (FlexType::Integer(a), FlexType::Integer(b)) => a.cmp(b),
-            (FlexType::Float(a), FlexType::Float(b)) => a.to_bits().cmp(&b.to_bits()),
-            (FlexType::String(a), FlexType::String(b)) => a.cmp(b),
-            (FlexType::Undefined, FlexType::Undefined) => std::cmp::Ordering::Equal,
-            _ => format!("{:?}", self.0).cmp(&format!("{:?}", other.0)),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Spill / flush
 // ---------------------------------------------------------------------------
 
 /// Compute a u64 hash of a key vector.
-fn compute_key_hash(key: &[FlexTypeKey]) -> u64 {
+fn compute_key_hash(key: &[FlexType]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for k in key {
         k.hash(&mut hasher);
@@ -329,12 +250,12 @@ fn compute_key_hash(key: &[FlexTypeKey]) -> u64 {
 
 /// Flush a segment's in-memory groups to a new cache:// spill file.
 fn flush_segment(
-    groups: &mut HashMap<Vec<FlexTypeKey>, Vec<Box<dyn Aggregator>>>,
+    groups: &mut HashMap<Vec<FlexType>, Vec<Box<dyn Aggregator>>>,
     seg_id: usize,
     state: &mut SpillState,
 ) -> Result<()> {
     // Collect and sort entries by (hash, keys) for merge-friendly ordering
-    let mut entries: Vec<(u64, Vec<FlexTypeKey>, Vec<Box<dyn Aggregator>>)> = groups
+    let mut entries: Vec<(u64, Vec<FlexType>, Vec<Box<dyn Aggregator>>)> = groups
         .drain()
         .map(|(key, mut aggs)| {
             let h = compute_key_hash(&key);
@@ -345,7 +266,17 @@ fn flush_segment(
         })
         .collect();
 
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    entries.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            for (x, y) in a.1.iter().zip(b.1.iter()) {
+                let c = x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal);
+                if c != std::cmp::Ordering::Equal {
+                    return c;
+                }
+            }
+            std::cmp::Ordering::Equal
+        })
+    });
 
     let entry_count = entries.len() as u64;
 
@@ -356,7 +287,7 @@ fn flush_segment(
         for (hash, key, aggs) in &entries {
             write_u64(&mut writer, *hash)?;
             for k in key {
-                write_flex_type(&mut writer, &k.0)?;
+                write_flex_type(&mut writer, k)?;
             }
             for agg in aggs {
                 agg.save(&mut writer)?;
@@ -406,7 +337,7 @@ impl ChunkReader {
         let hash = read_u64(&mut self.reader)?;
         let mut keys = Vec::with_capacity(self.num_key_cols);
         for _ in 0..self.num_key_cols {
-            keys.push(FlexTypeKey(read_flex_type(&mut self.reader)?));
+            keys.push(read_flex_type(&mut self.reader)?);
         }
 
         let mut aggs: Vec<Box<dyn Aggregator>> = agg_specs
@@ -424,7 +355,7 @@ impl ChunkReader {
 /// Entry in the k-way merge heap.
 struct MergeEntry {
     hash: u64,
-    keys: Vec<FlexTypeKey>,
+    keys: Vec<FlexType>,
     aggs: Vec<Box<dyn Aggregator>>,
 }
 
@@ -455,7 +386,15 @@ impl Ord for HeapEntry {
             .entry
             .hash
             .cmp(&self.entry.hash)
-            .then_with(|| other.entry.keys.cmp(&self.entry.keys))
+            .then_with(|| {
+                for (a, b) in other.entry.keys.iter().zip(self.entry.keys.iter()) {
+                    let c = a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                    if c != std::cmp::Ordering::Equal {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            })
     }
 }
 
@@ -531,12 +470,11 @@ fn merge_segment_chunks(
         }
 
         // Finalize and emit
-        let keys: Vec<FlexType> = current_keys.into_iter().map(|k| k.0).collect();
         let mut row_aggs = Vec::with_capacity(agg_specs.len());
         for agg in combined_aggs.iter_mut() {
             row_aggs.push(agg.finalize());
         }
-        out_keys.push(keys);
+        out_keys.push(current_keys);
         out_aggs.push(row_aggs);
     }
 
