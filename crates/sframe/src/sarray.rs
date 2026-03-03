@@ -342,8 +342,7 @@ impl SArray {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for v in values {
-            let key = format!("{:?}", v);
-            if seen.insert(key) {
+            if seen.insert(v.clone()) {
                 result.push(v);
             }
         }
@@ -1793,5 +1792,21 @@ mod tests {
         let rolled_max = sa.rolling_max(1, 1, 1).unwrap();
         let max_vals = rolled_max.to_vec().unwrap();
         assert_eq!(max_vals[1], FlexType::Integer(5)); // max of [5, 1, 3]
+    }
+
+    #[test]
+    fn test_unique_with_floats() {
+        let values = vec![
+            FlexType::Float(1.0),
+            FlexType::Float(2.0),
+            FlexType::Float(1.0),
+            FlexType::Float(f64::NAN),
+            FlexType::Float(f64::NAN),
+        ];
+        let sa = SArray::from_vec(values, FlexTypeEnum::Float).unwrap();
+        let unique = sa.unique().unwrap();
+        let result = unique.to_vec().unwrap();
+        // Should have 3 unique values: 1.0, 2.0, NaN
+        assert_eq!(result.len(), 3);
     }
 }
