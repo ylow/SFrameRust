@@ -709,6 +709,7 @@ impl CsvStreamingParse {
     /// Pass 1: Infer schema by streaming the file.
     pub fn open(path: &str, options: &CsvOptions) -> Result<Self> {
         use csv_tokenizer::TokenizerState;
+        use rayon::prelude::*;
         use std::io::{BufRead, BufReader};
 
         let config = options_to_config(options);
@@ -739,8 +740,10 @@ impl CsvStreamingParse {
             let lines = csv_tokenizer::split_lines_streaming(chunk_str, &config, &mut tok_state);
             reader.consume(chunk_len);
 
-            for line in lines {
-                if csv_tokenizer::is_comment(&line, &config) {
+            // Filter non-data lines (sequential, cheap)
+            let mut data_lines: Vec<&str> = Vec::new();
+            for line in &lines {
+                if csv_tokenizer::is_comment(line, &config) {
                     continue;
                 }
                 if rows_skipped < config.skip_rows {
@@ -751,9 +754,9 @@ impl CsvStreamingParse {
                     continue;
                 }
 
-                let fields = csv_tokenizer::split_fields(&line, &config);
-
+                // Handle header (first data line)
                 if column_names.is_none() {
+                    let fields = csv_tokenizer::split_fields(line, &config);
                     if config.has_header {
                         column_names = Some(fields);
                     } else {
@@ -765,19 +768,35 @@ impl CsvStreamingParse {
                         infer_state = Some(state);
                         row_count += 1;
                     }
-                } else {
-                    let ncols = column_names.as_ref().unwrap().len();
-                    if infer_state.is_none() {
-                        infer_state = Some(TypeInferenceState::new(ncols));
-                    }
-                    if let Some(limit) = config.row_limit {
-                        if row_count >= limit {
-                            continue;
-                        }
-                    }
-                    infer_state.as_mut().unwrap().observe_row(&fields, &na_values);
-                    row_count += 1;
+                    continue;
                 }
+
+                if let Some(limit) = config.row_limit {
+                    if row_count >= limit {
+                        continue;
+                    }
+                }
+                data_lines.push(line);
+                row_count += 1;
+            }
+
+            if data_lines.is_empty() {
+                continue;
+            }
+
+            // Parallel split_fields for data lines
+            let fields_batch: Vec<Vec<String>> = data_lines
+                .par_iter()
+                .map(|line| csv_tokenizer::split_fields(line, &config))
+                .collect();
+
+            // Sequential inference (cheap — O(1) per cell)
+            let ncols = column_names.as_ref().unwrap().len();
+            if infer_state.is_none() {
+                infer_state = Some(TypeInferenceState::new(ncols));
+            }
+            for fields in &fields_batch {
+                infer_state.as_mut().unwrap().observe_row(fields, &na_values);
             }
         }
 
@@ -835,93 +854,173 @@ impl CsvStreamingParse {
     }
 
     /// Pass 2: Parse chunks in parallel, calling `consumer` for each chunk.
+    ///
+    /// Architecture: a background I/O thread reads 50MB chunks and tokenizes
+    /// them into lines. The main thread receives lines, splits fields + parses
+    /// in parallel via rayon, then calls `consumer` with column vectors.
+    /// This overlaps disk I/O with CPU processing (double-buffering).
     pub fn parse_chunks<F>(&self, mut consumer: F) -> Result<()>
     where
         F: FnMut(Vec<Vec<FlexType>>) -> Result<()>,
     {
-        use csv_tokenizer::TokenizerState;
-        use std::io::{BufRead, BufReader};
+        use rayon::prelude::*;
 
         let config = options_to_config(&self.options);
         let na_values: HashSet<String> = self.options.na_values.iter().cloned().collect();
+        let path = self.path.clone();
+        let has_header = self.options.has_header;
+        let skip_rows = self.options.skip_rows;
+        let row_limit = self.options.row_limit;
 
-        let file = std::fs::File::open(&self.path).map_err(SFrameError::Io)?;
-        let mut reader = BufReader::with_capacity(CSV_CHUNK_SIZE, file);
-        let mut tok_state = TokenizerState::default();
-        let mut header_consumed = !self.options.has_header;
-        let mut rows_skipped = 0usize;
-        let mut total_rows = 0usize;
+        let all_indices: Vec<usize>;
+        let col_indices: Vec<usize> = if let Some(ref out) = self.output_indices {
+            out.clone()
+        } else {
+            all_indices = (0..self.col_types_full.len()).collect();
+            all_indices
+        };
 
-        loop {
-            let buf = reader.fill_buf().map_err(SFrameError::Io)?;
-            if buf.is_empty() {
-                break;
-            }
-            let chunk_len = buf.len();
-            let chunk_str = std::str::from_utf8(buf)
-                .map_err(|e| SFrameError::Format(format!("Non-UTF-8 CSV: {}", e)))?;
+        // Background I/O thread: reads file, tokenizes into lines, sends
+        // batches of owned line strings through a bounded channel.
+        // Capacity=2 so at most 2 chunks of lines are buffered ahead.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<String>>>(2);
+        let io_config = config.clone();
 
-            let lines = csv_tokenizer::split_lines_streaming(chunk_str, &config, &mut tok_state);
-            reader.consume(chunk_len);
+        std::thread::spawn(move || {
+            use csv_tokenizer::TokenizerState;
+            use std::io::{BufRead, BufReader};
 
-            let mut data_rows: Vec<Vec<String>> = Vec::new();
-
-            for line in lines {
-                if csv_tokenizer::is_comment(&line, &config) {
-                    continue;
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(Err(SFrameError::Io(e)));
+                    return;
                 }
-                if rows_skipped < config.skip_rows {
-                    rows_skipped += 1;
-                    continue;
+            };
+            let mut reader = BufReader::with_capacity(CSV_CHUNK_SIZE, file);
+            let mut tok_state = TokenizerState::default();
+            let mut header_consumed = !has_header;
+            let mut rows_skipped = 0usize;
+            let mut total_rows = 0usize;
+
+            loop {
+                let buf = match reader.fill_buf() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(SFrameError::Io(e)));
+                        return;
+                    }
+                };
+                if buf.is_empty() {
+                    break;
                 }
-                if !header_consumed {
-                    header_consumed = true;
-                    continue;
+                let chunk_len = buf.len();
+                let chunk_str = match std::str::from_utf8(buf) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(Err(SFrameError::Format(format!(
+                            "Non-UTF-8 CSV: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
+
+                let lines = csv_tokenizer::split_lines_streaming(
+                    chunk_str,
+                    &io_config,
+                    &mut tok_state,
+                );
+                reader.consume(chunk_len);
+
+                // Filter non-data lines (cheap)
+                let mut data_lines: Vec<String> = Vec::with_capacity(lines.len());
+                let mut hit_limit = false;
+                for line in lines {
+                    if csv_tokenizer::is_comment(&line, &io_config) {
+                        continue;
+                    }
+                    if rows_skipped < skip_rows {
+                        rows_skipped += 1;
+                        continue;
+                    }
+                    if !header_consumed {
+                        header_consumed = true;
+                        continue;
+                    }
+                    if line.is_empty() || line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(limit) = row_limit {
+                        if total_rows >= limit {
+                            hit_limit = true;
+                            break;
+                        }
+                    }
+                    data_lines.push(line);
+                    total_rows += 1;
                 }
-                if line.is_empty() || line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(limit) = config.row_limit {
-                    if total_rows >= limit {
-                        break;
+
+                if !data_lines.is_empty() {
+                    if tx.send(Ok(data_lines)).is_err() {
+                        return; // consumer dropped
                     }
                 }
-                let fields = csv_tokenizer::split_fields(&line, &config);
-                data_rows.push(fields);
-                total_rows += 1;
-            }
-
-            if !data_rows.is_empty() {
-                let col_vecs = parse_rows_slice_parallel(
-                    &data_rows,
-                    &self.col_types_full,
-                    &na_values,
-                    self.output_indices.as_deref(),
-                )?;
-                consumer(col_vecs)?;
-            }
-        }
-
-        // Handle final partial line
-        if !tok_state.partial_line.is_empty() && header_consumed {
-            let line = std::mem::take(&mut tok_state.partial_line);
-            if !line.trim().is_empty() && !csv_tokenizer::is_comment(&line, &config) {
-                let fields = csv_tokenizer::split_fields(&line, &config);
-                let can_emit = self
-                    .options
-                    .row_limit
-                    .map(|l| total_rows < l)
-                    .unwrap_or(true);
-                if can_emit {
-                    let col_vecs = parse_rows_slice_parallel(
-                        &[fields],
-                        &self.col_types_full,
-                        &na_values,
-                        self.output_indices.as_deref(),
-                    )?;
-                    consumer(col_vecs)?;
+                if hit_limit {
+                    break;
                 }
             }
+
+            // Flush partial last line
+            if !tok_state.partial_line.is_empty() && header_consumed {
+                let line = tok_state.partial_line;
+                if !line.trim().is_empty() && !csv_tokenizer::is_comment(&line, &io_config) {
+                    let can_emit = row_limit.map(|l| total_rows < l).unwrap_or(true);
+                    if can_emit {
+                        let _ = tx.send(Ok(vec![line]));
+                    }
+                }
+            }
+            // tx drops here, signaling end-of-stream
+        });
+
+        // Main thread: receive line batches, parallel tokenize + parse via rayon
+        let col_types = &self.col_types_full;
+        let n_out = col_indices.len();
+
+        for msg in rx {
+            let data_lines = msg?;
+
+            // Parallel: split_fields + parse_cell per line
+            let row_results: Vec<Result<Vec<FlexType>>> = data_lines
+                .par_iter()
+                .map(|line| {
+                    let fields = csv_tokenizer::split_fields(line, &config);
+                    let mut row = Vec::with_capacity(n_out);
+                    for &src_col in &col_indices {
+                        let val_str = if src_col < fields.len() {
+                            &fields[src_col]
+                        } else {
+                            ""
+                        };
+                        row.push(parse_cell(val_str, col_types[src_col], &na_values)?);
+                    }
+                    Ok(row)
+                })
+                .collect();
+
+            // Transpose row-major → column-major
+            let mut col_vecs: Vec<Vec<FlexType>> = (0..n_out)
+                .map(|_| Vec::with_capacity(row_results.len()))
+                .collect();
+            for row_result in row_results {
+                let row = row_result?;
+                for (i, val) in row.into_iter().enumerate() {
+                    col_vecs[i].push(val);
+                }
+            }
+
+            consumer(col_vecs)?;
         }
 
         Ok(())
