@@ -565,4 +565,100 @@ mod tests {
         assert!(FlexType::Integer(999) < FlexType::String(Arc::from("a")));
         assert!(FlexType::Float(999.0) < FlexType::String(Arc::from("a")));
     }
+
+    // === Hash + Eq tests ===
+
+    #[test]
+    fn test_flextype_hash_eq_integers() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::Integer(42));
+        assert!(set.contains(&FlexType::Integer(42)));
+        assert!(!set.contains(&FlexType::Integer(43)));
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_floats() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::Float(1.5));
+        assert!(set.contains(&FlexType::Float(1.5)));
+        // NaN == NaN for groupby/join semantics
+        set.insert(FlexType::Float(f64::NAN));
+        assert!(set.contains(&FlexType::Float(f64::NAN)));
+        // -0.0 and 0.0 are distinct via to_bits()
+        set.insert(FlexType::Float(0.0));
+        set.insert(FlexType::Float(-0.0));
+        assert_eq!(set.len(), 4); // 1.5, NaN, 0.0, -0.0
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_strings() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::String(Arc::from("hello")));
+        assert!(set.contains(&FlexType::String(Arc::from("hello"))));
+        assert!(!set.contains(&FlexType::String(Arc::from("world"))));
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_undefined() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::Undefined);
+        assert!(set.contains(&FlexType::Undefined));
+        set.insert(FlexType::Undefined);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_vectors() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::Vector(Arc::from(vec![1.0, 2.0].as_slice())));
+        assert!(set.contains(&FlexType::Vector(Arc::from(vec![1.0, 2.0].as_slice()))));
+        assert!(!set.contains(&FlexType::Vector(Arc::from(vec![1.0, 3.0].as_slice()))));
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_datetime() {
+        use std::collections::HashSet;
+        let dt1 = FlexType::DateTime(FlexDateTime {
+            posix_timestamp: 1000,
+            tz_offset_quarter_hours: 0,
+            microsecond: 500,
+        });
+        let dt2 = FlexType::DateTime(FlexDateTime {
+            posix_timestamp: 1000,
+            tz_offset_quarter_hours: 0,
+            microsecond: 500,
+        });
+        let mut set = HashSet::new();
+        set.insert(dt1);
+        assert!(set.contains(&dt2));
+    }
+
+    #[test]
+    fn test_flextype_hash_eq_cross_type_not_equal() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FlexType::Integer(1));
+        // Integer(1) and Float(1.0) should NOT be equal (different types)
+        assert!(!set.contains(&FlexType::Float(1.0)));
+    }
+
+    #[test]
+    fn test_flextype_eq_nan_consistency() {
+        // Hash+Eq contract: if a == b, then hash(a) == hash(b)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let a = FlexType::Float(f64::NAN);
+        let b = FlexType::Float(f64::NAN);
+        assert_eq!(a, b);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
 }
