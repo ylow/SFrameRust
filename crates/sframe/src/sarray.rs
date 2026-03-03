@@ -336,13 +336,50 @@ impl SArray {
         SArray::from_vec(values, self.dtype)
     }
 
-    /// Deduplicated values (preserves first occurrence order).
+    /// Deduplicated values.
+    ///
+    /// For small arrays, uses an in-memory HashSet (preserves first-occurrence order).
+    /// For large arrays, uses sort + streaming dedup (returns sorted order).
     pub fn unique(&self) -> Result<SArray> {
+        let estimated_size = self.estimate_unique_size();
+        let budget = sframe_config::global().sort_memory_budget;
+
+        if estimated_size <= budget {
+            self.unique_in_memory()
+        } else {
+            self.unique_via_sort()
+        }
+    }
+
+    fn estimate_unique_size(&self) -> usize {
+        let num_rows = self.len().unwrap_or(0) as usize;
+        let per_elem: usize = match self.dtype {
+            FlexTypeEnum::Integer | FlexTypeEnum::Float => 9,
+            FlexTypeEnum::String => 32,
+            _ => 64,
+        };
+        num_rows * per_elem
+    }
+
+    fn unique_in_memory(&self) -> Result<SArray> {
         let values = self.to_vec()?;
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for v in values {
             if seen.insert(v.clone()) {
+                result.push(v);
+            }
+        }
+        SArray::from_vec(result, self.dtype)
+    }
+
+    fn unique_via_sort(&self) -> Result<SArray> {
+        // Sort the array, then do a streaming dedup pass
+        let sorted = self.sort(true)?;
+        let values = sorted.to_vec()?;
+        let mut result = Vec::new();
+        for v in values {
+            if result.last() != Some(&v) {
                 result.push(v);
             }
         }
