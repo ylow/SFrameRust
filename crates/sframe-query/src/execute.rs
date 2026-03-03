@@ -159,26 +159,22 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     }
 }
 
-/// State for lazy segment-by-segment source reading.
-struct LazySourceState {
-    vfs: Arc<dyn VirtualFileSystem>,
-    segment_paths: Vec<String>,
+/// State for segment-prefetching source reading.
+struct PrefetchSourceState {
+    rx: std::sync::mpsc::Receiver<Result<Vec<Vec<FlexType>>>>,
     dtypes: Vec<FlexTypeEnum>,
     batch_size: usize,
-    // Current position
-    segment_idx: usize,
-    // Column data for the current segment (column-major)
     seg_data: Option<Vec<Vec<FlexType>>>,
     row_offset: usize,
 }
 
-/// Compile an SFrame source: lazily reads one segment at a time.
+/// Compile an SFrame source with segment prefetching.
 ///
-/// Memory usage is O(one segment) instead of O(all segments). Each segment
-/// is loaded on demand and dropped before the next segment is read.
+/// A background thread reads segments ahead into a bounded channel. The
+/// stream consumer pulls from the channel and slices segments into batches.
+/// Memory usage is O(prefetch_count * segment_size).
 ///
-/// For `cache://` paths, reads go through the global CacheFs VFS so that
-/// in-memory cached segments are served without disk I/O.
+/// For `cache://` paths, reads go through the global CacheFs VFS.
 fn compile_sframe_source(
     path: &str,
     column_types: &[FlexTypeEnum],
@@ -194,6 +190,7 @@ fn compile_sframe_source(
     let reader = SFrameReader::open_with_fs(&*vfs, path)?;
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
     let batch_size = sframe_config::global().source_batch_size;
+    let n_prefetch = sframe_config::global().source_prefetch_segments.max(1);
 
     // Collect segment file paths
     let segment_paths: Vec<String> = reader
@@ -203,19 +200,32 @@ fn compile_sframe_source(
         .map(|f| format!("{}/{}", path, f))
         .collect();
 
-    let state = LazySourceState {
-        vfs,
-        segment_paths,
+    // Bounded channel: background thread reads up to n_prefetch segments ahead
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<Result<Vec<Vec<FlexType>>>>(n_prefetch);
+    let dtypes_bg = dtypes.clone();
+    let vfs_bg = vfs.clone();
+
+    std::thread::spawn(move || {
+        for seg_path in segment_paths {
+            let result = read_segment_independently(&*vfs_bg, &seg_path, &dtypes_bg);
+            if tx.send(result).is_err() {
+                break; // receiver dropped
+            }
+        }
+        // tx dropped here, rx.recv() returns Err when channel empty
+    });
+
+    let state = PrefetchSourceState {
+        rx,
         dtypes,
         batch_size,
-        segment_idx: 0,
         seg_data: None,
         row_offset: 0,
     };
 
     Ok(Box::pin(stream::unfold(state, |mut state| async move {
         loop {
-            // If we have segment data, emit next batch from it
             if let Some(ref data) = state.seg_data {
                 let seg_rows = if data.is_empty() { 0 } else { data[0].len() };
                 if state.row_offset < seg_rows {
@@ -229,25 +239,20 @@ fn compile_sframe_source(
                     state.row_offset = end;
                     return Some((batch, state));
                 }
-                // Segment exhausted — drop its data
                 state.seg_data = None;
                 state.row_offset = 0;
             }
 
-            // Load next segment
-            if state.segment_idx >= state.segment_paths.len() {
-                return None; // All segments done
-            }
-            let seg_path = state.segment_paths[state.segment_idx].clone();
-            state.segment_idx += 1;
-            match read_segment_independently(&*state.vfs, &seg_path, &state.dtypes) {
-                Ok(data) => {
-                    if data.is_empty() || data[0].is_empty() {
+            // Get next segment from prefetch channel
+            match state.rx.recv() {
+                Err(_) => return None, // channel closed, all segments done
+                Ok(Ok(data)) => {
+                    if data.is_empty() || data.first().map(|c| c.is_empty()).unwrap_or(true) {
                         continue;
                     }
                     state.seg_data = Some(data);
                 }
-                Err(e) => return Some((Err(e), state)),
+                Ok(Err(e)) => return Some((Err(e), state)),
             }
         }
     })))
@@ -312,18 +317,38 @@ fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchStream> {
     Ok(Box::pin(stream::iter(batches)))
 }
 
+/// Threshold for intra-batch rayon parallelism.
+const PARALLEL_BATCH_THRESHOLD: usize = 1000;
+
 /// Apply a unary transform: append a new column from transforming an input column.
 fn apply_transform(
     batch: &SFrameRows,
     input_column: usize,
-    func: &dyn Fn(&FlexType) -> FlexType,
+    func: &(dyn Fn(&FlexType) -> FlexType + Send + Sync),
     output_type: FlexTypeEnum,
 ) -> Result<SFrameRows> {
+    let n = batch.num_rows();
+    let results: Vec<FlexType> = if n >= PARALLEL_BATCH_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let val = batch.column(input_column).get(i);
+                func(&val)
+            })
+            .collect()
+    } else {
+        (0..n)
+            .map(|i| {
+                let val = batch.column(input_column).get(i);
+                func(&val)
+            })
+            .collect()
+    };
+
     let mut new_col = ColumnData::empty(output_type);
-    for i in 0..batch.num_rows() {
-        let val = batch.column(input_column).get(i);
-        let result = func(&val);
-        new_col.push(&result)?;
+    for val in &results {
+        new_col.push(val)?;
     }
 
     let mut columns: Vec<ColumnData> = batch.columns().to_vec();
@@ -336,15 +361,33 @@ fn apply_binary_transform(
     batch: &SFrameRows,
     left_col: usize,
     right_col: usize,
-    func: &dyn Fn(&FlexType, &FlexType) -> FlexType,
+    func: &(dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync),
     output_type: FlexTypeEnum,
 ) -> Result<SFrameRows> {
+    let n = batch.num_rows();
+    let results: Vec<FlexType> = if n >= PARALLEL_BATCH_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let left = batch.column(left_col).get(i);
+                let right = batch.column(right_col).get(i);
+                func(&left, &right)
+            })
+            .collect()
+    } else {
+        (0..n)
+            .map(|i| {
+                let left = batch.column(left_col).get(i);
+                let right = batch.column(right_col).get(i);
+                func(&left, &right)
+            })
+            .collect()
+    };
+
     let mut new_col = ColumnData::empty(output_type);
-    for i in 0..batch.num_rows() {
-        let left = batch.column(left_col).get(i);
-        let right = batch.column(right_col).get(i);
-        let result = func(&left, &right);
-        new_col.push(&result)?;
+    for val in &results {
+        new_col.push(val)?;
     }
 
     let mut columns: Vec<ColumnData> = batch.columns().to_vec();
@@ -355,17 +398,34 @@ fn apply_binary_transform(
 /// Apply a generalized transform: replace all columns with transform output.
 fn apply_generalized_transform(
     batch: &SFrameRows,
-    func: &dyn Fn(&[FlexType]) -> Vec<FlexType>,
+    func: &(dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync),
     output_types: &[FlexTypeEnum],
 ) -> Result<SFrameRows> {
+    let n = batch.num_rows();
+    let all_results: Vec<Vec<FlexType>> = if n >= PARALLEL_BATCH_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let row: Vec<FlexType> = batch.row(i);
+                func(&row)
+            })
+            .collect()
+    } else {
+        (0..n)
+            .map(|i| {
+                let row: Vec<FlexType> = batch.row(i);
+                func(&row)
+            })
+            .collect()
+    };
+
     let mut columns: Vec<ColumnData> = output_types
         .iter()
         .map(|&dt| ColumnData::empty(dt))
         .collect();
 
-    for i in 0..batch.num_rows() {
-        let row: Vec<FlexType> = batch.row(i);
-        let results = func(&row);
+    for results in &all_results {
         if results.len() != output_types.len() {
             return Err(SFrameError::Format(format!(
                 "GeneralizedTransform produced {} values, expected {}",

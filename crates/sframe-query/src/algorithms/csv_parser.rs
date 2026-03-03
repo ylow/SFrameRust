@@ -475,6 +475,460 @@ pub fn read_csv_string(content: &str, options: &CsvOptions) -> Result<(Vec<Strin
 }
 
 // ---------------------------------------------------------------------------
+// Streaming / parallel API
+// ---------------------------------------------------------------------------
+
+/// Convert CsvOptions to the tokenizer's CsvConfig.
+pub fn options_to_config(options: &CsvOptions) -> CsvConfig {
+    CsvConfig {
+        delimiter: options.delimiter.clone(),
+        line_terminator: options.line_terminator.clone(),
+        escape_char: options.escape_char,
+        double_quote: options.double_quote,
+        skip_initial_space: options.skip_initial_space,
+        has_header: options.has_header,
+        comment_char: options.comment_char,
+        na_values: options.na_values.clone(),
+        skip_rows: options.skip_rows,
+        row_limit: options.row_limit,
+        output_columns: options.output_columns.clone(),
+        ..Default::default()
+    }
+}
+
+/// Incremental type inference state.
+///
+/// Uses the same elimination logic as `tokenize_and_infer`, but can be
+/// updated chunk-by-chunk so type inference doesn't require holding all
+/// raw rows in memory simultaneously.
+pub struct TypeInferenceState {
+    could_be_int: Vec<bool>,
+    could_be_float: Vec<bool>,
+    could_be_vector: Vec<bool>,
+    could_be_list: Vec<bool>,
+    could_be_dict: Vec<bool>,
+    num_cols: usize,
+}
+
+impl TypeInferenceState {
+    pub fn new(num_cols: usize) -> Self {
+        TypeInferenceState {
+            could_be_int: vec![true; num_cols],
+            could_be_float: vec![true; num_cols],
+            could_be_vector: vec![true; num_cols],
+            could_be_list: vec![true; num_cols],
+            could_be_dict: vec![true; num_cols],
+            num_cols,
+        }
+    }
+
+    /// Observe a single row of raw string values.
+    pub fn observe_row(&mut self, row: &[String], na_values: &HashSet<String>) {
+        for col in 0..self.num_cols {
+            if !self.could_be_int[col]
+                && !self.could_be_float[col]
+                && !self.could_be_vector[col]
+                && !self.could_be_list[col]
+                && !self.could_be_dict[col]
+            {
+                continue;
+            }
+            let val = if col < row.len() { &row[col] } else { "" };
+            if val.is_empty() || na_values.contains(val) {
+                continue;
+            }
+
+            let parsed = parse_flextype(val);
+            match parsed.type_enum() {
+                FlexTypeEnum::Integer => {
+                    self.could_be_vector[col] = false;
+                    self.could_be_list[col] = false;
+                    self.could_be_dict[col] = false;
+                }
+                FlexTypeEnum::Float => {
+                    self.could_be_int[col] = false;
+                    self.could_be_vector[col] = false;
+                    self.could_be_list[col] = false;
+                    self.could_be_dict[col] = false;
+                }
+                FlexTypeEnum::Vector => {
+                    self.could_be_int[col] = false;
+                    self.could_be_float[col] = false;
+                    self.could_be_list[col] = false;
+                    self.could_be_dict[col] = false;
+                }
+                FlexTypeEnum::List => {
+                    self.could_be_int[col] = false;
+                    self.could_be_float[col] = false;
+                    self.could_be_vector[col] = false;
+                    self.could_be_dict[col] = false;
+                }
+                FlexTypeEnum::Dict => {
+                    self.could_be_int[col] = false;
+                    self.could_be_float[col] = false;
+                    self.could_be_vector[col] = false;
+                    self.could_be_list[col] = false;
+                }
+                _ => {
+                    self.could_be_int[col] = false;
+                    self.could_be_float[col] = false;
+                    self.could_be_vector[col] = false;
+                    self.could_be_list[col] = false;
+                    self.could_be_dict[col] = false;
+                }
+            }
+        }
+    }
+
+    /// Finalize: resolve column types, applying type hints.
+    pub fn finalize(
+        &self,
+        hint_map: &std::collections::HashMap<&str, FlexTypeEnum>,
+        column_names: &[String],
+    ) -> Vec<FlexTypeEnum> {
+        (0..self.num_cols)
+            .map(|col| {
+                if let Some(&hint) = hint_map.get(column_names[col].as_str()) {
+                    return hint;
+                }
+                if self.could_be_int[col] {
+                    FlexTypeEnum::Integer
+                } else if self.could_be_float[col] {
+                    FlexTypeEnum::Float
+                } else if self.could_be_vector[col] {
+                    FlexTypeEnum::Vector
+                } else if self.could_be_list[col] {
+                    FlexTypeEnum::List
+                } else if self.could_be_dict[col] {
+                    FlexTypeEnum::Dict
+                } else {
+                    FlexTypeEnum::String
+                }
+            })
+            .collect()
+    }
+}
+
+/// Parse a slice of raw rows into column-oriented FlexType vectors, in parallel.
+///
+/// Divides rows into sub-chunks, processes each via rayon, then concatenates.
+pub fn parse_rows_slice_parallel(
+    rows: &[Vec<String>],
+    column_types: &[FlexTypeEnum],
+    na_values: &HashSet<String>,
+    output_indices: Option<&[usize]>,
+) -> Result<Vec<Vec<FlexType>>> {
+    use rayon::prelude::*;
+
+    let all_indices: Vec<usize>;
+    let col_indices: &[usize] = if let Some(out) = output_indices {
+        out
+    } else {
+        all_indices = (0..column_types.len()).collect();
+        &all_indices
+    };
+    let n_out = col_indices.len();
+
+    if rows.is_empty() {
+        return Ok(vec![Vec::new(); n_out]);
+    }
+
+    const SUB_CHUNK_SIZE: usize = 4096;
+
+    if rows.len() <= SUB_CHUNK_SIZE {
+        // Small: parse sequentially
+        return parse_rows_slice(rows, column_types, na_values, col_indices);
+    }
+
+    let num_sub = (rows.len() + SUB_CHUNK_SIZE - 1) / SUB_CHUNK_SIZE;
+    let sub_results: Vec<Result<Vec<Vec<FlexType>>>> = (0..num_sub)
+        .into_par_iter()
+        .map(|idx| {
+            let start = idx * SUB_CHUNK_SIZE;
+            let end = (start + SUB_CHUNK_SIZE).min(rows.len());
+            parse_rows_slice(&rows[start..end], column_types, na_values, col_indices)
+        })
+        .collect();
+
+    let mut combined: Vec<Vec<FlexType>> = (0..n_out)
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+    for result in sub_results {
+        let cols = result?;
+        for (i, col) in cols.into_iter().enumerate() {
+            combined[i].extend(col);
+        }
+    }
+
+    Ok(combined)
+}
+
+/// Sequential parse of a row slice into column-oriented vectors.
+fn parse_rows_slice(
+    rows: &[Vec<String>],
+    column_types: &[FlexTypeEnum],
+    na_values: &HashSet<String>,
+    col_indices: &[usize],
+) -> Result<Vec<Vec<FlexType>>> {
+    let mut col_vecs: Vec<Vec<FlexType>> = col_indices
+        .iter()
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+
+    for row in rows {
+        for (out_col, &src_col) in col_indices.iter().enumerate() {
+            let val_str = if src_col < row.len() { &row[src_col] } else { "" };
+            let val = parse_cell(val_str, column_types[src_col], na_values)?;
+            col_vecs[out_col].push(val);
+        }
+    }
+
+    Ok(col_vecs)
+}
+
+/// Two-pass streaming CSV parser.
+///
+/// Pass 1 (`open`): Reads the file in chunks, tokenizes with resumable state,
+/// and infers column types. O(chunk_size) memory.
+///
+/// Pass 2 (`parse_chunks`): Re-reads the file, tokenizes, and parses each
+/// chunk in parallel via rayon, calling `consumer` with column vectors.
+pub struct CsvStreamingParse {
+    pub column_names: Vec<String>,
+    pub column_types: Vec<FlexTypeEnum>,
+    path: String,
+    options: CsvOptions,
+    col_types_full: Vec<FlexTypeEnum>,
+    output_indices: Option<Vec<usize>>,
+}
+
+/// Default chunk size for streaming CSV (50 MB).
+const CSV_CHUNK_SIZE: usize = 50 * 1024 * 1024;
+
+impl CsvStreamingParse {
+    /// Pass 1: Infer schema by streaming the file.
+    pub fn open(path: &str, options: &CsvOptions) -> Result<Self> {
+        use csv_tokenizer::TokenizerState;
+        use std::io::{BufRead, BufReader};
+
+        let config = options_to_config(options);
+        let na_values: HashSet<String> = options.na_values.iter().cloned().collect();
+        let hint_map: std::collections::HashMap<&str, FlexTypeEnum> = options
+            .type_hints
+            .iter()
+            .map(|(n, t)| (n.as_str(), *t))
+            .collect();
+
+        let file = std::fs::File::open(path).map_err(SFrameError::Io)?;
+        let mut reader = BufReader::with_capacity(CSV_CHUNK_SIZE, file);
+        let mut tok_state = TokenizerState::default();
+        let mut column_names: Option<Vec<String>> = None;
+        let mut infer_state: Option<TypeInferenceState> = None;
+        let mut rows_skipped = 0usize;
+        let mut row_count = 0usize;
+
+        loop {
+            let buf = reader.fill_buf().map_err(SFrameError::Io)?;
+            if buf.is_empty() {
+                break;
+            }
+            let chunk_len = buf.len();
+            let chunk_str = std::str::from_utf8(buf)
+                .map_err(|e| SFrameError::Format(format!("Non-UTF-8 CSV: {}", e)))?;
+
+            let lines = csv_tokenizer::split_lines_streaming(chunk_str, &config, &mut tok_state);
+            reader.consume(chunk_len);
+
+            for line in lines {
+                if csv_tokenizer::is_comment(&line, &config) {
+                    continue;
+                }
+                if rows_skipped < config.skip_rows {
+                    rows_skipped += 1;
+                    continue;
+                }
+                if line.is_empty() || line.trim().is_empty() {
+                    continue;
+                }
+
+                let fields = csv_tokenizer::split_fields(&line, &config);
+
+                if column_names.is_none() {
+                    if config.has_header {
+                        column_names = Some(fields);
+                    } else {
+                        let n = fields.len();
+                        column_names =
+                            Some((0..n).map(|i| format!("X{}", i + 1)).collect());
+                        let mut state = TypeInferenceState::new(n);
+                        state.observe_row(&fields, &na_values);
+                        infer_state = Some(state);
+                        row_count += 1;
+                    }
+                } else {
+                    let ncols = column_names.as_ref().unwrap().len();
+                    if infer_state.is_none() {
+                        infer_state = Some(TypeInferenceState::new(ncols));
+                    }
+                    if let Some(limit) = config.row_limit {
+                        if row_count >= limit {
+                            continue;
+                        }
+                    }
+                    infer_state.as_mut().unwrap().observe_row(&fields, &na_values);
+                    row_count += 1;
+                }
+            }
+        }
+
+        // Handle any remaining partial line
+        if !tok_state.partial_line.is_empty() {
+            let line = std::mem::take(&mut tok_state.partial_line);
+            if !line.trim().is_empty() && !csv_tokenizer::is_comment(&line, &config) {
+                let fields = csv_tokenizer::split_fields(&line, &config);
+                if column_names.is_none() {
+                    if config.has_header {
+                        column_names = Some(fields);
+                    } else {
+                        let n = fields.len();
+                        column_names =
+                            Some((0..n).map(|i| format!("X{}", i + 1)).collect());
+                        let mut state = TypeInferenceState::new(n);
+                        state.observe_row(&fields, &na_values);
+                        infer_state = Some(state);
+                    }
+                } else if let Some(ref mut s) = infer_state {
+                    s.observe_row(&fields, &na_values);
+                }
+            }
+        }
+
+        let names = column_names.unwrap_or_default();
+        let ncols = names.len();
+        let infer = infer_state.unwrap_or_else(|| TypeInferenceState::new(ncols));
+        let col_types = infer.finalize(&hint_map, &names);
+
+        let output_indices = options.output_columns.as_ref().map(|out_cols| {
+            out_cols
+                .iter()
+                .filter_map(|name| names.iter().position(|n| n == name))
+                .collect::<Vec<usize>>()
+        });
+
+        let out_names: Vec<String> = output_indices
+            .as_ref()
+            .map(|idx| idx.iter().map(|&i| names[i].clone()).collect())
+            .unwrap_or_else(|| names.clone());
+        let out_types: Vec<FlexTypeEnum> = output_indices
+            .as_ref()
+            .map(|idx| idx.iter().map(|&i| col_types[i]).collect())
+            .unwrap_or_else(|| col_types.clone());
+
+        Ok(CsvStreamingParse {
+            column_names: out_names,
+            column_types: out_types,
+            path: path.to_string(),
+            options: options.clone(),
+            col_types_full: col_types,
+            output_indices,
+        })
+    }
+
+    /// Pass 2: Parse chunks in parallel, calling `consumer` for each chunk.
+    pub fn parse_chunks<F>(&self, mut consumer: F) -> Result<()>
+    where
+        F: FnMut(Vec<Vec<FlexType>>) -> Result<()>,
+    {
+        use csv_tokenizer::TokenizerState;
+        use std::io::{BufRead, BufReader};
+
+        let config = options_to_config(&self.options);
+        let na_values: HashSet<String> = self.options.na_values.iter().cloned().collect();
+
+        let file = std::fs::File::open(&self.path).map_err(SFrameError::Io)?;
+        let mut reader = BufReader::with_capacity(CSV_CHUNK_SIZE, file);
+        let mut tok_state = TokenizerState::default();
+        let mut header_consumed = !self.options.has_header;
+        let mut rows_skipped = 0usize;
+        let mut total_rows = 0usize;
+
+        loop {
+            let buf = reader.fill_buf().map_err(SFrameError::Io)?;
+            if buf.is_empty() {
+                break;
+            }
+            let chunk_len = buf.len();
+            let chunk_str = std::str::from_utf8(buf)
+                .map_err(|e| SFrameError::Format(format!("Non-UTF-8 CSV: {}", e)))?;
+
+            let lines = csv_tokenizer::split_lines_streaming(chunk_str, &config, &mut tok_state);
+            reader.consume(chunk_len);
+
+            let mut data_rows: Vec<Vec<String>> = Vec::new();
+
+            for line in lines {
+                if csv_tokenizer::is_comment(&line, &config) {
+                    continue;
+                }
+                if rows_skipped < config.skip_rows {
+                    rows_skipped += 1;
+                    continue;
+                }
+                if !header_consumed {
+                    header_consumed = true;
+                    continue;
+                }
+                if line.is_empty() || line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(limit) = config.row_limit {
+                    if total_rows >= limit {
+                        break;
+                    }
+                }
+                let fields = csv_tokenizer::split_fields(&line, &config);
+                data_rows.push(fields);
+                total_rows += 1;
+            }
+
+            if !data_rows.is_empty() {
+                let col_vecs = parse_rows_slice_parallel(
+                    &data_rows,
+                    &self.col_types_full,
+                    &na_values,
+                    self.output_indices.as_deref(),
+                )?;
+                consumer(col_vecs)?;
+            }
+        }
+
+        // Handle final partial line
+        if !tok_state.partial_line.is_empty() && header_consumed {
+            let line = std::mem::take(&mut tok_state.partial_line);
+            if !line.trim().is_empty() && !csv_tokenizer::is_comment(&line, &config) {
+                let fields = csv_tokenizer::split_fields(&line, &config);
+                let can_emit = self
+                    .options
+                    .row_limit
+                    .map(|l| total_rows < l)
+                    .unwrap_or(true);
+                if can_emit {
+                    let col_vecs = parse_rows_slice_parallel(
+                        &[fields],
+                        &self.col_types_full,
+                        &na_values,
+                        self.output_indices.as_deref(),
+                    )?;
+                    consumer(col_vecs)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 

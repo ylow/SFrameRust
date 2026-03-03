@@ -296,33 +296,28 @@ impl SFrame {
     /// conversion is per-chunk and parallelizable).
     pub fn from_csv(path: &str, options: Option<CsvOptions>) -> Result<Self> {
         let opts = options.unwrap_or_default();
-        let content = std::fs::read_to_string(path).map_err(SFrameError::Io)?;
-        let schema = csv_parser::tokenize_and_infer(&content, &opts)?;
 
-        // Resolve output names/types (respects output_columns subsetting)
-        let (out_names, out_types) = schema.output_names_types();
+        // Two-pass streaming: infer schema, then parse in parallel chunks
+        let streaming = csv_parser::CsvStreamingParse::open(path, &opts)?;
 
-        if schema.raw_rows.is_empty() {
-            let batch = SFrameRows::empty(&out_types);
+        if streaming.column_names.is_empty() {
+            let batch = SFrameRows::empty(&streaming.column_types);
             let plan = PlannerNode::materialized(batch);
-            let columns: Vec<SArray> = out_types
+            let columns: Vec<SArray> = streaming
+                .column_types
                 .iter()
                 .enumerate()
                 .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(0), i))
                 .collect();
-            return Ok(SFrame::new_with_columns(columns, out_names));
+            return Ok(SFrame::new_with_columns(columns, streaming.column_names));
         }
 
-        let mut builder = SFrameBuilder::anonymous(out_names, out_types)?;
+        let mut builder = SFrameBuilder::anonymous(
+            streaming.column_names.clone(),
+            streaming.column_types.clone(),
+        )?;
 
-        let total = schema.raw_rows.len();
-        let mut offset = 0;
-        while offset < total {
-            let end = (offset + DEFAULT_CHUNK_SIZE).min(total);
-            let col_vecs = csv_parser::parse_rows_range(&schema, offset, end)?;
-            builder.write_columns(&col_vecs)?;
-            offset = end;
-        }
+        streaming.parse_chunks(|col_vecs| builder.write_columns(&col_vecs))?;
 
         builder.finish()
     }
@@ -1165,16 +1160,14 @@ impl SFrame {
         let nrows = batch.num_rows();
         let ncols = batch.num_columns();
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<Vec<FlexType>> = std::collections::HashSet::new();
         let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
 
         for row in 0..nrows {
-            // Build a row key for deduplication
             let row_values: Vec<FlexType> = (0..ncols)
                 .map(|c| batch.column(c).get(row).clone())
                 .collect();
-            let key = format!("{:?}", row_values);
-            if seen.insert(key) {
+            if seen.insert(row_values.clone()) {
                 for (col, v) in row_values.into_iter().enumerate() {
                     col_vecs[col].push(v);
                 }
@@ -2134,5 +2127,23 @@ mod tests {
         // Left join: all left rows present
         let left_join = left.join(&right, "id", "id", JoinType::Left).unwrap();
         assert_eq!(left_join.num_rows().unwrap(), n as u64);
+    }
+
+    #[test]
+    fn test_unique_uses_proper_hashing() {
+        // Regression: ensure unique() uses FlexType Hash+Eq, not Debug string.
+        // Floats with different representations must be treated correctly.
+        let sf = SFrame::from_columns(vec![
+            ("a", SArray::from_vec(
+                vec![FlexType::Float(1.0), FlexType::Float(1.0), FlexType::Float(2.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+            ("b", SArray::from_vec(
+                vec![FlexType::Integer(10), FlexType::Integer(10), FlexType::Integer(20)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+        ]).unwrap();
+        let result = sf.unique().unwrap();
+        assert_eq!(result.num_rows().unwrap(), 2); // (1.0, 10) deduped, (2.0, 20) kept
     }
 }

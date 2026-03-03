@@ -13,7 +13,10 @@ use crate::planner::{LogicalOp, PlannerNode};
 pub fn optimize(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     let plan = fuse_projects(plan);
     let plan = eliminate_identity_projects(&plan);
+    let plan = eliminate_trivial_unions(&plan);
+    let plan = eliminate_empty_appends(&plan);
     let plan = pushdown_projects(&plan);
+    let plan = push_filter_through_transform(&plan);
     plan
 }
 
@@ -150,6 +153,129 @@ pub fn pushdown_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     plan
 }
 
+/// Flatten nested Union nodes and eliminate singleton Unions.
+///
+/// - `Union([x])` becomes `x`
+/// - `Union(a, Union(b, c))` becomes `Union(a, b, c)`
+pub fn eliminate_trivial_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let new_inputs: Vec<Arc<PlannerNode>> = plan
+        .inputs
+        .iter()
+        .map(|i| eliminate_trivial_unions(i))
+        .collect();
+    let plan = rebuild_with_inputs(plan, new_inputs);
+
+    if let LogicalOp::Union = &plan.op {
+        // Flatten nested Unions
+        let mut flattened: Vec<Arc<PlannerNode>> = Vec::new();
+        for input in &plan.inputs {
+            if let LogicalOp::Union = &input.op {
+                flattened.extend(input.inputs.iter().cloned());
+            } else {
+                flattened.push(input.clone());
+            }
+        }
+        // Singleton elimination
+        if flattened.len() == 1 {
+            return flattened.remove(0);
+        }
+        if flattened.len() != plan.inputs.len() {
+            return Arc::new(PlannerNode {
+                op: LogicalOp::Union,
+                inputs: flattened,
+            });
+        }
+    }
+
+    plan
+}
+
+/// Remove empty sources from Append nodes.
+///
+/// - `Append(X, empty)` becomes `X`
+/// - `Append(empty, X)` becomes `X`
+pub fn eliminate_empty_appends(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let new_inputs: Vec<Arc<PlannerNode>> = plan
+        .inputs
+        .iter()
+        .map(|i| eliminate_empty_appends(i))
+        .collect();
+    let plan = rebuild_with_inputs(plan, new_inputs);
+
+    if let LogicalOp::Append = &plan.op {
+        if plan.inputs.len() == 2 {
+            let left_empty = is_empty_source(&plan.inputs[0]);
+            let right_empty = is_empty_source(&plan.inputs[1]);
+            match (left_empty, right_empty) {
+                (true, false) => return plan.inputs[1].clone(),
+                (false, true) => return plan.inputs[0].clone(),
+                _ => {}
+            }
+        }
+    }
+
+    plan
+}
+
+fn is_empty_source(plan: &PlannerNode) -> bool {
+    match &plan.op {
+        LogicalOp::MaterializedSource { data } => data.num_rows() == 0,
+        _ => false,
+    }
+}
+
+/// Push Filter below Transform when the filter does not reference the
+/// transform's output column.
+///
+/// `Filter(col=c) -> Transform(output_at=N) -> input` becomes
+/// `Transform -> Filter(col=c) -> input` when `c != N`.
+pub fn push_filter_through_transform(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let new_inputs: Vec<Arc<PlannerNode>> = plan
+        .inputs
+        .iter()
+        .map(|i| push_filter_through_transform(i))
+        .collect();
+    let plan = rebuild_with_inputs(plan, new_inputs);
+
+    if let LogicalOp::Filter {
+        column: filter_col,
+        predicate,
+    } = &plan.op
+    {
+        if plan.inputs.len() == 1 {
+            if let LogicalOp::Transform {
+                input_column,
+                func,
+                output_type,
+            } = &plan.inputs[0].op
+            {
+                if plan.inputs[0].inputs.len() == 1 {
+                    let transform_input = &plan.inputs[0].inputs[0];
+                    if let Some(n) = count_output_columns(transform_input) {
+                        // Transform appends at index n
+                        if *filter_col != n {
+                            // Safe to push filter below transform
+                            let new_filter = PlannerNode::filter(
+                                transform_input.clone(),
+                                *filter_col,
+                                predicate.clone(),
+                            );
+                            return PlannerNode::transform(
+                                new_filter,
+                                *input_column,
+                                func.clone(),
+                                *output_type,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    plan
+}
+
 /// Count the number of output columns for a plan node (if known statically).
 fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
     match &plan.op {
@@ -165,7 +291,8 @@ fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
             plan.inputs.first().and_then(|i| count_output_columns(i)).map(|n| n + 1)
         }
         LogicalOp::GeneralizedTransform { output_types, .. } => {
-            plan.inputs.first().and_then(|i| count_output_columns(i)).map(|n| n + output_types.len())
+            // GeneralizedTransform replaces all input columns with output_types
+            Some(output_types.len())
         }
         LogicalOp::Filter { .. } => {
             // Filter doesn't change column count
@@ -328,5 +455,135 @@ mod tests {
 
         let optimized = optimize(&source);
         assert!(std::sync::Arc::ptr_eq(&source, &optimized));
+    }
+
+    #[test]
+    fn test_eliminate_singleton_union() {
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let union_node = PlannerNode::union(vec![source]);
+        let optimized = optimize(&union_node);
+        assert!(matches!(optimized.op, LogicalOp::SFrameSource { .. }));
+    }
+
+    #[test]
+    fn test_flatten_nested_union() {
+        let s1 = PlannerNode::sframe_source(
+            "t1.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let s2 = PlannerNode::sframe_source(
+            "t2.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let s3 = PlannerNode::sframe_source(
+            "t3.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let inner_union = PlannerNode::union(vec![s2, s3]);
+        let outer_union = PlannerNode::union(vec![s1, inner_union]);
+        let optimized = eliminate_trivial_unions(&outer_union);
+        if let LogicalOp::Union = &optimized.op {
+            assert_eq!(optimized.inputs.len(), 3);
+        } else {
+            panic!("Expected flattened Union");
+        }
+    }
+
+    #[test]
+    fn test_eliminate_empty_append_right() {
+        use crate::batch::SFrameRows;
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let empty = PlannerNode::materialized(SFrameRows::empty(&[FlexTypeEnum::Integer]));
+        let appended = PlannerNode::append(source, empty);
+        let optimized = eliminate_empty_appends(&appended);
+        assert!(matches!(optimized.op, LogicalOp::SFrameSource { .. }));
+    }
+
+    #[test]
+    fn test_eliminate_empty_append_left() {
+        use crate::batch::SFrameRows;
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let empty = PlannerNode::materialized(SFrameRows::empty(&[FlexTypeEnum::Integer]));
+        let appended = PlannerNode::append(empty, source);
+        let optimized = eliminate_empty_appends(&appended);
+        assert!(matches!(optimized.op, LogicalOp::SFrameSource { .. }));
+    }
+
+    #[test]
+    fn test_push_filter_through_transform() {
+        use sframe_types::flex_type::FlexType;
+        // Source(1 col) → Transform(input=0, output at col 1) → Filter(col=0)
+        // Filter on col 0 (original column), not on transform output (col 1).
+        // Should push filter below transform.
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let transformed = PlannerNode::transform(
+            source,
+            0,
+            Arc::new(|v: &FlexType| v.clone()),
+            FlexTypeEnum::Integer,
+        );
+        let filtered = PlannerNode::filter(
+            transformed,
+            0,
+            Arc::new(|v: &FlexType| matches!(v, FlexType::Integer(i) if *i > 0)),
+        );
+        let optimized = push_filter_through_transform(&filtered);
+        // After pushdown: Transform → Filter → Source
+        assert!(matches!(optimized.op, LogicalOp::Transform { .. }));
+        assert!(matches!(optimized.inputs[0].op, LogicalOp::Filter { .. }));
+    }
+
+    #[test]
+    fn test_no_push_filter_on_transform_output() {
+        use sframe_types::flex_type::FlexType;
+        // Source(1 col) → Transform(output at col 1) → Filter(col=1)
+        // Filter is on the transform's output column — should NOT push.
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            10,
+        );
+        let transformed = PlannerNode::transform(
+            source,
+            0,
+            Arc::new(|v: &FlexType| v.clone()),
+            FlexTypeEnum::Integer,
+        );
+        let filtered = PlannerNode::filter(
+            transformed,
+            1, // transform output column
+            Arc::new(|v: &FlexType| matches!(v, FlexType::Integer(i) if *i > 0)),
+        );
+        let optimized = push_filter_through_transform(&filtered);
+        // Should remain: Filter → Transform → Source
+        assert!(matches!(optimized.op, LogicalOp::Filter { .. }));
+        assert!(matches!(optimized.inputs[0].op, LogicalOp::Transform { .. }));
     }
 }

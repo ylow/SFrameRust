@@ -208,7 +208,7 @@ fn split_lines(content: &str, config: &CsvConfig) -> Vec<String> {
 }
 
 /// Check if a line is a comment.
-fn is_comment(line: &str, config: &CsvConfig) -> bool {
+pub fn is_comment(line: &str, config: &CsvConfig) -> bool {
     if let Some(comment_char) = config.comment_char {
         let trimmed = if config.skip_initial_space {
             line.trim_start()
@@ -414,7 +414,7 @@ fn has_colon_at_depth0(chars: &[char]) -> bool {
 ///   C++ IN_FIELD comment handling.
 /// - `skip_initial_space` skips spaces at the start of each field (including the
 ///   first), matching C++ START_FIELD behavior.
-fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
+pub fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = line.chars().collect();
@@ -701,6 +701,114 @@ fn unescape_csv_string(s: &str, escape_char: char) -> String {
     result
 }
 
+/// State for resumable/streaming line splitting.
+///
+/// Carry this across chunk boundaries so that a quoted field spanning
+/// two chunks is handled correctly.
+#[derive(Debug, Clone, Default)]
+pub struct TokenizerState {
+    /// Whether we are currently inside a quoted field.
+    pub in_quote: bool,
+    /// Whether the next character is escape-escaped.
+    pub escape_next: bool,
+    /// Partial line accumulated so far (not yet newline-terminated).
+    pub partial_line: String,
+}
+
+/// Split a byte chunk into complete lines, respecting quote state.
+///
+/// Returns the complete lines found in this chunk. Updates `state` with
+/// any partial line carried forward to the next chunk. The `state.partial_line`
+/// holds already-processed characters that are part of the current incomplete
+/// line — they are NOT re-scanned for quotes/escapes.
+///
+/// This is the streaming-friendly version of `split_lines`.
+pub fn split_lines_streaming(
+    chunk: &str,
+    config: &CsvConfig,
+    state: &mut TokenizerState,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    // Start with the partial line from the previous chunk (already processed)
+    let mut current = std::mem::take(&mut state.partial_line);
+    let chars: Vec<char> = chunk.chars().collect();
+    let mut i = 0;
+
+    let mut in_quote = state.in_quote;
+    let mut escape_next = state.escape_next;
+
+    let is_standard_terminator = config.line_terminator == "\n"
+        || config.line_terminator == "\r\n"
+        || config.line_terminator == "\r";
+
+    while i < chars.len() {
+        if escape_next {
+            current.push(chars[i]);
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        let ch = chars[i];
+
+        if ch == config.escape_char && in_quote {
+            current.push(ch);
+            escape_next = true;
+            i += 1;
+            continue;
+        }
+
+        if ch == config.quote_char {
+            current.push(ch);
+            if in_quote && config.double_quote && i + 1 < chars.len() && chars[i + 1] == config.quote_char {
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_quote {
+            if is_standard_terminator {
+                if ch == '\r' {
+                    lines.push(std::mem::take(&mut current));
+                    i += 1;
+                    if i < chars.len() && chars[i] == '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if ch == '\n' {
+                    lines.push(std::mem::take(&mut current));
+                    i += 1;
+                    continue;
+                }
+            } else {
+                let term_chars: Vec<char> = config.line_terminator.chars().collect();
+                if i + term_chars.len() <= chars.len()
+                    && chars[i..i + term_chars.len()] == term_chars[..]
+                {
+                    lines.push(std::mem::take(&mut current));
+                    i += term_chars.len();
+                    continue;
+                }
+            }
+        }
+
+        current.push(ch);
+        i += 1;
+    }
+
+    // Save state for next chunk
+    state.in_quote = in_quote;
+    state.escape_next = escape_next;
+    state.partial_line = current;
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +978,54 @@ mod tests {
         let (_, rows) = tokenize(csv, &config);
 
         assert_eq!(rows[0], vec!["test", "[1,[2,3],4]"]);
+    }
+
+    #[test]
+    fn test_streaming_matches_regular() {
+        let csv = "a,b,c\n1,2,3\n4,5,6\n7,8,9\n";
+        let config = CsvConfig::default();
+
+        // Regular split_lines
+        let regular = split_lines(csv, &config);
+
+        // Streaming: feed entire content as one chunk
+        let mut state = TokenizerState::default();
+        let mut streaming = split_lines_streaming(csv, &config, &mut state);
+        // Flush the partial line
+        if !state.partial_line.is_empty() {
+            streaming.push(std::mem::take(&mut state.partial_line));
+        }
+
+        assert_eq!(regular, streaming);
+    }
+
+    #[test]
+    fn test_streaming_across_chunks() {
+        let config = CsvConfig::default();
+        let mut state = TokenizerState::default();
+
+        // Split "a,b\n1,2\n3,4\n" into two chunks
+        let lines1 = split_lines_streaming("a,b\n1,", &config, &mut state);
+        assert_eq!(lines1, vec!["a,b"]);
+        assert_eq!(state.partial_line, "1,");
+
+        let lines2 = split_lines_streaming("2\n3,4\n", &config, &mut state);
+        assert_eq!(lines2, vec!["1,2", "3,4"]);
+        assert!(state.partial_line.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_quoted_field_across_chunks() {
+        let config = CsvConfig::default();
+        let mut state = TokenizerState::default();
+
+        // Quoted field "line1\nline2" split across chunks
+        let lines1 = split_lines_streaming("a,b\n\"line1\n", &config, &mut state);
+        assert_eq!(lines1, vec!["a,b"]);
+        assert!(state.in_quote); // still inside quoted field
+
+        let lines2 = split_lines_streaming("line2\",42\n", &config, &mut state);
+        assert_eq!(lines2, vec!["\"line1\nline2\",42"]);
+        assert!(!state.in_quote);
     }
 }

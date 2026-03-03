@@ -268,38 +268,48 @@ impl SArray {
     // === Internal helpers ===
 
     /// Binary operation between two SArrays.
-    /// Materializes the right-hand side and applies element-wise.
+    ///
+    /// Case A: If both arrays share the same underlying plan, uses
+    /// GeneralizedTransform for lazy streaming evaluation.
+    /// Case B: If plans differ, materializes both sides and computes eagerly.
     fn binary_op(
         &self,
         other: &SArray,
         func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
         _op_name: &str,
     ) -> Result<SArray> {
-        // Materialize the right-hand side
-        let rhs_values = other.to_vec()?;
-        let rhs = Arc::new(rhs_values);
-
         let output_type = infer_binary_output_type(self.dtype, other.dtype, &func);
 
-        // Build a transform that zips with the materialized right side
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let f = func.clone();
-        let rhs_clone = rhs.clone();
-        let cnt = counter.clone();
+        // Case A: same underlying plan — use GeneralizedTransform (lazy, streaming)
+        if Arc::ptr_eq(&self.plan, &other.plan) {
+            let l = self.column_index;
+            let r = other.column_index;
+            let f = func;
+            let plan = PlannerNode::generalized_transform(
+                self.plan.clone(),
+                Arc::new(move |row: &[FlexType]| vec![f(&row[l], &row[r])]),
+                vec![output_type],
+            );
+            return Ok(SArray {
+                plan,
+                dtype: output_type,
+                len: self.len,
+                column_index: 0,
+            });
+        }
 
-        let result = self.apply(
-            Arc::new(move |lhs_val| {
-                let idx = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if idx < rhs_clone.len() {
-                    f(lhs_val, &rhs_clone[idx])
-                } else {
-                    FlexType::Undefined
-                }
-            }),
-            output_type,
-        );
-
-        Ok(result)
+        // Case B: different plans — materialize both sides eagerly
+        let lhs = self.to_vec()?;
+        let rhs = other.to_vec()?;
+        if lhs.len() != rhs.len() {
+            return Err(SFrameError::Format(format!(
+                "SArray binary_op: length mismatch ({} vs {})",
+                lhs.len(),
+                rhs.len()
+            )));
+        }
+        let results: Vec<FlexType> = lhs.iter().zip(rhs.iter()).map(|(l, r)| func(l, r)).collect();
+        SArray::from_vec(results, output_type)
     }
 
     /// Comparison operation returning Integer 0/1 array.
@@ -1874,5 +1884,35 @@ mod tests {
         let result = unique.to_vec().unwrap();
         // Should have 3: 1, Undefined, 2
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_binary_op_reexecution() {
+        // Regression: calling to_vec() twice on a binary_op result must be identical.
+        let a = SArray::from_vec(
+            vec![FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let b = SArray::from_vec(
+            vec![FlexType::Integer(10), FlexType::Integer(20)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let c = a.add(&b).unwrap();
+        let v1 = c.to_vec().unwrap();
+        let v2 = c.to_vec().unwrap();
+        assert_eq!(v1, v2);
+        assert_eq!(v1, vec![FlexType::Integer(11), FlexType::Integer(22)]);
+    }
+
+    #[test]
+    fn test_binary_op_same_plan() {
+        // When both arrays share the same plan, should use GeneralizedTransform.
+        let a = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(5)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let doubled = a.add(&a).unwrap();
+        let v = doubled.to_vec().unwrap();
+        assert_eq!(v, vec![FlexType::Integer(6), FlexType::Integer(10)]);
     }
 }
