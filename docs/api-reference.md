@@ -312,7 +312,7 @@ Environment variables (read at process startup):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SFRAME_CACHE_CAPACITY` | 2 GiB | Total in-memory cache for CacheFs. |
-| `SFRAME_CACHE_CAPACITY_PER_FILE` | 128 MiB | Max single file size in memory cache. |
+| `SFRAME_CACHE_CAPACITY_PER_FILE` | 2 GiB | Max single file size in memory cache. |
 | `SFRAME_SORT_BUFFER_SIZE` | 256 MiB | Memory budget before external sort kicks in. |
 | `RAYON_NUM_THREADS` | CPU count | Number of worker threads for parallel execution. |
 

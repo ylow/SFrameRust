@@ -8,7 +8,7 @@
 //!
 //! All prefixed with `SFRAME_`:
 //! - `SFRAME_CACHE_CAPACITY`: CacheFs in-memory store limit (default 2G)
-//! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Max single file in cache (default 128M)
+//! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Max single file in cache (default 2G)
 //! - `SFRAME_SOURCE_BATCH_SIZE`: Rows per batch (default 4096)
 //! - `SFRAME_ROWS_PER_SEGMENT`: Max rows per segment (default 1000000)
 //! - `SFRAME_SORT_BUFFER_SIZE`: Sort memory budget (default 256M)
@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CACHE_CAPACITY: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-const DEFAULT_CACHE_CAPACITY_PER_FILE: usize = 128 * 1024 * 1024; // 128 MiB
+const DEFAULT_CACHE_CAPACITY_PER_FILE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Global configuration for the SFrame engine.
 ///

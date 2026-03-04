@@ -12,7 +12,7 @@
 //!
 //! Cache capacity is controlled by two globals in `sframe_config`:
 //! - `SFRAME_CACHE_CAPACITY` — total in-memory budget (default 2 GiB)
-//! - `SFRAME_CACHE_CAPACITY_PER_FILE` — max per-file in-memory size (default 128 MiB)
+//! - `SFRAME_CACHE_CAPACITY_PER_FILE` — max per-file in-memory size (default 2 GiB)
 
 use std::collections::HashMap;
 use std::fs::{self, File};
