@@ -7,7 +7,7 @@ use futures::stream::{self, Stream};
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
-use sframe_storage::sframe_reader::SFrameReader;
+use sframe_storage::sframe_reader::SFrameMetadata;
 use sframe_storage::segment_reader::SegmentReader;
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -91,12 +91,12 @@ pub(super) fn compile_sframe_source(
     end_row: u64,
 ) -> Result<BatchStream> {
     let vfs = resolve_vfs(path);
-    let reader = SFrameReader::open_with_fs(&*vfs, path)?;
+    let meta = SFrameMetadata::open_with_fs(&*vfs, path)?;
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
     let batch_size = sframe_config::global().source_batch_size;
     let n_prefetch = sframe_config::global().source_prefetch_segments.max(1);
 
-    let segment_paths: Vec<String> = reader
+    let segment_paths: Vec<String> = meta
         .group_index
         .segment_files
         .iter()
@@ -104,7 +104,7 @@ pub(super) fn compile_sframe_source(
         .collect();
 
     // Get segment sizes from first column (all columns have same segment sizes).
-    let segment_sizes: Vec<u64> = reader
+    let segment_sizes: Vec<u64> = meta
         .group_index
         .columns[0]
         .segment_sizes
@@ -156,7 +156,7 @@ pub(super) fn compile_sframe_source_projected(
     column_indices: &[usize],
 ) -> Result<BatchStream> {
     let vfs = resolve_vfs(path);
-    let reader = SFrameReader::open_with_fs(&*vfs, path)?;
+    let meta = SFrameMetadata::open_with_fs(&*vfs, path)?;
     let projected_dtypes: Vec<FlexTypeEnum> =
         column_indices.iter().map(|&i| column_types[i]).collect();
     let all_col_types: Vec<FlexTypeEnum> = column_types.to_vec();
@@ -164,14 +164,14 @@ pub(super) fn compile_sframe_source_projected(
     let batch_size = sframe_config::global().source_batch_size;
     let n_prefetch = sframe_config::global().source_prefetch_segments.max(1);
 
-    let segment_paths: Vec<String> = reader
+    let segment_paths: Vec<String> = meta
         .group_index
         .segment_files
         .iter()
         .map(|f| format!("{}/{}", path, f))
         .collect();
 
-    let segment_sizes: Vec<u64> = reader
+    let segment_sizes: Vec<u64> = meta
         .group_index
         .columns[0]
         .segment_sizes
@@ -400,4 +400,42 @@ pub(super) fn read_segment_columns_projected(
         columns.push(seg_reader.read_column(col_idx)?);
     }
     Ok(columns)
+}
+
+/// Read projected columns for a global row range `[begin_row, end_row)`
+/// across potentially multiple segments.
+///
+/// Computes which segments overlap the range, reads each with block-level
+/// skipping for partial segments, and concatenates the results.
+pub(super) fn read_projected_row_range(
+    vfs: &dyn VirtualFileSystem,
+    segment_paths: &[String],
+    segment_sizes: &[u64],
+    column_types: &[FlexTypeEnum],
+    column_indices: &[usize],
+    begin_row: u64,
+    end_row: u64,
+) -> Result<Vec<Vec<FlexType>>> {
+    let slices = compute_segment_slices(segment_paths, segment_sizes, begin_row, end_row);
+    let num_projected = column_indices.len();
+    let expected_rows = (end_row - begin_row) as usize;
+    let mut result: Vec<Vec<FlexType>> = (0..num_projected)
+        .map(|_| Vec::with_capacity(expected_rows))
+        .collect();
+
+    for slice in slices {
+        let seg_columns = read_segment_columns_projected_row_range(
+            vfs,
+            &slice.segment_path,
+            column_types,
+            column_indices,
+            slice.local_begin,
+            slice.local_end,
+        )?;
+        for (i, col_data) in seg_columns.into_iter().enumerate() {
+            result[i].extend(col_data);
+        }
+    }
+
+    Ok(result)
 }

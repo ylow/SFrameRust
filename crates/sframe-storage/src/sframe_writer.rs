@@ -25,7 +25,9 @@ const MIN_ROWS_PER_BLOCK: usize = 8;
 const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
 
 /// Default number of rows per segment before auto-splitting.
-const DEFAULT_ROWS_PER_SEGMENT: u64 = 1_000_000;
+/// Set to u64::MAX so segments are 1:1 with writer threads; block-level
+/// flushing already bounds memory.
+const DEFAULT_ROWS_PER_SEGMENT: u64 = u64::MAX;
 
 /// No-op writer used as a placeholder during segment swaps.
 struct NullWriter;

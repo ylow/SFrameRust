@@ -12,6 +12,49 @@ use crate::dir_archive::DirArchive;
 use crate::index::{FrameIndex, GroupIndex};
 use crate::segment_reader::SegmentReader;
 
+/// Lightweight metadata from an SFrame (no segment files opened).
+pub struct SFrameMetadata {
+    pub frame_index: FrameIndex,
+    pub group_index: GroupIndex,
+}
+
+impl SFrameMetadata {
+    /// Open only the metadata (dir_archive.ini, frame_idx, sidx) from a directory path.
+    pub fn open(base_path: &str) -> Result<Self> {
+        let fs = LocalFileSystem;
+        Self::open_with_fs(&fs, base_path)
+    }
+
+    /// Open only the metadata using a specific VFS backend.
+    pub fn open_with_fs(fs: &dyn VirtualFileSystem, base_path: &str) -> Result<Self> {
+        let archive_path = format!("{}/dir_archive.ini", base_path);
+        let archive_content = fs.read_to_string(&archive_path)?;
+        let archive = DirArchive::parse(&archive_content)?;
+
+        if archive.contents != "sframe" {
+            return Err(SFrameError::Format(format!(
+                "Expected sframe contents, got '{}'",
+                archive.contents
+            )));
+        }
+
+        let data_prefix = archive.data_prefix()?;
+
+        let frame_idx_path = format!("{}/{}.frame_idx", base_path, data_prefix);
+        let frame_idx_content = fs.read_to_string(&frame_idx_path)?;
+        let frame_index = FrameIndex::parse(&frame_idx_content)?;
+
+        let sidx_path = format!("{}/{}.sidx", base_path, data_prefix);
+        let sidx_content = fs.read_to_string(&sidx_path)?;
+        let group_index = GroupIndex::parse(&sidx_content)?;
+
+        Ok(SFrameMetadata {
+            frame_index,
+            group_index,
+        })
+    }
+}
+
 /// A fully opened SFrame, ready to read column data.
 pub struct SFrameReader {
     pub frame_index: FrameIndex,
@@ -29,42 +72,19 @@ impl SFrameReader {
 
     /// Open an SFrame using a specific VFS backend.
     pub fn open_with_fs(fs: &dyn VirtualFileSystem, base_path: &str) -> Result<Self> {
-        // Read dir_archive.ini
-        let archive_path = format!("{}/dir_archive.ini", base_path);
-        let archive_content = fs.read_to_string(&archive_path)?;
-        let archive = DirArchive::parse(&archive_content)?;
-
-        if archive.contents != "sframe" {
-            return Err(SFrameError::Format(format!(
-                "Expected sframe contents, got '{}'",
-                archive.contents
-            )));
-        }
-
-        let data_prefix = archive.data_prefix()?;
-
-        // Read frame_idx
-        let frame_idx_path = format!("{}/{}.frame_idx", base_path, data_prefix);
-        let frame_idx_content = fs.read_to_string(&frame_idx_path)?;
-        let frame_index = FrameIndex::parse(&frame_idx_content)?;
-
-        // Read sidx
-        let sidx_path = format!("{}/{}.sidx", base_path, data_prefix);
-        let sidx_content = fs.read_to_string(&sidx_path)?;
-        let group_index = GroupIndex::parse(&sidx_content)?;
+        let meta = SFrameMetadata::open_with_fs(fs, base_path)?;
 
         // Collect column types
         let column_types: Vec<FlexTypeEnum> =
-            group_index.columns.iter().map(|c| c.dtype).collect();
+            meta.group_index.columns.iter().map(|c| c.dtype).collect();
 
         // Open segment files
-        let mut segment_readers = Vec::with_capacity(group_index.nsegments);
-        for seg_file in &group_index.segment_files {
+        let mut segment_readers = Vec::with_capacity(meta.group_index.nsegments);
+        for seg_file in &meta.group_index.segment_files {
             let seg_path = format!("{}/{}", base_path, seg_file);
             let file = fs.open_read(&seg_path)?;
             let file_size = file.size()?;
 
-            // Box the file as ReadSeek
             let reader = SegmentReader::open(
                 Box::new(file),
                 file_size,
@@ -74,8 +94,8 @@ impl SFrameReader {
         }
 
         Ok(SFrameReader {
-            frame_index,
-            group_index,
+            frame_index: meta.frame_index,
+            group_index: meta.group_index,
             segment_readers,
             base_path: base_path.to_string(),
         })

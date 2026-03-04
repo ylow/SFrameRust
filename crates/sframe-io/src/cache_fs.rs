@@ -117,6 +117,11 @@ impl CacheFs {
         })
     }
 
+    /// The root directory where on-disk spill files are stored.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Allocate a new unique path in this cache. The path is a `cache://N` URL.
     /// The file does not exist yet — call `open_write` to create it.
     pub fn alloc_path(&self) -> String {

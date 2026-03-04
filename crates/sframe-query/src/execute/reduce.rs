@@ -7,7 +7,7 @@ use futures::stream::StreamExt;
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
-use sframe_storage::sframe_reader::SFrameReader;
+use sframe_storage::sframe_reader::SFrameMetadata;
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
@@ -94,9 +94,10 @@ pub(super) fn try_extract_parallel_reduce_plan(node: &Arc<PlannerNode>) -> Optio
     None
 }
 
-/// Execute a parallel reduce over segments using rayon.
+/// Execute a parallel reduce by splitting rows across rayon workers.
 ///
-/// Each thread reads a segment (only projected columns), creates a local
+/// Divides the total row range into N equal slices (one per rayon thread),
+/// each worker reads its slice (with block-level skipping), creates a local
 /// aggregator, feeds rows, then all partial aggregators are merged sequentially.
 pub(super) fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFrameRows> {
     use rayon::prelude::*;
@@ -108,25 +109,45 @@ pub(super) fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFram
         Arc::new(LocalFileSystem)
     };
 
-    let reader = SFrameReader::open_with_fs(&*vfs, &plan.path)?;
-    let segment_paths: Vec<String> = reader
+    let meta = SFrameMetadata::open_with_fs(&*vfs, &plan.path)?;
+    let segment_paths: Vec<String> = meta
         .group_index
         .segment_files
         .iter()
         .map(|f| format!("{}/{}", plan.path, f))
         .collect();
 
+    let segment_sizes: Vec<u64> = meta
+        .group_index
+        .columns[0]
+        .segment_sizes
+        .clone();
+
+    let total_rows: u64 = segment_sizes.iter().sum();
+    let n_workers = rayon::current_num_threads().max(1);
     let single_column = plan.column_indices.len() == 1;
 
-    // Process segments in parallel
-    let partial_aggs: Vec<Result<Box<dyn Aggregator>>> = segment_paths
+    // Build equal row-range slices for each worker
+    let worker_ranges: Vec<(u64, u64)> = (0..n_workers)
+        .filter_map(|i| {
+            let begin = (i as u64 * total_rows) / n_workers as u64;
+            let end = ((i as u64 + 1) * total_rows) / n_workers as u64;
+            if begin >= end { None } else { Some((begin, end)) }
+        })
+        .collect();
+
+    // Process row ranges in parallel
+    let partial_aggs: Vec<Result<Box<dyn Aggregator>>> = worker_ranges
         .par_iter()
-        .map(|seg_path| {
-            let columns = source::read_segment_columns_projected(
+        .map(|&(begin, end)| {
+            let columns = source::read_projected_row_range(
                 &*vfs,
-                seg_path,
+                &segment_paths,
+                &segment_sizes,
                 &plan.column_types,
                 &plan.column_indices,
+                begin,
+                end,
             )?;
 
             let num_rows = if columns.is_empty() {

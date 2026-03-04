@@ -31,11 +31,19 @@ fn main() {
     let sf_path = format!("bench.sf");
     let csv_path = format!("bench.csv");
 
+    // Force-initialize the global cache so the spill directory is created.
+    let cache_dir = sframe_io::cache_fs::global_cache_fs().root().to_string_lossy().to_string();
+    let n_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+
     println!();
     println!("SFrameRust Benchmark");
     println!("{}", "-".repeat(66));
-    println!("  Rows: {:>12}", format_num(n));
-    println!("  Cols: {:>12}", 5);
+    println!("  Rows:      {:>12}", format_num(n));
+    println!("  Cols:      {:>12}", 5);
+    println!("  Threads:   {:>12}", n_threads);
+    println!("  Cache dir: {}", cache_dir);
     println!("{}", "-".repeat(66));
     println!("  {:<38} {:>10} {:>12}", "Operation", "Time", "Rows/sec");
     println!("{}", "-".repeat(66));

@@ -424,13 +424,20 @@ fn main() {
     let total_rows = num_rows();
     let do_full_sort = std::env::var("SFRAME_BENCH_FULL_SORT").is_ok();
 
+    let cache_dir = sframe_io::cache_fs::global_cache_fs().root().to_string_lossy().to_string();
+    let n_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║       SFrame Large-Scale Benchmark                       ║");
     println!("╠═══════════════════════════════════════════════════════════╣");
     println!("║  Rows:    {:>12}                                    ║", format_count(total_rows));
     println!("║  Columns: 7 (3 int, 2 float, 2 string)                  ║");
     println!("║  Est. uncompressed: ~{}                          ║", human_bytes(total_rows * 68));
+    println!("║  Threads: {:>12}                                    ║", n_threads);
     println!("╚═══════════════════════════════════════════════════════════╝");
+    println!("  Cache dir: {}", cache_dir);
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let sf_path = tmp.path().join("benchmark.sf");

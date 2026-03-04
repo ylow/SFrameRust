@@ -22,7 +22,6 @@ use sframe_query::execute::{
 };
 use sframe_query::optimizer;
 use sframe_query::planner::PlannerNode;
-use sframe_storage::sframe_reader::SFrameReader;
 use sframe_storage::sframe_writer::SFrameWriter;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -260,15 +259,16 @@ impl SFrame {
 
     /// Read an SFrame from disk.
     pub fn read(path: &str) -> Result<Self> {
-        let reader = SFrameReader::open(path)?;
-        let col_names: Vec<String> = reader.column_names().to_vec();
-        let col_types: Vec<FlexTypeEnum> = reader
+        use sframe_storage::sframe_reader::SFrameMetadata;
+        let meta = SFrameMetadata::open(path)?;
+        let col_names: Vec<String> = meta.frame_index.column_names.clone();
+        let col_types: Vec<FlexTypeEnum> = meta
             .group_index
             .columns
             .iter()
             .map(|c| c.dtype)
             .collect();
-        let num_rows = reader.num_rows();
+        let num_rows = meta.frame_index.nrows;
 
         let plan = PlannerNode::sframe_source(path, col_names.clone(), col_types.clone(), num_rows);
 
@@ -281,9 +281,7 @@ impl SFrame {
             .collect();
 
         let mut sf = SFrame::new_with_columns(columns, col_names);
-        // Load metadata from disk
-        let reader = SFrameReader::open(path)?;
-        sf.metadata = reader.metadata().clone();
+        sf.metadata = meta.frame_index.metadata;
         Ok(sf)
     }
 
