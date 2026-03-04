@@ -3,13 +3,17 @@
 //! DAG of PlannerNodes representing query operations. Nodes are Arc-shared
 //! so the same subexpression can appear in multiple places.
 
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
+
+static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Classification of an operator's output rate relative to its input(s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +32,10 @@ pub enum OperatorRate {
 pub struct PlannerNode {
     pub op: LogicalOp,
     pub inputs: Vec<Arc<PlannerNode>>,
+    /// Unique identifier assigned at construction time.
+    id: u64,
+    /// Deterministic hash of op + params + input content hashes.
+    content_hash: u64,
 }
 
 /// Logical operations in the query plan.
@@ -201,6 +209,122 @@ pub trait Aggregator: Send + Sync {
 }
 
 impl PlannerNode {
+    /// Create a PlannerNode with a unique id and deterministic content hash.
+    pub(crate) fn new(op: LogicalOp, inputs: Vec<Arc<PlannerNode>>) -> Self {
+        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
+        let content_hash = Self::compute_hash(&op, &inputs, id);
+        PlannerNode { op, inputs, id, content_hash }
+    }
+
+    /// Return this node's unique identifier.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Return this node's deterministic content hash.
+    pub fn content_hash(&self) -> u64 {
+        self.content_hash
+    }
+
+    /// Compute a deterministic hash from the operator, its parameters, and
+    /// the content hashes of its inputs.
+    ///
+    /// For operators containing opaque closures or aggregators (which cannot
+    /// be compared), the node's unique `id` is included in the hash instead,
+    /// ensuring distinct nodes produce distinct hashes.
+    fn compute_hash(op: &LogicalOp, inputs: &[Arc<PlannerNode>], id: u64) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut h = DefaultHasher::new();
+        // Hash the discriminant to distinguish operator types
+        std::mem::discriminant(op).hash(&mut h);
+
+        match op {
+            LogicalOp::SFrameSource {
+                path, column_types, begin_row, end_row, ..
+            } => {
+                path.hash(&mut h);
+                column_types.hash(&mut h);
+                begin_row.hash(&mut h);
+                end_row.hash(&mut h);
+            }
+            LogicalOp::MaterializedSource { .. } => {
+                // Data is not cheaply hashable; use unique id
+                id.hash(&mut h);
+            }
+            LogicalOp::Range { start, step, count } => {
+                start.hash(&mut h);
+                step.hash(&mut h);
+                count.hash(&mut h);
+            }
+            LogicalOp::Project { column_indices } => {
+                column_indices.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::Transform { input_column, output_type, .. } => {
+                input_column.hash(&mut h);
+                output_type.hash(&mut h);
+                // Closure is opaque; use unique id
+                id.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::BinaryTransform { left_column, right_column, output_type, .. } => {
+                left_column.hash(&mut h);
+                right_column.hash(&mut h);
+                output_type.hash(&mut h);
+                // Closure is opaque; use unique id
+                id.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::GeneralizedTransform { output_types, .. } => {
+                output_types.hash(&mut h);
+                // Closure is opaque; use unique id
+                id.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::Filter { column, .. } => {
+                column.hash(&mut h);
+                // Predicate is opaque; use unique id
+                id.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::LogicalFilter => {
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::Append => {
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::Union => {
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::Reduce { .. } => {
+                // Aggregator is opaque; use unique id
+                id.hash(&mut h);
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+        }
+
+        h.finish()
+    }
+
     /// Create a source node that reads an SFrame from disk.
     pub fn sframe_source(
         path: &str,
@@ -208,8 +332,8 @@ impl PlannerNode {
         column_types: Vec<FlexTypeEnum>,
         num_rows: u64,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::SFrameSource {
+        Arc::new(PlannerNode::new(
+            LogicalOp::SFrameSource {
                 path: path.to_string(),
                 column_names,
                 column_types,
@@ -218,8 +342,8 @@ impl PlannerNode {
                 end_row: num_rows,
                 _keep_alive: None,
             },
-            inputs: vec![],
-        })
+            vec![],
+        ))
     }
 
     /// Create a source node backed by a cache:// path with a keep-alive guard.
@@ -230,8 +354,8 @@ impl PlannerNode {
         num_rows: u64,
         keep_alive: Arc<dyn Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::SFrameSource {
+        Arc::new(PlannerNode::new(
+            LogicalOp::SFrameSource {
                 path: path.to_string(),
                 column_names,
                 column_types,
@@ -240,26 +364,26 @@ impl PlannerNode {
                 end_row: num_rows,
                 _keep_alive: Some(keep_alive),
             },
-            inputs: vec![],
-        })
+            vec![],
+        ))
     }
 
     /// Create a materialized source from in-memory data.
     pub fn materialized(data: SFrameRows) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::MaterializedSource {
+        Arc::new(PlannerNode::new(
+            LogicalOp::MaterializedSource {
                 data: Arc::new(data),
             },
-            inputs: vec![],
-        })
+            vec![],
+        ))
     }
 
     /// Project specific columns from the input.
     pub fn project(input: Arc<PlannerNode>, column_indices: Vec<usize>) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Project { column_indices },
-            inputs: vec![input],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::Project { column_indices },
+            vec![input],
+        ))
     }
 
     /// Filter rows from the input.
@@ -268,10 +392,10 @@ impl PlannerNode {
         column: usize,
         predicate: Arc<dyn Fn(&FlexType) -> bool + Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Filter { column, predicate },
-            inputs: vec![input],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::Filter { column, predicate },
+            vec![input],
+        ))
     }
 
     /// Transform a column.
@@ -281,14 +405,14 @@ impl PlannerNode {
         func: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync>,
         output_type: FlexTypeEnum,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Transform {
+        Arc::new(PlannerNode::new(
+            LogicalOp::Transform {
                 input_column,
                 func,
                 output_type,
             },
-            inputs: vec![input],
-        })
+            vec![input],
+        ))
     }
 
     /// Binary transform on two columns.
@@ -299,15 +423,15 @@ impl PlannerNode {
         func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
         output_type: FlexTypeEnum,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::BinaryTransform {
+        Arc::new(PlannerNode::new(
+            LogicalOp::BinaryTransform {
                 left_column,
                 right_column,
                 func,
                 output_type,
             },
-            inputs: vec![input],
-        })
+            vec![input],
+        ))
     }
 
     /// Generalized transform producing multiple output columns.
@@ -316,55 +440,55 @@ impl PlannerNode {
         func: Arc<dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync>,
         output_types: Vec<FlexTypeEnum>,
     ) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::GeneralizedTransform {
+        Arc::new(PlannerNode::new(
+            LogicalOp::GeneralizedTransform {
                 func,
                 output_types,
             },
-            inputs: vec![input],
-        })
+            vec![input],
+        ))
     }
 
     /// Append two inputs vertically.
     pub fn append(left: Arc<PlannerNode>, right: Arc<PlannerNode>) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Append,
-            inputs: vec![left, right],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::Append,
+            vec![left, right],
+        ))
     }
 
     /// Generate a range of integers.
     pub fn range(start: i64, step: i64, count: u64) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Range { start, step, count },
-            inputs: vec![],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::Range { start, step, count },
+            vec![],
+        ))
     }
 
     /// Reduce the input using an aggregator.
     pub fn reduce(input: Arc<PlannerNode>, aggregator: Arc<dyn Aggregator>) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Reduce { aggregator },
-            inputs: vec![input],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::Reduce { aggregator },
+            vec![input],
+        ))
     }
 
     /// Logical filter: emit rows from `data` where `mask` is truthy.
     ///
     /// `mask` must produce a single-column stream of the same row count as `data`.
     pub fn logical_filter(data: Arc<PlannerNode>, mask: Arc<PlannerNode>) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::LogicalFilter,
-            inputs: vec![data, mask],
-        })
+        Arc::new(PlannerNode::new(
+            LogicalOp::LogicalFilter,
+            vec![data, mask],
+        ))
     }
 
     /// Union of multiple inputs.
     pub fn union(inputs: Vec<Arc<PlannerNode>>) -> Arc<Self> {
-        Arc::new(PlannerNode {
-            op: LogicalOp::Union,
+        Arc::new(PlannerNode::new(
+            LogicalOp::Union,
             inputs,
-        })
+        ))
     }
 
     /// Compute the output row count if statically known.
@@ -536,10 +660,7 @@ pub fn clone_plan_with_row_range(
             other => other.clone_op(),
         };
 
-        let result = Arc::new(PlannerNode {
-            op: new_op,
-            inputs: new_inputs,
-        });
+        let result = Arc::new(PlannerNode::new(new_op, new_inputs));
         memo.insert(id, result.clone());
         result
     }
@@ -606,8 +727,8 @@ fn slice_recursive(
             let new_begin = begin_row + begin;
             let new_end = begin_row + end;
             assert!(new_end <= *end_row);
-            Ok(Arc::new(PlannerNode {
-                op: LogicalOp::SFrameSource {
+            Ok(Arc::new(PlannerNode::new(
+                LogicalOp::SFrameSource {
                     path: path.clone(),
                     column_names: column_names.clone(),
                     column_types: column_types.clone(),
@@ -616,8 +737,8 @@ fn slice_recursive(
                     end_row: new_end,
                     _keep_alive: _keep_alive.clone(),
                 },
-                inputs: vec![],
-            }))
+                vec![],
+            )))
         }
         LogicalOp::MaterializedSource { data } => {
             let indices: Vec<usize> = (begin as usize..end as usize).collect();
@@ -636,10 +757,10 @@ fn slice_recursive(
         | LogicalOp::BinaryTransform { .. }
         | LogicalOp::GeneralizedTransform { .. } => {
             let new_input = slice_recursive(&plan.inputs[0], begin, end)?;
-            Ok(Arc::new(PlannerNode {
-                op: plan.op.clone_op(),
-                inputs: vec![new_input],
-            }))
+            Ok(Arc::new(PlannerNode::new(
+                plan.op.clone_op(),
+                vec![new_input],
+            )))
         }
         LogicalOp::Append => {
             let left_len = plan.inputs[0].length().ok_or_else(|| {
@@ -896,5 +1017,113 @@ mod tests {
         let src = PlannerNode::range(0, 1, 100);
         let sliced = slice_plan(&src, 5, 5).unwrap();
         assert_eq!(sliced.length(), Some(0));
+    }
+
+    // Content hash tests
+
+    #[test]
+    fn test_same_source_same_hash() {
+        let a = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let b = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn test_different_source_different_hash() {
+        let a = PlannerNode::sframe_source(
+            "a.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let b = PlannerNode::sframe_source(
+            "b.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn test_transform_different_id() {
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let t1 = PlannerNode::transform(
+            src.clone(),
+            0,
+            Arc::new(|v: &FlexType| v.clone()),
+            FlexTypeEnum::Integer,
+        );
+        let t2 = PlannerNode::transform(
+            src,
+            0,
+            Arc::new(|v: &FlexType| v.clone()),
+            FlexTypeEnum::Integer,
+        );
+        // Different closures (different node ids) should produce different hashes
+        assert_ne!(t1.content_hash(), t2.content_hash());
+    }
+
+    #[test]
+    fn test_transform_on_same_input() {
+        let src_a = PlannerNode::sframe_source(
+            "a.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let src_b = PlannerNode::sframe_source(
+            "b.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        // Same closure (same node), but different inputs
+        let func: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> =
+            Arc::new(|v: &FlexType| v.clone());
+        let t1 = PlannerNode::transform(src_a, 0, func.clone(), FlexTypeEnum::Integer);
+        let t2 = PlannerNode::transform(src_b, 0, func, FlexTypeEnum::Integer);
+        // Different input hashes should produce different output hashes
+        assert_ne!(t1.content_hash(), t2.content_hash());
+    }
+
+    #[test]
+    fn test_sliced_sources_same_hash() {
+        let a = slice_plan(
+            &PlannerNode::sframe_source(
+                "test.sf",
+                vec!["col".into()],
+                vec![FlexTypeEnum::Integer],
+                100,
+            ),
+            10,
+            50,
+        ).unwrap();
+        let b = slice_plan(
+            &PlannerNode::sframe_source(
+                "test.sf",
+                vec!["col".into()],
+                vec![FlexTypeEnum::Integer],
+                100,
+            ),
+            10,
+            50,
+        ).unwrap();
+        assert_eq!(a.content_hash(), b.content_hash());
     }
 }

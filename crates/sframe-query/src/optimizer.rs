@@ -36,10 +36,10 @@ pub fn fuse_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
                     .iter()
                     .map(|&i| inner_indices[i])
                     .collect();
-                return Arc::new(PlannerNode {
-                    op: LogicalOp::Project { column_indices: composed },
-                    inputs: plan.inputs[0].inputs.clone(),
-                });
+                return Arc::new(PlannerNode::new(
+                    LogicalOp::Project { column_indices: composed },
+                    plan.inputs[0].inputs.clone(),
+                ));
             }
         }
     }
@@ -161,10 +161,10 @@ pub fn eliminate_trivial_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
             return flattened.remove(0);
         }
         if flattened.len() != plan.inputs.len() {
-            return Arc::new(PlannerNode {
-                op: LogicalOp::Union,
-                inputs: flattened,
-            });
+            return Arc::new(PlannerNode::new(
+                LogicalOp::Union,
+                flattened,
+            ));
         }
     }
 
@@ -257,10 +257,10 @@ fn rebuild_with_inputs(plan: &Arc<PlannerNode>, new_inputs: Vec<Arc<PlannerNode>
         return plan.clone();
     }
 
-    Arc::new(PlannerNode {
-        op: clone_op(&plan.op),
-        inputs: new_inputs,
-    })
+    Arc::new(PlannerNode::new(
+        clone_op(&plan.op),
+        new_inputs,
+    ))
 }
 
 /// Clone a LogicalOp. Delegates to `LogicalOp::clone_op`.
