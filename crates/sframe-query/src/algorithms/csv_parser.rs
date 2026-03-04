@@ -859,15 +859,24 @@ impl CsvStreamingParse {
     /// Pass 2: Parse chunks in parallel, calling `consumer` for each chunk.
     ///
     /// Architecture: a background I/O thread reads 50MB raw byte chunks and
-    /// sends them through a bounded channel. The main thread uses the parallel
-    /// tokenizer to split bytes into rows of fields, then parses each field
-    /// into FlexType values via rayon, and calls `consumer` with column vectors.
-    /// This overlaps disk I/O with CPU processing (double-buffering).
+    /// sends them through a bounded channel. The main thread dispatches
+    /// parallel tokenize+parse work via rayon and calls `consumer` with
+    /// column-major vectors. This overlaps disk I/O with CPU processing
+    /// (double-buffering).
+    ///
+    /// Once the header and skip_rows are consumed (typically the first few
+    /// lines), all subsequent chunks use the fused `parallel_tokenize_and_parse`
+    /// path which tokenizes and parses in a single parallel pass, eliminating
+    /// the intermediate `Vec<Vec<String>>` allocation and the serial
+    /// row-major → column-major transpose.
     pub fn parse_chunks<F>(&self, mut consumer: F) -> Result<()>
     where
         F: FnMut(Vec<Vec<FlexType>>) -> Result<()>,
     {
-        use super::csv_parallel_tokenizer::{ByteConfig, parallel_tokenize, parallel_tokenize_eof};
+        use super::csv_parallel_tokenizer::{
+            ByteConfig, parallel_tokenize, parallel_tokenize_eof,
+            parallel_tokenize_and_parse,
+        };
         use rayon::prelude::*;
 
         let config = options_to_config(&self.options);
@@ -954,7 +963,64 @@ impl CsvStreamingParse {
                 break;
             }
 
-            // Parallel tokenize
+            // ---------------------------------------------------------------
+            // Fast path: header consumed, skip_rows done → fused tokenize+parse
+            // ---------------------------------------------------------------
+            if header_consumed && rows_skipped >= skip_rows {
+                let (col_vecs, last_parsed) = parallel_tokenize_and_parse(
+                    &buffer,
+                    &bcfg,
+                    is_eof,
+                    col_types,
+                    &col_indices,
+                    |val, dtype| {
+                        parse_cell(val, dtype, &na_values).unwrap_or(FlexType::Undefined)
+                    },
+                );
+
+                if last_parsed < buffer.len() {
+                    leftover = buffer[last_parsed..].to_vec();
+                }
+
+                if !col_vecs.is_empty() && !col_vecs[0].is_empty() {
+                    let chunk_rows = col_vecs[0].len();
+
+                    // Apply row limit
+                    if let Some(limit) = row_limit {
+                        let remaining = limit.saturating_sub(total_rows);
+                        if remaining == 0 {
+                            break;
+                        }
+                        if chunk_rows > remaining {
+                            let truncated: Vec<Vec<FlexType>> = col_vecs
+                                .into_iter()
+                                .map(|mut col| {
+                                    col.truncate(remaining);
+                                    col
+                                })
+                                .collect();
+                            total_rows += remaining;
+                            consumer(truncated)?;
+                            break;
+                        }
+                        total_rows += chunk_rows;
+                    } else {
+                        total_rows += chunk_rows;
+                    }
+                    consumer(col_vecs)?;
+                }
+
+                if is_eof {
+                    break;
+                }
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // Slow path: still processing header / skip_rows.
+            // Uses parallel_tokenize → filter → par_iter parse.
+            // Only runs for the first chunk (usually a handful of lines).
+            // ---------------------------------------------------------------
             let (rows, last_parsed) = if is_eof {
                 parallel_tokenize_eof(&buffer, &bcfg)
             } else {

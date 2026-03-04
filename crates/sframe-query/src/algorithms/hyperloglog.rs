@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use sframe_types::flex_type::FlexType;
 
 /// HyperLogLog cardinality sketch.
+#[derive(Clone)]
 pub struct HyperLogLog {
     registers: Vec<u8>,
     p: u8,

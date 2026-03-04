@@ -6,9 +6,14 @@
 
 use std::sync::Arc;
 
+use sframe_query::algorithms::aggregators::{
+    AllAggregator, AnyAggregator, ApproxCountDistinctAggregator, CountNaAggregator,
+    FrequentItemsAggregator, MaxAggregator, MeanAggregator, MinAggregator, NnzAggregator,
+    StdDevAggregator, SumAggregator, VarianceAggregator,
+};
 use sframe_query::batch::{ColumnData, SFrameRows};
 use sframe_query::execute::{compile, materialize_head_sync, materialize_sync};
-use sframe_query::planner::PlannerNode;
+use sframe_query::planner::{Aggregator, PlannerNode};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
@@ -436,8 +441,10 @@ impl SArray {
 
     /// Count Undefined values.
     pub fn countna(&self) -> Result<u64> {
-        let values = self.to_vec()?;
-        Ok(values.iter().filter(|v| matches!(v, FlexType::Undefined)).count() as u64)
+        match self.reduce_with(CountNaAggregator::new())? {
+            FlexType::Integer(n) => Ok(n as u64),
+            _ => Ok(0),
+        }
     }
 
     /// Remove Undefined values.
@@ -559,140 +566,80 @@ impl SArray {
 
     // === Phase 10.4: Reduction operations ===
 
+    /// Execute a streaming reduction over this column using a plan-based
+    /// Reduce node. Projects to the single column, reduces, and extracts
+    /// the scalar result — never materializes the full column.
+    fn reduce_with(&self, aggregator: impl Aggregator + 'static) -> Result<FlexType> {
+        // Project down to just this column, then reduce.
+        let projected = PlannerNode::project(self.plan.clone(), vec![self.column_index]);
+        let reduce_plan = PlannerNode::reduce(projected, Arc::new(aggregator));
+        let stream = compile(&reduce_plan)?;
+        let batch = materialize_sync(stream)?;
+        Ok(batch.column(0).get(0))
+    }
+
     /// Sum of all values.
     pub fn sum(&self) -> Result<FlexType> {
-        let values = self.to_vec()?;
-        let mut result = FlexType::Integer(0);
-        for v in values {
-            if !matches!(v, FlexType::Undefined) {
-                result = result + v;
-            }
-        }
-        Ok(result)
+        self.reduce_with(SumAggregator::new())
     }
 
     /// Minimum value.
     pub fn min_val(&self) -> Result<FlexType> {
-        let values = self.to_vec()?;
-        let mut result: Option<FlexType> = None;
-        for v in values {
-            if matches!(v, FlexType::Undefined) {
-                continue;
-            }
-            result = Some(match result {
-                None => v,
-                Some(cur) => {
-                    if v < cur { v } else { cur }
-                }
-            });
-        }
-        Ok(result.unwrap_or(FlexType::Undefined))
+        self.reduce_with(MinAggregator::new())
     }
 
     /// Maximum value.
     pub fn max_val(&self) -> Result<FlexType> {
-        let values = self.to_vec()?;
-        let mut result: Option<FlexType> = None;
-        for v in values {
-            if matches!(v, FlexType::Undefined) {
-                continue;
-            }
-            result = Some(match result {
-                None => v,
-                Some(cur) => {
-                    if v > cur { v } else { cur }
-                }
-            });
-        }
-        Ok(result.unwrap_or(FlexType::Undefined))
+        self.reduce_with(MaxAggregator::new())
     }
 
     /// Mean of numeric values.
     pub fn mean(&self) -> Result<FlexType> {
-        let values = self.to_vec()?;
-        let mut sum = 0.0;
-        let mut count = 0u64;
-        for v in &values {
-            match v {
-                FlexType::Integer(i) => {
-                    sum += *i as f64;
-                    count += 1;
-                }
-                FlexType::Float(f) => {
-                    sum += f;
-                    count += 1;
-                }
-                _ => {}
-            }
-        }
-        if count == 0 {
-            Ok(FlexType::Undefined)
-        } else {
-            Ok(FlexType::Float(sum / count as f64))
-        }
+        self.reduce_with(MeanAggregator::new())
     }
 
     /// Standard deviation (sample, ddof=1).
     pub fn std_dev(&self, ddof: u8) -> Result<FlexType> {
-        match self.variance(ddof)? {
-            FlexType::Float(v) => Ok(FlexType::Float(v.sqrt())),
-            other => Ok(other),
-        }
+        let agg = if ddof == 0 {
+            StdDevAggregator::population()
+        } else {
+            StdDevAggregator::sample()
+        };
+        self.reduce_with(agg)
     }
 
     /// Variance (sample by default, ddof=1).
     pub fn variance(&self, ddof: u8) -> Result<FlexType> {
-        let values = self.to_vec()?;
-        let mut count = 0u64;
-        let mut mean = 0.0;
-        let mut m2 = 0.0;
-
-        for v in &values {
-            let x = match v {
-                FlexType::Integer(i) => *i as f64,
-                FlexType::Float(f) => *f,
-                _ => continue,
-            };
-            count += 1;
-            let delta = x - mean;
-            mean += delta / count as f64;
-            let delta2 = x - mean;
-            m2 += delta * delta2;
-        }
-
-        if count <= ddof as u64 {
-            Ok(FlexType::Undefined)
+        let agg = if ddof == 0 {
+            VarianceAggregator::population()
         } else {
-            Ok(FlexType::Float(m2 / (count - ddof as u64) as f64))
-        }
+            VarianceAggregator::sample()
+        };
+        self.reduce_with(agg)
     }
 
     /// True if any element is non-zero (for integer arrays).
     pub fn any(&self) -> Result<bool> {
-        let values = self.to_vec()?;
-        Ok(values.iter().any(|v| matches!(v, FlexType::Integer(i) if *i != 0)))
+        match self.reduce_with(AnyAggregator::new())? {
+            FlexType::Integer(i) => Ok(i != 0),
+            _ => Ok(false),
+        }
     }
 
     /// True if all elements are non-zero (for integer arrays).
     pub fn all(&self) -> Result<bool> {
-        let values = self.to_vec()?;
-        Ok(values
-            .iter()
-            .filter(|v| !matches!(v, FlexType::Undefined))
-            .all(|v| matches!(v, FlexType::Integer(i) if *i != 0)))
+        match self.reduce_with(AllAggregator::new())? {
+            FlexType::Integer(i) => Ok(i != 0),
+            _ => Ok(true),
+        }
     }
 
     /// Count non-zero elements.
     pub fn nnz(&self) -> Result<u64> {
-        let values = self.to_vec()?;
-        Ok(values
-            .iter()
-            .filter(|v| match v {
-                FlexType::Integer(i) => *i != 0,
-                FlexType::Float(f) => *f != 0.0,
-                _ => false,
-            })
-            .count() as u64)
+        match self.reduce_with(NnzAggregator::new())? {
+            FlexType::Integer(n) => Ok(n as u64),
+            _ => Ok(0),
+        }
     }
 
     /// Count Undefined/missing values (alias for countna).
@@ -707,13 +654,10 @@ impl SArray {
     /// Uses precision=12 (4 KB memory, ~1.6% relative error).
     /// Much faster than `unique().len()` for large arrays.
     pub fn approx_count_distinct(&self) -> Result<u64> {
-        use sframe_query::algorithms::hyperloglog::HyperLogLog;
-        let values = self.to_vec()?;
-        let mut hll = HyperLogLog::new(12);
-        for v in &values {
-            hll.insert(v);
+        match self.reduce_with(ApproxCountDistinctAggregator::new(12))? {
+            FlexType::Integer(n) => Ok(n as u64),
+            _ => Ok(0),
         }
-        Ok(hll.estimate())
     }
 
     /// Find the most frequent items using the Space-Saving algorithm.
@@ -723,13 +667,22 @@ impl SArray {
     ///
     /// Any item with true frequency > N/k is guaranteed to appear in the result.
     pub fn frequent_items(&self, k: usize) -> Result<Vec<(FlexType, u64)>> {
-        use sframe_query::algorithms::space_saving::SpaceSaving;
-        let values = self.to_vec()?;
-        let mut ss = SpaceSaving::new(k.max(1) * 4);
-        for v in &values {
-            ss.insert(v);
+        let result = self.reduce_with(FrequentItemsAggregator::new(k))?;
+        match result {
+            FlexType::Dict(entries) => {
+                Ok(entries
+                    .iter()
+                    .map(|(item, count)| {
+                        let c = match count {
+                            FlexType::Integer(i) => *i as u64,
+                            _ => 0,
+                        };
+                        (item.clone(), c)
+                    })
+                    .collect())
+            }
+            _ => Ok(vec![]),
         }
-        Ok(ss.top_k(k))
     }
 
     // === Phase 10.5: String Operations ===

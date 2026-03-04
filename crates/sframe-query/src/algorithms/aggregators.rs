@@ -1256,6 +1256,344 @@ impl Aggregator for VectorAvgAggregator {
     }
 }
 
+/// Count Undefined/NA values aggregator.
+#[derive(Clone)]
+pub struct CountNaAggregator {
+    count: u64,
+}
+
+impl CountNaAggregator {
+    pub fn new() -> Self {
+        CountNaAggregator { count: 0 }
+    }
+}
+
+impl Default for CountNaAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for CountNaAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() || matches!(values[0], FlexType::Undefined) {
+            self.count += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<CountNaAggregator>() {
+            self.count += o.count;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.count as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.count)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.count = read_u64(reader)?;
+        Ok(())
+    }
+}
+
+/// Count non-zero values aggregator.
+#[derive(Clone)]
+pub struct NnzAggregator {
+    count: u64,
+}
+
+impl NnzAggregator {
+    pub fn new() -> Self {
+        NnzAggregator { count: 0 }
+    }
+}
+
+impl Default for NnzAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for NnzAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) if *i != 0 => self.count += 1,
+            FlexType::Float(f) if *f != 0.0 => self.count += 1,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<NnzAggregator>() {
+            self.count += o.count;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.count as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u64(writer, self.count)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.count = read_u64(reader)?;
+        Ok(())
+    }
+}
+
+/// Any aggregator — true if any element is non-zero.
+#[derive(Clone)]
+pub struct AnyAggregator {
+    found: bool,
+}
+
+impl AnyAggregator {
+    pub fn new() -> Self {
+        AnyAggregator { found: false }
+    }
+}
+
+impl Default for AnyAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for AnyAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if self.found {
+            return;
+        }
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Integer(i) if *i != 0 => self.found = true,
+            FlexType::Float(f) if *f != 0.0 => self.found = true,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<AnyAggregator>() {
+            self.found = self.found || o.found;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(if self.found { 1 } else { 0 })
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.found as u8)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.found = read_u8(reader)? != 0;
+        Ok(())
+    }
+}
+
+/// All aggregator — true if all non-Undefined elements are non-zero.
+#[derive(Clone)]
+pub struct AllAggregator {
+    all_nonzero: bool,
+}
+
+impl AllAggregator {
+    pub fn new() -> Self {
+        AllAggregator { all_nonzero: true }
+    }
+}
+
+impl Default for AllAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Aggregator for AllAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if !self.all_nonzero {
+            return;
+        }
+        if values.is_empty() {
+            return;
+        }
+        match &values[0] {
+            FlexType::Undefined => {} // skip undefined
+            FlexType::Integer(i) if *i == 0 => self.all_nonzero = false,
+            FlexType::Float(f) if *f == 0.0 => self.all_nonzero = false,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<AllAggregator>() {
+            self.all_nonzero = self.all_nonzero && o.all_nonzero;
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(if self.all_nonzero { 1 } else { 0 })
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, writer: &mut dyn Write) -> Result<()> {
+        write_u8(writer, self.all_nonzero as u8)
+    }
+
+    fn load(&mut self, reader: &mut dyn Read) -> Result<()> {
+        self.all_nonzero = read_u8(reader)? != 0;
+        Ok(())
+    }
+}
+
+/// Approximate count distinct using HyperLogLog.
+#[derive(Clone)]
+pub struct ApproxCountDistinctAggregator {
+    hll: crate::algorithms::hyperloglog::HyperLogLog,
+}
+
+impl ApproxCountDistinctAggregator {
+    pub fn new(precision: u8) -> Self {
+        ApproxCountDistinctAggregator {
+            hll: crate::algorithms::hyperloglog::HyperLogLog::new(precision),
+        }
+    }
+}
+
+impl Aggregator for ApproxCountDistinctAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        if !matches!(values[0], FlexType::Undefined) {
+            self.hll.insert(&values[0]);
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<ApproxCountDistinctAggregator>() {
+            self.hll.merge(&o.hll);
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        FlexType::Integer(self.hll.estimate() as i64)
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Integer
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, _writer: &mut dyn Write) -> Result<()> {
+        // HyperLogLog save not needed for this use case
+        Ok(())
+    }
+
+    fn load(&mut self, _reader: &mut dyn Read) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Frequent items using Space-Saving algorithm.
+#[derive(Clone)]
+pub struct FrequentItemsAggregator {
+    ss: crate::algorithms::space_saving::SpaceSaving,
+    k: usize,
+}
+
+impl FrequentItemsAggregator {
+    pub fn new(k: usize) -> Self {
+        FrequentItemsAggregator {
+            ss: crate::algorithms::space_saving::SpaceSaving::new(k.max(1) * 4),
+            k,
+        }
+    }
+}
+
+impl Aggregator for FrequentItemsAggregator {
+    fn add(&mut self, values: &[FlexType]) {
+        if values.is_empty() {
+            return;
+        }
+        if !matches!(values[0], FlexType::Undefined) {
+            self.ss.insert(&values[0]);
+        }
+    }
+
+    fn merge(&mut self, other: &dyn Aggregator) {
+        if let Some(o) = other.as_any().downcast_ref::<FrequentItemsAggregator>() {
+            self.ss.merge(&o.ss);
+        }
+    }
+
+    fn finalize(&mut self) -> FlexType {
+        let top = self.ss.top_k(self.k);
+        let entries: Vec<(FlexType, FlexType)> = top
+            .into_iter()
+            .map(|(item, count)| (item, FlexType::Integer(count as i64)))
+            .collect();
+        FlexType::Dict(std::sync::Arc::from(entries))
+    }
+
+    fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
+        FlexTypeEnum::Dict
+    }
+
+    fn box_clone(&self) -> Box<dyn Aggregator> { Box::new(self.clone()) }
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn save(&self, _writer: &mut dyn Write) -> Result<()> {
+        Ok(())
+    }
+
+    fn load(&mut self, _reader: &mut dyn Read) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Specification for a groupby aggregation.
 #[derive(Clone)]
 pub struct AggSpec {

@@ -9,6 +9,7 @@
 use super::csv_tokenizer::CsvConfig;
 use rayon::prelude::*;
 use sframe_types::error::{Result, SFrameError};
+use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 /// Compact bitset -- 1 bit per byte position in a CSV buffer.
 /// Used to track quote parity: bit set means "inside a quoted field".
@@ -1040,6 +1041,184 @@ fn find_line_content_end(buffer: &[u8], line_start: usize, after_term: usize, co
 #[inline]
 fn is_empty_line(line: &[u8]) -> bool {
     line.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
+}
+
+// ---------------------------------------------------------------------------
+// Fused parallel tokenize + parse
+// ---------------------------------------------------------------------------
+
+/// Fused parallel tokenize + parse: goes directly from raw bytes to FlexType
+/// values in a single parallel pass. Eliminates the intermediate `Vec<Vec<String>>`
+/// allocation and the serial row-major to column-major transpose.
+///
+/// Returns `(column_major_results, last_parsed_byte_offset)`.
+/// `column_major_results[i]` contains all values for output column `i`.
+///
+/// `parse_fn` is called for each field value with `(field_str, column_type)` and
+/// returns a `FlexType`. This is provided as a closure so that `csv_parser.rs`
+/// can pass its `parse_cell` logic.
+pub(crate) fn parallel_tokenize_and_parse<F>(
+    buffer: &[u8],
+    config: &ByteConfig,
+    eof: bool,
+    col_types: &[FlexTypeEnum],
+    col_indices: &[usize],
+    parse_fn: F,
+) -> (Vec<Vec<FlexType>>, usize)
+where
+    F: Fn(&str, FlexTypeEnum) -> FlexType + Sync,
+{
+    let len = buffer.len();
+    let n_out = col_indices.len();
+    if len == 0 {
+        let empty_cols: Vec<Vec<FlexType>> = (0..n_out).map(|_| Vec::new()).collect();
+        return (empty_cols, 0);
+    }
+
+    // 1. Build quote parity bitset (same as parallel_tokenize_inner).
+    let mut parity = find_true_newline_positions(buffer, config);
+    if eof {
+        parity.clear_bit(len - 1);
+    }
+
+    // 2. Determine thread count.
+    let nthreads = rayon::current_num_threads().max(1);
+
+    // 3. Dispatch threads — each thread tokenizes AND parses its byte range,
+    //    producing column-major output directly.
+    let thread_results: Vec<(Vec<Vec<FlexType>>, usize)> = (0..nthreads)
+        .into_par_iter()
+        .map(|tid| {
+            parse_thread_fused(
+                buffer, &parity, config, tid, nthreads, eof,
+                col_types, col_indices, &parse_fn,
+            )
+        })
+        .collect();
+
+    // 4. Merge: concatenate column vectors in thread order.
+    let total_rows: usize = thread_results
+        .iter()
+        .map(|(cols, _)| if cols.is_empty() { 0 } else { cols[0].len() })
+        .sum();
+
+    let mut col_vecs: Vec<Vec<FlexType>> = (0..n_out)
+        .map(|_| Vec::with_capacity(total_rows))
+        .collect();
+    let mut last_parsed: usize = 0;
+
+    for (thread_cols, thread_last) in thread_results {
+        if !thread_cols.is_empty() {
+            for (i, col) in thread_cols.into_iter().enumerate() {
+                col_vecs[i].extend(col);
+            }
+        }
+        if thread_last > last_parsed {
+            last_parsed = thread_last;
+        }
+    }
+
+    (col_vecs, last_parsed)
+}
+
+/// Per-thread fused tokenize+parse worker.
+///
+/// Finds its byte range (same logic as `parse_thread`), tokenizes each line
+/// via `split_fields_bytes`, immediately parses each field into `FlexType`,
+/// and builds column-major output directly. The per-line `Vec<String>` from
+/// `split_fields_bytes` is short-lived and dropped after each line.
+fn parse_thread_fused<F>(
+    buffer: &[u8],
+    parity: &DenseBitset,
+    config: &ByteConfig,
+    thread_id: usize,
+    nthreads: usize,
+    eof: bool,
+    col_types: &[FlexTypeEnum],
+    col_indices: &[usize],
+    parse_fn: &F,
+) -> (Vec<Vec<FlexType>>, usize)
+where
+    F: Fn(&str, FlexTypeEnum) -> FlexType + Sync,
+{
+    let len = buffer.len();
+    let step = len / nthreads;
+    let n_out = col_indices.len();
+
+    // --- Find start position (same logic as parse_thread) ---
+    let pstart = thread_id * step;
+    let pend = if thread_id == nthreads - 1 { len } else { (thread_id + 1) * step };
+
+    let start = if thread_id == 0 {
+        0
+    } else {
+        let search_from = if !config.is_regular_line_terminator && config.line_terminator.len() > 1 {
+            pstart.saturating_sub(config.line_terminator.len() - 1)
+        } else {
+            pstart
+        };
+        let (pos, found) = advance_past_newline_with_parity(buffer, search_from, pend, config, parity);
+        if !found {
+            return (Vec::new(), 0);
+        }
+        pos
+    };
+
+    // --- Find end position ---
+    let end = if pend >= len {
+        len
+    } else {
+        let search_from = if !config.is_regular_line_terminator && config.line_terminator.len() > 1 {
+            pend.saturating_sub(config.line_terminator.len() - 1)
+        } else {
+            pend
+        };
+        let (pos, _) = advance_past_newline_with_parity(buffer, search_from, len, config, parity);
+        pos
+    };
+
+    if start >= end {
+        return (Vec::new(), 0);
+    }
+
+    // --- Parse lines, building column-major output directly ---
+    let mut col_vecs: Vec<Vec<FlexType>> = (0..n_out).map(|_| Vec::new()).collect();
+    let mut pos = start;
+    let mut last_parsed = start;
+
+    while pos < end {
+        let (next_pos, found) = advance_past_newline_with_parity(buffer, pos, end, config, parity);
+        if found {
+            let line_end = find_line_content_end(buffer, pos, next_pos, config);
+            let line = &buffer[pos..line_end];
+            if !is_empty_line(line) {
+                let fields = split_fields_bytes(line, config);
+                for (out_idx, &src_col) in col_indices.iter().enumerate() {
+                    let val_str = if src_col < fields.len() { &fields[src_col] } else { "" };
+                    let val = parse_fn(val_str, col_types[src_col]);
+                    col_vecs[out_idx].push(val);
+                }
+            }
+            last_parsed = next_pos;
+            pos = next_pos;
+        } else {
+            if eof && pos < end {
+                let line = &buffer[pos..end];
+                if !is_empty_line(line) {
+                    let fields = split_fields_bytes(line, config);
+                    for (out_idx, &src_col) in col_indices.iter().enumerate() {
+                        let val_str = if src_col < fields.len() { &fields[src_col] } else { "" };
+                        let val = parse_fn(val_str, col_types[src_col]);
+                        col_vecs[out_idx].push(val);
+                    }
+                }
+                last_parsed = end;
+            }
+            break;
+        }
+    }
+
+    (col_vecs, last_parsed)
 }
 
 #[cfg(test)]

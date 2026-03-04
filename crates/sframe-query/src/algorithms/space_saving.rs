@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use sframe_types::flex_type::FlexType;
 
 /// Space-Saving frequent items sketch.
+#[derive(Clone)]
 pub struct SpaceSaving {
     /// Tracked items and their counts, ordered by count descending.
     items: Vec<FlexType>,

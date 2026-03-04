@@ -28,8 +28,8 @@ fn num_rows() -> usize {
 fn main() {
     let n = num_rows();
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
-    let sf_path = format!("{}/bench.sf", tmp.path().display());
-    let csv_path = format!("{}/bench.csv", tmp.path().display());
+    let sf_path = format!("bench.sf");
+    let csv_path = format!("bench.csv");
 
     println!();
     println!("SFrameRust Benchmark");

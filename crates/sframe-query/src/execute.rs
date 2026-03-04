@@ -18,7 +18,7 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::{ColumnData, SFrameRows};
 use crate::optimizer;
-use crate::planner::{LogicalOp, PlannerNode};
+use crate::planner::{Aggregator, LogicalOp, PlannerNode};
 
 /// A stream of SFrameRows batches.
 pub type BatchStream = Pin<Box<dyn Stream<Item = Result<SFrameRows>> + Send>>;
@@ -150,6 +150,11 @@ fn compile_node(node: &Arc<PlannerNode>) -> Result<BatchStream> {
         }
 
         LogicalOp::Reduce { aggregator } => {
+            if let Some(par_plan) = try_extract_parallel_reduce_plan(node) {
+                return Ok(Box::pin(stream::once(async move {
+                    execute_parallel_reduce(&par_plan)
+                })));
+            }
             let input = compile_node(&node.inputs[0])?;
             let agg = aggregator.clone();
             Ok(Box::pin(stream::once(async move {
@@ -297,6 +302,170 @@ fn read_segment_independently(
         columns.push(seg_reader.read_column(col)?);
     }
     Ok(columns)
+}
+
+/// Read only projected columns from a segment file.
+///
+/// Like `read_segment_independently` but only reads columns at the given
+/// indices, returning `column_indices.len()` vecs in the same order as
+/// `column_indices`. The full `column_types` slice is needed to open the
+/// segment reader for validation.
+fn read_segment_columns_projected(
+    vfs: &dyn VirtualFileSystem,
+    segment_path: &str,
+    column_types: &[FlexTypeEnum],
+    column_indices: &[usize],
+) -> Result<Vec<Vec<FlexType>>> {
+    let file = vfs.open_read(segment_path)?;
+    let file_size = file.size()?;
+    let mut seg_reader = SegmentReader::open(
+        Box::new(file),
+        file_size,
+        column_types.to_vec(),
+    )?;
+    let mut columns = Vec::with_capacity(column_indices.len());
+    for &col_idx in column_indices {
+        columns.push(seg_reader.read_column(col_idx)?);
+    }
+    Ok(columns)
+}
+
+/// Extracted parallel reduce plan.
+struct ParallelReducePlan {
+    path: String,
+    column_types: Vec<FlexTypeEnum>,
+    column_indices: Vec<usize>,
+    aggregator: Arc<dyn Aggregator>,
+    _keep_alive: Option<Arc<dyn Send + Sync>>,
+}
+
+/// Try to extract a plan suitable for parallel reduce.
+///
+/// Matches two patterns:
+/// - `Reduce → SFrameSource` (identity project was optimized away)
+/// - `Reduce → Project → SFrameSource`
+///
+/// Returns `None` if the plan doesn't match these patterns.
+fn try_extract_parallel_reduce_plan(node: &Arc<PlannerNode>) -> Option<ParallelReducePlan> {
+    let aggregator = match &node.op {
+        LogicalOp::Reduce { aggregator } => aggregator.clone(),
+        _ => return None,
+    };
+
+    let input = node.inputs.first()?;
+
+    // Pattern 1: Reduce → SFrameSource
+    if let LogicalOp::SFrameSource {
+        path,
+        column_types,
+        _keep_alive,
+        ..
+    } = &input.op
+    {
+        let column_indices: Vec<usize> = (0..column_types.len()).collect();
+        return Some(ParallelReducePlan {
+            path: path.clone(),
+            column_types: column_types.clone(),
+            column_indices,
+            aggregator,
+            _keep_alive: _keep_alive.clone(),
+        });
+    }
+
+    // Pattern 2: Reduce → Project → SFrameSource
+    if let LogicalOp::Project { column_indices } = &input.op {
+        let source = input.inputs.first()?;
+        if let LogicalOp::SFrameSource {
+            path,
+            column_types,
+            _keep_alive,
+            ..
+        } = &source.op
+        {
+            return Some(ParallelReducePlan {
+                path: path.clone(),
+                column_types: column_types.clone(),
+                column_indices: column_indices.clone(),
+                aggregator,
+                _keep_alive: _keep_alive.clone(),
+            });
+        }
+    }
+
+    None
+}
+
+/// Execute a parallel reduce over segments using rayon.
+///
+/// Each thread reads a segment (only projected columns), creates a local
+/// aggregator, feeds rows, then all partial aggregators are merged sequentially.
+fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFrameRows> {
+    use rayon::prelude::*;
+
+    let is_cache = plan.path.starts_with("cache://");
+    let vfs: Arc<dyn VirtualFileSystem> = if is_cache {
+        Arc::new(ArcCacheFsVfs(global_cache_fs().clone()))
+    } else {
+        Arc::new(LocalFileSystem)
+    };
+
+    let reader = SFrameReader::open_with_fs(&*vfs, &plan.path)?;
+    let segment_paths: Vec<String> = reader
+        .group_index
+        .segment_files
+        .iter()
+        .map(|f| format!("{}/{}", plan.path, f))
+        .collect();
+
+    let single_column = plan.column_indices.len() == 1;
+
+    // Process segments in parallel
+    let partial_aggs: Vec<Result<Box<dyn Aggregator>>> = segment_paths
+        .par_iter()
+        .map(|seg_path| {
+            let columns = read_segment_columns_projected(
+                &*vfs,
+                seg_path,
+                &plan.column_types,
+                &plan.column_indices,
+            )?;
+
+            let num_rows = if columns.is_empty() {
+                0
+            } else {
+                columns[0].len()
+            };
+
+            let mut local_agg = plan.aggregator.box_clone();
+
+            if single_column {
+                // Optimized single-column path: avoid Vec allocation per row
+                for i in 0..num_rows {
+                    local_agg.add(std::slice::from_ref(&columns[0][i]));
+                }
+            } else {
+                for i in 0..num_rows {
+                    let row: Vec<FlexType> = columns.iter().map(|c| c[i].clone()).collect();
+                    local_agg.add(&row);
+                }
+            }
+
+            Ok(local_agg)
+        })
+        .collect();
+
+    // Merge all partial aggregators sequentially
+    let mut final_agg = plan.aggregator.box_clone();
+    for partial in partial_aggs {
+        let partial = partial?;
+        final_agg.merge(&*partial);
+    }
+
+    let result = final_agg.finalize();
+    let dtype = result.type_enum();
+    let mut col = ColumnData::empty(dtype);
+    col.push(&result)?;
+    SFrameRows::new(vec![col])
 }
 
 /// Compile a range source.
