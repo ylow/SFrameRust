@@ -438,6 +438,67 @@ pub fn materialize_head_sync(stream: BatchStream, limit: usize) -> Result<SFrame
     rt.block_on(materialize_head(stream, limit))
 }
 
+/// Materialize only the last `limit` rows from a stream.
+///
+/// Streams all batches but keeps a bounded ring buffer of the most recent
+/// rows, so memory stays O(limit) regardless of total stream size.
+pub async fn materialize_tail(mut stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+    use std::collections::VecDeque;
+
+    if limit == 0 {
+        return Ok(SFrameRows::empty(&[]));
+    }
+
+    let mut ring: VecDeque<SFrameRows> = VecDeque::new();
+    let mut buffered_rows: usize = 0;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        let n = batch.num_rows();
+        if n == 0 {
+            continue;
+        }
+        buffered_rows += n;
+        ring.push_back(batch);
+
+        // Trim from the front while we have more than `limit` rows buffered.
+        while buffered_rows > limit {
+            let front_rows = ring.front().unwrap().num_rows();
+            let excess = buffered_rows - limit;
+            if excess >= front_rows {
+                // Drop the entire front batch.
+                ring.pop_front();
+                buffered_rows -= front_rows;
+            } else {
+                // Trim the front batch: keep only the tail portion.
+                let front = ring.pop_front().unwrap();
+                let indices: Vec<usize> = (excess..front_rows).collect();
+                let trimmed = front.take(&indices)?;
+                buffered_rows -= excess;
+                ring.push_front(trimmed);
+                break;
+            }
+        }
+    }
+
+    // Concatenate the ring into a single batch.
+    let mut result: Option<SFrameRows> = None;
+    for batch in ring {
+        match &mut result {
+            None => result = Some(batch),
+            Some(existing) => existing.append(&batch)?,
+        }
+    }
+    Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
+}
+
+/// Synchronous version of [`materialize_tail`].
+pub fn materialize_tail_sync(stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
+    rt.block_on(materialize_tail(stream, limit))
+}
+
 /// Consume a stream batch-by-batch synchronously, calling `callback` for
 /// each batch. This avoids collecting the entire stream into memory.
 pub fn for_each_batch_sync<F>(stream: BatchStream, mut callback: F) -> Result<()>
