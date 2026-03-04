@@ -851,6 +851,12 @@ pub enum ColumnEval {
     },
 }
 
+// ColumnEval must be Send + Sync for use in the async execution engine.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _check() { _assert_send_sync::<ColumnEval>(); }
+};
+
 impl ColumnEval {
     /// Evaluate this expression given a base row (one FlexType per base column).
     pub fn evaluate(&self, base_row: &[FlexType]) -> FlexType {
@@ -928,6 +934,9 @@ pub fn try_build_evaluator(
 
         LogicalOp::GeneralizedTransform { func, .. } => {
             // Only fusible if the input IS the base plan directly.
+            // We can't recurse further because GeneralizedProject passes the
+            // full base_row to func, so the func must expect the base's column
+            // layout. If there were intermediate ops, the row shape would differ.
             if plan.inputs[0].content_hash() == base_hash {
                 Some(ColumnEval::GeneralizedProject {
                     func: func.clone(),
@@ -982,6 +991,11 @@ fn find_leaf_source(plan: &Arc<PlannerNode>) -> Option<Arc<PlannerNode>> {
 
 /// Given N `(plan, column_index, dtype)` tuples, try to find a common base plan
 /// and build a single fused plan that produces all columns.
+///
+/// `column_index` is the column index in the corresponding plan's output.
+///
+/// The current implementation always fuses at the leaf source node. A future
+/// optimization could find the deepest common ancestor to reduce evaluator depth.
 ///
 /// Returns `None` if columns can't be fused (no common base, or unfusible ops
 /// in any chain).
