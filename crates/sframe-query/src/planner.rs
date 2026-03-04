@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use sframe_types::error::Result;
+use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
@@ -367,6 +367,44 @@ impl PlannerNode {
         })
     }
 
+    /// Compute the output row count if statically known.
+    ///
+    /// Returns `Some(n)` for source nodes and linear operators whose
+    /// input lengths are known. Returns `None` for sub-linear operators
+    /// (Filter, LogicalFilter) whose output size depends on data.
+    /// Reduce always returns `Some(1)`.
+    pub fn length(&self) -> Option<u64> {
+        match &self.op {
+            LogicalOp::SFrameSource { begin_row, end_row, .. } => {
+                Some(end_row - begin_row)
+            }
+            LogicalOp::MaterializedSource { data } => {
+                Some(data.num_rows() as u64)
+            }
+            LogicalOp::Range { count, .. } => Some(*count),
+            LogicalOp::Project { .. }
+            | LogicalOp::Transform { .. }
+            | LogicalOp::BinaryTransform { .. }
+            | LogicalOp::GeneralizedTransform { .. } => {
+                self.inputs[0].length()
+            }
+            LogicalOp::Append => {
+                let a = self.inputs[0].length()?;
+                let b = self.inputs[1].length()?;
+                Some(a + b)
+            }
+            LogicalOp::Union => {
+                let mut total: u64 = 0;
+                for input in &self.inputs {
+                    total += input.length()?;
+                }
+                Some(total)
+            }
+            LogicalOp::Filter { .. } | LogicalOp::LogicalFilter => None,
+            LogicalOp::Reduce { .. } => Some(1),
+        }
+    }
+
     /// Return a Graphviz DOT representation of the query plan DAG.
     ///
     /// Shared subexpressions (same Arc) appear as a single node with
@@ -508,4 +546,355 @@ pub fn clone_plan_with_row_range(
 
     let mut memo = HashMap::new();
     walk(plan, begin_row, end_row, &mut memo)
+}
+
+/// Slice a plan to output only rows `[begin, end)`.
+///
+/// Works by recursively rewriting source nodes. The plan must be
+/// fully linear (no Filter, LogicalFilter, or Reduce). Returns an
+/// error if the plan contains sub-linear operators or if the range
+/// is out of bounds.
+pub fn slice_plan(
+    plan: &Arc<PlannerNode>,
+    begin: u64,
+    end: u64,
+) -> Result<Arc<PlannerNode>> {
+    if begin > end {
+        return Err(SFrameError::Format(format!(
+            "Invalid slice range: begin ({}) > end ({})",
+            begin, end
+        )));
+    }
+    if begin == end {
+        let dtypes = plan_output_types(plan);
+        return Ok(PlannerNode::materialized(SFrameRows::empty(&dtypes)));
+    }
+    validate_sliceable(plan)?;
+    let len = plan.length().ok_or_else(|| {
+        SFrameError::Format("Cannot slice plan with unknown length".to_string())
+    })?;
+    if end > len {
+        return Err(SFrameError::Format(format!(
+            "Slice end ({}) exceeds plan length ({})",
+            end, len
+        )));
+    }
+    slice_recursive(plan, begin, end)
+}
+
+fn validate_sliceable(plan: &Arc<PlannerNode>) -> Result<()> {
+    if plan.op.rate() == OperatorRate::SubLinear {
+        return Err(SFrameError::Format(
+            "Cannot slice a plan containing sub-linear operators (Filter, LogicalFilter, Reduce)".to_string()
+        ));
+    }
+    for input in &plan.inputs {
+        validate_sliceable(input)?;
+    }
+    Ok(())
+}
+
+fn slice_recursive(
+    plan: &Arc<PlannerNode>,
+    begin: u64,
+    end: u64,
+) -> Result<Arc<PlannerNode>> {
+    match &plan.op {
+        LogicalOp::SFrameSource {
+            path, column_names, column_types, num_rows, begin_row, end_row, _keep_alive,
+        } => {
+            let new_begin = begin_row + begin;
+            let new_end = begin_row + end;
+            assert!(new_end <= *end_row);
+            Ok(Arc::new(PlannerNode {
+                op: LogicalOp::SFrameSource {
+                    path: path.clone(),
+                    column_names: column_names.clone(),
+                    column_types: column_types.clone(),
+                    num_rows: *num_rows,
+                    begin_row: new_begin,
+                    end_row: new_end,
+                    _keep_alive: _keep_alive.clone(),
+                },
+                inputs: vec![],
+            }))
+        }
+        LogicalOp::MaterializedSource { data } => {
+            let indices: Vec<usize> = (begin as usize..end as usize).collect();
+            let sliced = data.take(&indices)?;
+            Ok(PlannerNode::materialized(sliced))
+        }
+        LogicalOp::Range { start, step, .. } => {
+            Ok(PlannerNode::range(
+                start + (begin as i64) * step,
+                *step,
+                end - begin,
+            ))
+        }
+        LogicalOp::Project { .. }
+        | LogicalOp::Transform { .. }
+        | LogicalOp::BinaryTransform { .. }
+        | LogicalOp::GeneralizedTransform { .. } => {
+            let new_input = slice_recursive(&plan.inputs[0], begin, end)?;
+            Ok(Arc::new(PlannerNode {
+                op: plan.op.clone_op(),
+                inputs: vec![new_input],
+            }))
+        }
+        LogicalOp::Append => {
+            let left_len = plan.inputs[0].length().ok_or_else(|| {
+                SFrameError::Format("Append input has unknown length".to_string())
+            })?;
+
+            if end <= left_len {
+                slice_recursive(&plan.inputs[0], begin, end)
+            } else if begin >= left_len {
+                slice_recursive(&plan.inputs[1], begin - left_len, end - left_len)
+            } else {
+                let left_sliced = slice_recursive(&plan.inputs[0], begin, left_len)?;
+                let right_sliced = slice_recursive(&plan.inputs[1], 0, end - left_len)?;
+                Ok(PlannerNode::append(left_sliced, right_sliced))
+            }
+        }
+        LogicalOp::Union => {
+            let mut input_lengths: Vec<u64> = Vec::new();
+            for input in &plan.inputs {
+                let l = input.length().ok_or_else(|| {
+                    SFrameError::Format("Union input has unknown length".to_string())
+                })?;
+                input_lengths.push(l);
+            }
+
+            let mut offset: u64 = 0;
+            let mut new_inputs: Vec<Arc<PlannerNode>> = Vec::new();
+
+            for (i, &len) in input_lengths.iter().enumerate() {
+                let input_begin = offset;
+                let input_end = offset + len;
+
+                if begin >= input_end || end <= input_begin {
+                    offset = input_end;
+                    continue;
+                }
+
+                let local_begin = if begin > input_begin { begin - input_begin } else { 0 };
+                let local_end = if end < input_end { end - input_begin } else { len };
+
+                new_inputs.push(slice_recursive(&plan.inputs[i], local_begin, local_end)?);
+                offset = input_end;
+            }
+
+            match new_inputs.len() {
+                0 => {
+                    let dtypes = plan_output_types(plan);
+                    Ok(PlannerNode::materialized(SFrameRows::empty(&dtypes)))
+                }
+                1 => Ok(new_inputs.into_iter().next().unwrap()),
+                _ => Ok(PlannerNode::union(new_inputs)),
+            }
+        }
+        _ => Err(SFrameError::Format(
+            "Unexpected operator in slice_recursive".to_string()
+        )),
+    }
+}
+
+fn plan_output_types(plan: &Arc<PlannerNode>) -> Vec<FlexTypeEnum> {
+    match &plan.op {
+        LogicalOp::SFrameSource { column_types, .. } => column_types.clone(),
+        LogicalOp::MaterializedSource { data } => data.dtypes(),
+        LogicalOp::Range { .. } => vec![FlexTypeEnum::Integer],
+        LogicalOp::Project { column_indices } => {
+            let input_types = plan_output_types(&plan.inputs[0]);
+            column_indices.iter().map(|&i| input_types[i]).collect()
+        }
+        LogicalOp::Transform { output_type, .. } => {
+            let mut types = plan_output_types(&plan.inputs[0]);
+            types.push(*output_type);
+            types
+        }
+        LogicalOp::BinaryTransform { output_type, .. } => {
+            let mut types = plan_output_types(&plan.inputs[0]);
+            types.push(*output_type);
+            types
+        }
+        LogicalOp::GeneralizedTransform { output_types, .. } => output_types.clone(),
+        LogicalOp::Append | LogicalOp::Union => plan_output_types(&plan.inputs[0]),
+        LogicalOp::Filter { .. } | LogicalOp::LogicalFilter => {
+            plan_output_types(&plan.inputs[0])
+        }
+        LogicalOp::Reduce { .. } => plan_output_types(&plan.inputs[0]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::batch::{ColumnData, SFrameRows};
+
+    // Length tests
+    #[test]
+    fn test_length_sframe_source() {
+        let node = PlannerNode::sframe_source("test.sf", vec!["col".into()], vec![FlexTypeEnum::Integer], 100);
+        assert_eq!(node.length(), Some(100));
+    }
+
+    #[test]
+    fn test_length_range() {
+        assert_eq!(PlannerNode::range(0, 1, 50).length(), Some(50));
+    }
+
+    #[test]
+    fn test_length_materialized() {
+        let col = ColumnData::Integer(vec![Some(1), Some(2), Some(3)]);
+        let batch = SFrameRows::new(vec![col]).unwrap();
+        assert_eq!(PlannerNode::materialized(batch).length(), Some(3));
+    }
+
+    #[test]
+    fn test_length_project() {
+        let src = PlannerNode::sframe_source("t.sf", vec!["a".into(), "b".into()], vec![FlexTypeEnum::Integer, FlexTypeEnum::Float], 100);
+        assert_eq!(PlannerNode::project(src, vec![0]).length(), Some(100));
+    }
+
+    #[test]
+    fn test_length_transform() {
+        let src = PlannerNode::range(0, 1, 42);
+        let xform = PlannerNode::transform(src, 0, Arc::new(|v: &FlexType| v.clone()), FlexTypeEnum::Integer);
+        assert_eq!(xform.length(), Some(42));
+    }
+
+    #[test]
+    fn test_length_append() {
+        let a = PlannerNode::range(0, 1, 30);
+        let b = PlannerNode::range(0, 1, 20);
+        assert_eq!(PlannerNode::append(a, b).length(), Some(50));
+    }
+
+    #[test]
+    fn test_length_union() {
+        let a = PlannerNode::range(0, 1, 10);
+        let b = PlannerNode::range(0, 1, 20);
+        let c = PlannerNode::range(0, 1, 30);
+        assert_eq!(PlannerNode::union(vec![a, b, c]).length(), Some(60));
+    }
+
+    #[test]
+    fn test_length_filter_unknown() {
+        let src = PlannerNode::range(0, 1, 100);
+        let filtered = PlannerNode::filter(src, 0, Arc::new(|_: &FlexType| true));
+        assert_eq!(filtered.length(), None);
+    }
+
+    #[test]
+    fn test_length_logical_filter_unknown() {
+        let data = PlannerNode::range(0, 1, 100);
+        let mask = PlannerNode::range(0, 1, 100);
+        assert_eq!(PlannerNode::logical_filter(data, mask).length(), None);
+    }
+
+    #[test]
+    fn test_length_append_one_unknown() {
+        let a = PlannerNode::range(0, 1, 30);
+        let b = PlannerNode::filter(PlannerNode::range(0, 1, 100), 0, Arc::new(|_: &FlexType| true));
+        assert_eq!(PlannerNode::append(a, b).length(), None);
+    }
+
+    // Slice tests
+    #[test]
+    fn test_slice_sframe_source() {
+        let src = PlannerNode::sframe_source("test.sf", vec!["col".into()], vec![FlexTypeEnum::Integer], 100);
+        let sliced = slice_plan(&src, 10, 30).unwrap();
+        assert_eq!(sliced.length(), Some(20));
+        match &sliced.op {
+            LogicalOp::SFrameSource { begin_row, end_row, .. } => {
+                assert_eq!(*begin_row, 10);
+                assert_eq!(*end_row, 30);
+            }
+            _ => panic!("expected SFrameSource"),
+        }
+    }
+
+    #[test]
+    fn test_slice_range() {
+        let src = PlannerNode::range(10, 3, 100);
+        let sliced = slice_plan(&src, 5, 15).unwrap();
+        assert_eq!(sliced.length(), Some(10));
+        match &sliced.op {
+            LogicalOp::Range { start, step, count } => {
+                assert_eq!(*start, 25); // 10 + 5*3
+                assert_eq!(*step, 3);
+                assert_eq!(*count, 10);
+            }
+            _ => panic!("expected Range"),
+        }
+    }
+
+    #[test]
+    fn test_slice_materialized() {
+        let col = ColumnData::Integer(vec![Some(10), Some(20), Some(30), Some(40), Some(50)]);
+        let batch = SFrameRows::new(vec![col]).unwrap();
+        let src = PlannerNode::materialized(batch);
+        let sliced = slice_plan(&src, 1, 4).unwrap();
+        assert_eq!(sliced.length(), Some(3));
+    }
+
+    #[test]
+    fn test_slice_through_linear_ops() {
+        let src = PlannerNode::sframe_source("t.sf", vec!["a".into(), "b".into()], vec![FlexTypeEnum::Integer, FlexTypeEnum::Float], 100);
+        let proj = PlannerNode::project(src, vec![0]);
+        let xform = PlannerNode::transform(proj, 0, Arc::new(|v: &FlexType| v.clone()), FlexTypeEnum::Integer);
+        let sliced = slice_plan(&xform, 20, 40).unwrap();
+        assert_eq!(sliced.length(), Some(20));
+    }
+
+    #[test]
+    fn test_slice_append() {
+        let a = PlannerNode::sframe_source("a.sf", vec!["col".into()], vec![FlexTypeEnum::Integer], 60);
+        let b = PlannerNode::sframe_source("b.sf", vec!["col".into()], vec![FlexTypeEnum::Integer], 40);
+        let appended = PlannerNode::append(a, b);
+
+        // Entirely within first input
+        assert_eq!(slice_plan(&appended, 10, 30).unwrap().length(), Some(20));
+        // Entirely within second input
+        assert_eq!(slice_plan(&appended, 70, 90).unwrap().length(), Some(20));
+        // Spanning both
+        assert_eq!(slice_plan(&appended, 50, 80).unwrap().length(), Some(30));
+    }
+
+    #[test]
+    fn test_slice_rejects_sublinear() {
+        let src = PlannerNode::range(0, 1, 100);
+        let filtered = PlannerNode::filter(src, 0, Arc::new(|_: &FlexType| true));
+        assert!(slice_plan(&filtered, 0, 10).is_err());
+    }
+
+    #[test]
+    fn test_slice_out_of_bounds() {
+        let src = PlannerNode::range(0, 1, 100);
+        assert!(slice_plan(&src, 0, 101).is_err());
+        assert!(slice_plan(&src, 50, 30).is_err());
+    }
+
+    #[test]
+    fn test_slice_already_sliced_source() {
+        let src = PlannerNode::sframe_source("test.sf", vec!["col".into()], vec![FlexTypeEnum::Integer], 100);
+        let s1 = slice_plan(&src, 20, 80).unwrap();
+        let s2 = slice_plan(&s1, 5, 15).unwrap();
+        assert_eq!(s2.length(), Some(10));
+        match &s2.op {
+            LogicalOp::SFrameSource { begin_row, end_row, .. } => {
+                assert_eq!(*begin_row, 25);
+                assert_eq!(*end_row, 35);
+            }
+            _ => panic!("expected SFrameSource"),
+        }
+    }
+
+    #[test]
+    fn test_slice_empty() {
+        let src = PlannerNode::range(0, 1, 100);
+        let sliced = slice_plan(&src, 5, 5).unwrap();
+        assert_eq!(sliced.length(), Some(0));
+    }
 }
