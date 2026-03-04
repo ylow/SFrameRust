@@ -6,11 +6,13 @@
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{VirtualFileSystem, WritableFile};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
+use crate::block_encode::encode_typed_block;
 use crate::segment_writer::SegmentWriter;
 
 /// Target block size in bytes (64KB like C++).
@@ -572,42 +574,91 @@ impl SFrameWriter {
     }
 
     /// Flush all complete blocks from each column's buffer independently.
-    /// Each column has its own block size, so columns flush at different rates.
-    /// After each block write, the per-column block size is updated based on
-    /// the actual compressed size (online estimation).
+    /// Encoding + LZ4 compression is parallelized across blocks, then
+    /// the encoded results are written to the segment file sequentially.
     fn flush_ready_columns(&mut self) -> Result<()> {
-        for col_idx in 0..self.num_columns {
-            // Re-read block_size each iteration since it may be updated
-            while self.column_buffers[col_idx].len() >= self.per_column_rows_per_block[col_idx] {
-                let block_size = self.per_column_rows_per_block[col_idx];
-                let block: Vec<FlexType> = self.column_buffers[col_idx]
-                    .drain(..block_size)
-                    .collect();
-                let on_disk_bytes = self.seg_writer.write_column_block(
-                    col_idx,
-                    &block,
-                    self.column_types[col_idx],
-                )?;
-                self.update_block_size(col_idx, block_size as u64, on_disk_bytes);
-            }
-        }
-        Ok(())
+        self.flush_blocks_parallel(false)
     }
 
     /// Flush all remaining buffered data for every column as partial blocks.
     fn flush_all_buffers(&mut self) -> Result<()> {
+        self.flush_blocks_parallel(true)
+    }
+
+    /// Shared implementation for flush_ready_columns and flush_all_buffers.
+    /// When `flush_all` is true, drains all remaining data (partial blocks).
+    fn flush_blocks_parallel(&mut self, flush_all: bool) -> Result<()> {
+        // 1. Determine block boundaries and collect slices to encode.
+        //    Each entry: (col_idx, start_offset, block_size)
+        let mut block_specs: Vec<(usize, usize, usize)> = Vec::new();
+
         for col_idx in 0..self.num_columns {
-            if !self.column_buffers[col_idx].is_empty() {
-                let n = self.column_buffers[col_idx].len();
-                let block: Vec<FlexType> = self.column_buffers[col_idx].drain(..).collect();
-                let on_disk_bytes = self.seg_writer.write_column_block(
-                    col_idx,
-                    &block,
-                    self.column_types[col_idx],
-                )?;
-                self.update_block_size(col_idx, n as u64, on_disk_bytes);
+            let buf_len = self.column_buffers[col_idx].len();
+            let rows_per_block = self.per_column_rows_per_block[col_idx];
+            let mut offset = 0;
+
+            while offset + rows_per_block <= buf_len {
+                block_specs.push((col_idx, offset, rows_per_block));
+                offset += rows_per_block;
+            }
+            if flush_all && offset < buf_len {
+                block_specs.push((col_idx, offset, buf_len - offset));
             }
         }
+
+        if block_specs.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Encode + compress all blocks in parallel.
+        //    Each thread reads from the column buffer (immutable slice).
+        const COMPRESS_THRESHOLD: f64 = 0.9;
+        let buffers = &self.column_buffers;
+
+        let encoded_blocks: Vec<Result<(Vec<u8>, u64, bool)>> = block_specs
+            .par_iter()
+            .map(|&(col_idx, start, size)| {
+                let block = &buffers[col_idx][start..start + size];
+                let encoded = encode_typed_block(block)?;
+                let uncompressed_size = encoded.len() as u64;
+                let compressed = lz4_flex::compress(&encoded);
+                let use_compression =
+                    (compressed.len() as f64) < COMPRESS_THRESHOLD * (uncompressed_size as f64);
+                if use_compression {
+                    Ok((compressed, uncompressed_size, true))
+                } else {
+                    Ok((encoded, uncompressed_size, false))
+                }
+            })
+            .collect();
+
+        // 3. Write encoded blocks sequentially and update metadata.
+        for (i, result) in encoded_blocks.into_iter().enumerate() {
+            let (data, uncompressed_size, is_compressed) = result?;
+            let (col_idx, _, block_size) = block_specs[i];
+            let on_disk_bytes = self.seg_writer.write_pre_encoded_block(
+                col_idx,
+                &data,
+                uncompressed_size,
+                block_size as u64,
+                is_compressed,
+                self.column_types[col_idx],
+            )?;
+            self.update_block_size(col_idx, block_size as u64, on_disk_bytes);
+        }
+
+        // 4. Drain processed rows from column buffers.
+        //    Calculate total drained per column.
+        let mut drained_per_col = vec![0usize; self.num_columns];
+        for &(col_idx, _, size) in &block_specs {
+            drained_per_col[col_idx] += size;
+        }
+        for col_idx in 0..self.num_columns {
+            if drained_per_col[col_idx] > 0 {
+                self.column_buffers[col_idx].drain(..drained_per_col[col_idx]);
+            }
+        }
+
         Ok(())
     }
 

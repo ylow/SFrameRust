@@ -65,13 +65,19 @@ fn main() {
     report("CSV read (streaming + parallel)", n, t);
 
     // ── Filter ────────────────────────────────────────────────────────
-    let t = Instant::now();
     let filtered = sf
         .filter(
             "score",
             Arc::new(|v| matches!(v, FlexType::Integer(i) if *i > 500)),
         )
         .unwrap();
+    println!();
+    println!("  Filter query plan:");
+    for line in filtered.explain().lines() {
+        println!("    {}", line);
+    }
+    println!();
+    let t = Instant::now();
     let filt_n = filtered.num_rows().unwrap() as usize;
     report(
         &format!("Filter (score > 500) -> {} rows", format_num(filt_n)),

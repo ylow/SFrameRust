@@ -333,7 +333,7 @@ pub fn parse_rows_range(
 }
 
 /// Parse a single cell string into a `FlexType` given the target column type.
-fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String>) -> Result<FlexType> {
+pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String>) -> Result<FlexType> {
     // Check NA values first
     if na_set.contains(val) {
         return Ok(FlexType::Undefined);
@@ -705,11 +705,18 @@ pub struct CsvStreamingParse {
 /// Default chunk size for streaming CSV (50 MB).
 const CSV_CHUNK_SIZE: usize = 50 * 1024 * 1024;
 
+/// Number of rows to sample for type inference.
+const TYPE_INFERENCE_ROWS: usize = 100;
+
+/// Read buffer for type inference pass (1 MB — only need a few hundred rows).
+const INFERENCE_READ_SIZE: usize = 1024 * 1024;
+
 impl CsvStreamingParse {
-    /// Pass 1: Infer schema by streaming the file.
+    /// Pass 1: Infer schema by reading the first few hundred rows.
     ///
-    /// Reads the file in chunks, uses the parallel tokenizer to split bytes
-    /// into rows of fields, then infers column types from the field values.
+    /// Reads small chunks (1 MB) from the start of the file and infers column
+    /// types from the first `TYPE_INFERENCE_ROWS` data rows. Stops reading
+    /// as soon as enough rows have been observed.
     pub fn open(path: &str, options: &CsvOptions) -> Result<Self> {
         use super::csv_parallel_tokenizer::{ByteConfig, parallel_tokenize, parallel_tokenize_eof};
 
@@ -728,20 +735,21 @@ impl CsvStreamingParse {
         let mut infer_state: Option<TypeInferenceState> = None;
         let mut rows_skipped = 0usize;
         let mut row_count = 0usize;
+        let infer_limit = options.row_limit.unwrap_or(TYPE_INFERENCE_ROWS);
+        let mut done = false;
 
         loop {
-            // Read up to CSV_CHUNK_SIZE bytes, appending to buffer.
-            // Loop to handle short reads from the OS.
+            // Read small chunks — we only need enough for inference.
             let old_len = buffer.len();
-            buffer.resize(old_len + CSV_CHUNK_SIZE, 0);
+            buffer.resize(old_len + INFERENCE_READ_SIZE, 0);
             let mut filled = old_len;
             loop {
-                match std::io::Read::read(&mut file, &mut buffer[filled..old_len + CSV_CHUNK_SIZE]) {
+                match std::io::Read::read(&mut file, &mut buffer[filled..old_len + INFERENCE_READ_SIZE]) {
                     Ok(0) => break,
                     Ok(n) => filled += n,
                     Err(e) => return Err(SFrameError::Io(e)),
                 }
-                if filled >= old_len + CSV_CHUNK_SIZE {
+                if filled >= old_len + INFERENCE_READ_SIZE {
                     break;
                 }
             }
@@ -752,7 +760,7 @@ impl CsvStreamingParse {
                 break;
             }
 
-            // Parallel tokenize this chunk
+            // Tokenize this chunk
             let (rows, last_parsed) = if is_eof {
                 parallel_tokenize_eof(&buffer, &bcfg)
             } else {
@@ -804,13 +812,6 @@ impl CsvStreamingParse {
                     continue;
                 }
 
-                // Row limit
-                if let Some(limit) = config.row_limit {
-                    if row_count >= limit {
-                        continue;
-                    }
-                }
-
                 // Type inference
                 let ncols = column_names.as_ref().unwrap().len();
                 if infer_state.is_none() {
@@ -818,9 +819,15 @@ impl CsvStreamingParse {
                 }
                 infer_state.as_mut().unwrap().observe_row(&row, &na_values);
                 row_count += 1;
+
+                // Stop once we have enough rows for inference
+                if row_count >= infer_limit {
+                    done = true;
+                    break;
+                }
             }
 
-            if is_eof {
+            if is_eof || done {
                 break;
             }
         }

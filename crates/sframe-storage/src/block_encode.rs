@@ -132,14 +132,65 @@ fn encode_mixed_block(values: &[FlexType]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Encode values of a specific type.
+/// Encode values of a specific type (all values must be of `dtype`).
 fn encode_typed_values(
     writer: &mut (impl Write + ?Sized),
     values: &[FlexType],
     dtype: FlexTypeEnum,
 ) -> Result<()> {
-    let refs: Vec<&FlexType> = values.iter().collect();
-    encode_typed_values_refs(writer, &refs, dtype)
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    match dtype {
+        FlexTypeEnum::Integer => {
+            let ints: Vec<i64> = values
+                .iter()
+                .map(|v| match v {
+                    FlexType::Integer(i) => Ok(*i),
+                    _ => Err(SFrameError::Format("Expected Integer".to_string())),
+                })
+                .collect::<Result<_>>()?;
+            encode_integers_for(writer, &ints)
+        }
+        FlexTypeEnum::Float => {
+            let floats: Vec<f64> = values
+                .iter()
+                .map(|v| match v {
+                    FlexType::Float(f) => Ok(*f),
+                    _ => Err(SFrameError::Format("Expected Float".to_string())),
+                })
+                .collect::<Result<_>>()?;
+            encode_floats(writer, &floats)
+        }
+        FlexTypeEnum::String => {
+            let strs: Vec<&str> = values
+                .iter()
+                .map(|v| match v {
+                    FlexType::String(s) => Ok(s.as_ref()),
+                    _ => Err(SFrameError::Format("Expected String".to_string())),
+                })
+                .collect::<Result<_>>()?;
+            encode_strings(writer, &strs)
+        }
+        FlexTypeEnum::Vector => {
+            let vecs: Vec<&[f64]> = values
+                .iter()
+                .map(|v| match v {
+                    FlexType::Vector(v) => Ok(v.as_ref()),
+                    _ => Err(SFrameError::Format("Expected Vector".to_string())),
+                })
+                .collect::<Result<_>>()?;
+            encode_vectors(writer, &vecs)
+        }
+        FlexTypeEnum::List | FlexTypeEnum::Dict | FlexTypeEnum::DateTime => {
+            for val in values {
+                write_flex_type(writer, val)?;
+            }
+            Ok(())
+        }
+        FlexTypeEnum::Undefined => Ok(()),
+    }
 }
 
 /// Encode values of a specific type from references.

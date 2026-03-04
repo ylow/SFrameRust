@@ -236,8 +236,8 @@ fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
             // GeneralizedTransform replaces all input columns with output_types
             Some(output_types.len())
         }
-        LogicalOp::Filter { .. } => {
-            // Filter doesn't change column count
+        LogicalOp::Filter { .. } | LogicalOp::LogicalFilter => {
+            // Filter/LogicalFilter doesn't change column count (uses input 0)
             plan.inputs.first().and_then(|i| count_output_columns(i))
         }
         LogicalOp::Append | LogicalOp::Union => {
@@ -263,38 +263,9 @@ fn rebuild_with_inputs(plan: &Arc<PlannerNode>, new_inputs: Vec<Arc<PlannerNode>
     })
 }
 
-/// Clone a LogicalOp (needed because it contains Arc closures, not plain Clone).
+/// Clone a LogicalOp. Delegates to `LogicalOp::clone_op`.
 fn clone_op(op: &LogicalOp) -> LogicalOp {
-    match op {
-        LogicalOp::SFrameSource { path, column_names, column_types, num_rows, _keep_alive } => {
-            LogicalOp::SFrameSource {
-                path: path.clone(),
-                column_names: column_names.clone(),
-                column_types: column_types.clone(),
-                num_rows: *num_rows,
-                _keep_alive: _keep_alive.clone(),
-            }
-        }
-        LogicalOp::Project { column_indices } => LogicalOp::Project { column_indices: column_indices.clone() },
-        LogicalOp::Filter { column, predicate } => LogicalOp::Filter { column: *column, predicate: predicate.clone() },
-        LogicalOp::Transform { input_column, func, output_type } => {
-            LogicalOp::Transform { input_column: *input_column, func: func.clone(), output_type: *output_type }
-        }
-        LogicalOp::BinaryTransform { left_column, right_column, func, output_type } => {
-            LogicalOp::BinaryTransform {
-                left_column: *left_column, right_column: *right_column,
-                func: func.clone(), output_type: *output_type,
-            }
-        }
-        LogicalOp::GeneralizedTransform { func, output_types } => {
-            LogicalOp::GeneralizedTransform { func: func.clone(), output_types: output_types.clone() }
-        }
-        LogicalOp::Append => LogicalOp::Append,
-        LogicalOp::Range { start, step, count } => LogicalOp::Range { start: *start, step: *step, count: *count },
-        LogicalOp::Reduce { aggregator } => LogicalOp::Reduce { aggregator: aggregator.clone() },
-        LogicalOp::Union => LogicalOp::Union,
-        LogicalOp::MaterializedSource { data } => LogicalOp::MaterializedSource { data: data.clone() },
-    }
+    op.clone_op()
 }
 
 #[cfg(test)]

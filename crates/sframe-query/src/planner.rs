@@ -11,6 +11,19 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
 
+/// Classification of an operator's output rate relative to its input(s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorRate {
+    /// Generates data (no inputs). SFrameSource, MaterializedSource, Range.
+    Source,
+    /// 1:1 row mapping — output rate equals input rate.
+    /// Project, Transform, BinaryTransform, GeneralizedTransform, Append, Union.
+    Linear,
+    /// Output rate differs from input rate (e.g., fewer rows).
+    /// Filter, LogicalFilter, Reduce.
+    SubLinear,
+}
+
 /// A node in the logical query plan DAG.
 pub struct PlannerNode {
     pub op: LogicalOp,
@@ -25,6 +38,10 @@ pub enum LogicalOp {
         column_names: Vec<String>,
         column_types: Vec<FlexTypeEnum>,
         num_rows: u64,
+        /// First row to read (inclusive). Default 0.
+        begin_row: u64,
+        /// Last row to read (exclusive). Default num_rows.
+        end_row: u64,
         /// Keeps the backing store alive (e.g. AnonymousStore for cache:// paths).
         _keep_alive: Option<Arc<dyn Send + Sync>>,
     },
@@ -79,10 +96,78 @@ pub enum LogicalOp {
     /// Union of multiple inputs (same as Append but for >2 inputs).
     Union,
 
+    /// Logical filter: two inputs of the same row count. A row from
+    /// input 0 (data) is emitted only when the corresponding row in
+    /// input 1 (mask, single column) is truthy (non-zero).
+    LogicalFilter,
+
     /// An in-memory batch of rows (materialized data).
     MaterializedSource {
         data: Arc<SFrameRows>,
     },
+}
+
+impl LogicalOp {
+    /// Clone a LogicalOp (needed because it contains Arc closures, not plain Clone).
+    pub fn clone_op(&self) -> LogicalOp {
+        match self {
+            LogicalOp::SFrameSource { path, column_names, column_types, num_rows, begin_row, end_row, _keep_alive } => {
+                LogicalOp::SFrameSource {
+                    path: path.clone(),
+                    column_names: column_names.clone(),
+                    column_types: column_types.clone(),
+                    num_rows: *num_rows,
+                    begin_row: *begin_row,
+                    end_row: *end_row,
+                    _keep_alive: _keep_alive.clone(),
+                }
+            }
+            LogicalOp::Project { column_indices } => LogicalOp::Project { column_indices: column_indices.clone() },
+            LogicalOp::Filter { column, predicate } => LogicalOp::Filter { column: *column, predicate: predicate.clone() },
+            LogicalOp::Transform { input_column, func, output_type } => {
+                LogicalOp::Transform { input_column: *input_column, func: func.clone(), output_type: *output_type }
+            }
+            LogicalOp::BinaryTransform { left_column, right_column, func, output_type } => {
+                LogicalOp::BinaryTransform {
+                    left_column: *left_column, right_column: *right_column,
+                    func: func.clone(), output_type: *output_type,
+                }
+            }
+            LogicalOp::GeneralizedTransform { func, output_types } => {
+                LogicalOp::GeneralizedTransform { func: func.clone(), output_types: output_types.clone() }
+            }
+            LogicalOp::LogicalFilter => LogicalOp::LogicalFilter,
+            LogicalOp::Append => LogicalOp::Append,
+            LogicalOp::Range { start, step, count } => LogicalOp::Range { start: *start, step: *step, count: *count },
+            LogicalOp::Reduce { aggregator } => LogicalOp::Reduce { aggregator: aggregator.clone() },
+            LogicalOp::Union => LogicalOp::Union,
+            LogicalOp::MaterializedSource { data } => LogicalOp::MaterializedSource { data: data.clone() },
+        }
+    }
+
+    /// Return this operator's rate classification.
+    pub fn rate(&self) -> OperatorRate {
+        match self {
+            LogicalOp::SFrameSource { .. } => OperatorRate::Source,
+            LogicalOp::MaterializedSource { .. } => OperatorRate::Source,
+            LogicalOp::Range { .. } => OperatorRate::Source,
+            LogicalOp::Project { .. } => OperatorRate::Linear,
+            LogicalOp::Transform { .. } => OperatorRate::Linear,
+            LogicalOp::BinaryTransform { .. } => OperatorRate::Linear,
+            LogicalOp::GeneralizedTransform { .. } => OperatorRate::Linear,
+            LogicalOp::Append => OperatorRate::Linear,
+            LogicalOp::Union => OperatorRate::Linear,
+            LogicalOp::Filter { .. } => OperatorRate::SubLinear,
+            LogicalOp::LogicalFilter => OperatorRate::SubLinear,
+            LogicalOp::Reduce { .. } => OperatorRate::SubLinear,
+        }
+    }
+
+    /// Whether this multi-input operator consumes inputs in lockstep
+    /// (same batch boundaries required) vs sequentially.
+    pub fn is_lockstep(&self) -> bool {
+        matches!(self, LogicalOp::LogicalFilter)
+    }
 }
 
 /// Trait for aggregation operations.
@@ -129,6 +214,8 @@ impl PlannerNode {
                 column_names,
                 column_types,
                 num_rows,
+                begin_row: 0,
+                end_row: num_rows,
                 _keep_alive: None,
             },
             inputs: vec![],
@@ -149,6 +236,8 @@ impl PlannerNode {
                 column_names,
                 column_types,
                 num_rows,
+                begin_row: 0,
+                end_row: num_rows,
                 _keep_alive: Some(keep_alive),
             },
             inputs: vec![],
@@ -260,6 +349,16 @@ impl PlannerNode {
         })
     }
 
+    /// Logical filter: emit rows from `data` where `mask` is truthy.
+    ///
+    /// `mask` must produce a single-column stream of the same row count as `data`.
+    pub fn logical_filter(data: Arc<PlannerNode>, mask: Arc<PlannerNode>) -> Arc<Self> {
+        Arc::new(PlannerNode {
+            op: LogicalOp::LogicalFilter,
+            inputs: vec![data, mask],
+        })
+    }
+
     /// Union of multiple inputs.
     pub fn union(inputs: Vec<Arc<PlannerNode>>) -> Arc<Self> {
         Arc::new(PlannerNode {
@@ -267,4 +366,146 @@ impl PlannerNode {
             inputs,
         })
     }
+
+    /// Return a Graphviz DOT representation of the query plan DAG.
+    ///
+    /// Shared subexpressions (same Arc) appear as a single node with
+    /// multiple incoming edges, making reuse visible.
+    pub fn explain(self: &Arc<Self>) -> String {
+        use std::collections::HashSet;
+        use std::fmt::Write;
+
+        let mut buf = String::new();
+        let mut visited = HashSet::new();
+        writeln!(buf, "digraph plan {{").unwrap();
+        writeln!(buf, "    rankdir=BT;").unwrap();
+        Self::explain_dot(&mut buf, self, &mut visited);
+        writeln!(buf, "}}").unwrap();
+        buf
+    }
+
+    fn explain_dot(buf: &mut String, node: &Arc<Self>, visited: &mut std::collections::HashSet<usize>) {
+        use std::fmt::Write;
+
+        let id = Arc::as_ptr(node) as usize;
+        if !visited.insert(id) {
+            return; // already emitted
+        }
+
+        // Emit node
+        let label = node.op_label();
+        // Escape quotes for DOT
+        let label = label.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(buf, "    n{} [label=\"{}\"];", id, label).unwrap();
+
+        // Emit edges and recurse
+        for input in &node.inputs {
+            let child_id = Arc::as_ptr(input) as usize;
+            writeln!(buf, "    n{} -> n{};", child_id, id).unwrap();
+            Self::explain_dot(buf, input, visited);
+        }
+    }
+
+    fn op_label(&self) -> String {
+        match &self.op {
+            LogicalOp::SFrameSource { path, column_names, column_types, num_rows, begin_row, end_row, .. } => {
+                let cols: Vec<String> = column_names
+                    .iter()
+                    .zip(column_types.iter())
+                    .map(|(n, t)| format!("{}:{:?}", n, t))
+                    .collect();
+                if *begin_row == 0 && *end_row == *num_rows {
+                    format!("SFrameSource({}, {} rows, [{}])", path, num_rows, cols.join(", "))
+                } else {
+                    format!("SFrameSource({}, rows {}-{} of {}, [{}])", path, begin_row, end_row, num_rows, cols.join(", "))
+                }
+            }
+            LogicalOp::Project { column_indices } => {
+                format!("Project({:?})", column_indices)
+            }
+            LogicalOp::Filter { column, .. } => {
+                format!("Filter(col={})", column)
+            }
+            LogicalOp::Transform { input_column, output_type, .. } => {
+                format!("Transform(col={}, out={:?})", input_column, output_type)
+            }
+            LogicalOp::BinaryTransform { left_column, right_column, output_type, .. } => {
+                format!("BinaryTransform(cols=[{}, {}], out={:?})", left_column, right_column, output_type)
+            }
+            LogicalOp::GeneralizedTransform { output_types, .. } => {
+                format!("GeneralizedTransform(out={:?})", output_types)
+            }
+            LogicalOp::LogicalFilter => "LogicalFilter".to_string(),
+            LogicalOp::Append => "Append".to_string(),
+            LogicalOp::Range { start, step, count } => {
+                format!("Range(start={}, step={}, count={})", start, step, count)
+            }
+            LogicalOp::Reduce { .. } => "Reduce".to_string(),
+            LogicalOp::Union => "Union".to_string(),
+            LogicalOp::MaterializedSource { data } => {
+                format!("MaterializedSource({} rows, {} cols)", data.num_rows(), data.num_columns())
+            }
+        }
+    }
+}
+
+/// Clone a plan DAG, rewriting all SFrameSource nodes to read
+/// `[begin_row, end_row)` instead of their original range.
+///
+/// Preserves shared subexpressions: if two inputs in the original plan
+/// are the same `Arc`, the cloned plan will share one cloned node.
+pub fn clone_plan_with_row_range(
+    plan: &Arc<PlannerNode>,
+    begin_row: u64,
+    end_row: u64,
+) -> Arc<PlannerNode> {
+    use std::collections::HashMap;
+
+    fn walk(
+        node: &Arc<PlannerNode>,
+        begin_row: u64,
+        end_row: u64,
+        memo: &mut HashMap<usize, Arc<PlannerNode>>,
+    ) -> Arc<PlannerNode> {
+        let id = Arc::as_ptr(node) as usize;
+        if let Some(existing) = memo.get(&id) {
+            return existing.clone();
+        }
+
+        let new_inputs: Vec<Arc<PlannerNode>> = node
+            .inputs
+            .iter()
+            .map(|input| walk(input, begin_row, end_row, memo))
+            .collect();
+
+        let new_op = match &node.op {
+            LogicalOp::SFrameSource {
+                path,
+                column_names,
+                column_types,
+                num_rows,
+                _keep_alive,
+                ..
+            } => LogicalOp::SFrameSource {
+                path: path.clone(),
+                column_names: column_names.clone(),
+                column_types: column_types.clone(),
+                num_rows: *num_rows,
+                begin_row,
+                end_row,
+                _keep_alive: _keep_alive.clone(),
+            },
+            other => other.clone_op(),
+        };
+
+        let result = Arc::new(PlannerNode {
+            op: new_op,
+            inputs: new_inputs,
+        });
+        memo.insert(id, result.clone());
+        result
+    }
+
+    let mut memo = HashMap::new();
+    walk(plan, begin_row, end_row, &mut memo)
 }

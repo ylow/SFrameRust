@@ -100,6 +100,52 @@ impl<W: Write> SegmentWriter<W> {
         Ok(on_disk_len)
     }
 
+    /// Write a pre-encoded (and possibly compressed) block for a column.
+    ///
+    /// Used by parallel encoding: the CPU-intensive encode+compress work is
+    /// done in parallel, then results are written sequentially via this method.
+    pub fn write_pre_encoded_block(
+        &mut self,
+        column: usize,
+        data: &[u8],
+        uncompressed_size: u64,
+        num_elem: u64,
+        is_compressed: bool,
+        dtype: FlexTypeEnum,
+    ) -> Result<u64> {
+        let on_disk_len = data.len() as u64;
+        let flags = if is_compressed {
+            LZ4_COMPRESSION | IS_FLEXIBLE_TYPE | BLOCK_ENCODING_EXTENSION
+        } else {
+            IS_FLEXIBLE_TYPE | BLOCK_ENCODING_EXTENSION
+        };
+
+        let offset = self.bytes_written;
+
+        self.writer.write_all(data)?;
+        self.bytes_written += on_disk_len;
+
+        // 4K alignment padding
+        let padded = ((self.bytes_written + BLOCK_ALIGNMENT - 1) / BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
+        let padding = padded - self.bytes_written;
+        if padding > 0 {
+            let zeros = vec![0u8; padding as usize];
+            self.writer.write_all(&zeros)?;
+            self.bytes_written = padded;
+        }
+
+        self.block_index[column].push(BlockInfo {
+            offset,
+            length: on_disk_len,
+            block_size: uncompressed_size,
+            num_elem,
+            flags,
+            content_type: dtype as u16,
+        });
+
+        Ok(on_disk_len)
+    }
+
     /// Finalize the segment: write the footer and return column element counts.
     ///
     /// Returns the per-column element counts (segment_sizes).

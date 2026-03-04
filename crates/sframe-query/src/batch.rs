@@ -178,6 +178,168 @@ impl ColumnData {
         with_column_data_pair!(self, other, a, b => a.extend_from_slice(b));
         Ok(())
     }
+
+    /// Bulk-convert a borrowed slice of FlexType values to typed ColumnData.
+    ///
+    /// Single variant dispatch at the column level instead of per-element.
+    /// Values that don't match the expected type are treated as None/Undefined.
+    pub fn from_flex_slice(data: &[FlexType], dtype: FlexTypeEnum) -> Self {
+        macro_rules! convert_opt {
+            ($variant:ident, $inner:ident) => {
+                ColumnData::$variant(data.iter().map(|v| match v {
+                    FlexType::$inner(x) => Some(x.clone()),
+                    _ => None,
+                }).collect())
+            };
+        }
+        match dtype {
+            FlexTypeEnum::Integer => convert_opt!(Integer, Integer),
+            FlexTypeEnum::Float => convert_opt!(Float, Float),
+            FlexTypeEnum::String => convert_opt!(String, String),
+            FlexTypeEnum::Vector => convert_opt!(Vector, Vector),
+            FlexTypeEnum::List => convert_opt!(List, List),
+            FlexTypeEnum::Dict => convert_opt!(Dict, Dict),
+            FlexTypeEnum::DateTime => convert_opt!(DateTime, DateTime),
+            FlexTypeEnum::Undefined => ColumnData::Flexible(data.to_vec()),
+        }
+    }
+
+    /// Bulk-convert by consuming a Vec<FlexType> (avoids Arc clones for refcounted types).
+    pub fn from_flex_vec(data: Vec<FlexType>, dtype: FlexTypeEnum) -> Self {
+        macro_rules! convert_opt {
+            ($variant:ident, $inner:ident) => {
+                ColumnData::$variant(data.into_iter().map(|v| match v {
+                    FlexType::$inner(x) => Some(x),
+                    _ => None,
+                }).collect())
+            };
+        }
+        match dtype {
+            FlexTypeEnum::Integer => convert_opt!(Integer, Integer),
+            FlexTypeEnum::Float => convert_opt!(Float, Float),
+            FlexTypeEnum::String => convert_opt!(String, String),
+            FlexTypeEnum::Vector => convert_opt!(Vector, Vector),
+            FlexTypeEnum::List => convert_opt!(List, List),
+            FlexTypeEnum::Dict => convert_opt!(Dict, Dict),
+            FlexTypeEnum::DateTime => convert_opt!(DateTime, DateTime),
+            FlexTypeEnum::Undefined => ColumnData::Flexible(data),
+        }
+    }
+
+    /// Select elements by indices, staying in typed storage.
+    ///
+    /// Avoids the FlexType round-trip that `get()` + `push()` incurs.
+    pub fn gather(&self, indices: &[usize]) -> Self {
+        macro_rules! gather_typed {
+            ($variant:ident, $v:expr) => {
+                ColumnData::$variant(indices.iter().map(|&i| $v[i].clone()).collect())
+            };
+        }
+        match self {
+            ColumnData::Integer(v) => gather_typed!(Integer, v),
+            ColumnData::Float(v) => gather_typed!(Float, v),
+            ColumnData::String(v) => gather_typed!(String, v),
+            ColumnData::Vector(v) => gather_typed!(Vector, v),
+            ColumnData::List(v) => gather_typed!(List, v),
+            ColumnData::Dict(v) => gather_typed!(Dict, v),
+            ColumnData::DateTime(v) => gather_typed!(DateTime, v),
+            ColumnData::Flexible(v) => gather_typed!(Flexible, v),
+        }
+    }
+
+    /// Apply a function to each element, collecting results as FlexType values.
+    ///
+    /// Single variant dispatch, then tight loop — avoids per-element `get()` dispatch.
+    pub fn map(&self, func: &dyn Fn(&FlexType) -> FlexType) -> Vec<FlexType> {
+        macro_rules! map_opt {
+            ($v:expr, $variant:ident) => {
+                $v.iter().map(|val| {
+                    let ft = match val {
+                        Some(x) => FlexType::$variant(x.clone()),
+                        None => FlexType::Undefined,
+                    };
+                    func(&ft)
+                }).collect()
+            };
+        }
+        match self {
+            ColumnData::Integer(v) => map_opt!(v, Integer),
+            ColumnData::Float(v) => map_opt!(v, Float),
+            ColumnData::String(v) => map_opt!(v, String),
+            ColumnData::Vector(v) => map_opt!(v, Vector),
+            ColumnData::List(v) => map_opt!(v, List),
+            ColumnData::Dict(v) => map_opt!(v, Dict),
+            ColumnData::DateTime(v) => map_opt!(v, DateTime),
+            ColumnData::Flexible(v) => v.iter().map(|val| func(val)).collect(),
+        }
+    }
+
+    /// Evaluate a predicate on each element, returning indices of matches.
+    ///
+    /// Dispatches on the column variant once, then runs a tight loop over
+    /// the typed vec — avoids per-element variant dispatch that `get()` incurs.
+    pub fn filter_indices(&self, pred: &dyn Fn(&FlexType) -> bool) -> Vec<usize> {
+        macro_rules! filter_opt {
+            ($v:expr, $variant:ident) => {
+                $v.iter().enumerate().filter_map(|(i, val)| {
+                    let ft = match val {
+                        Some(x) => FlexType::$variant(x.clone()),
+                        None => FlexType::Undefined,
+                    };
+                    if pred(&ft) { Some(i) } else { None }
+                }).collect()
+            };
+        }
+        match self {
+            ColumnData::Integer(v) => filter_opt!(v, Integer),
+            ColumnData::Float(v) => filter_opt!(v, Float),
+            ColumnData::String(v) => filter_opt!(v, String),
+            ColumnData::Vector(v) => filter_opt!(v, Vector),
+            ColumnData::List(v) => filter_opt!(v, List),
+            ColumnData::Dict(v) => filter_opt!(v, Dict),
+            ColumnData::DateTime(v) => filter_opt!(v, DateTime),
+            ColumnData::Flexible(v) => {
+                v.iter().enumerate().filter_map(|(i, val)| {
+                    if pred(val) { Some(i) } else { None }
+                }).collect()
+            }
+        }
+    }
+
+    /// Return indices of "truthy" elements (non-zero, non-null).
+    ///
+    /// Operates directly on typed storage without constructing FlexType values.
+    pub fn truthy_indices(&self) -> Vec<usize> {
+        match self {
+            ColumnData::Integer(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| match val {
+                    Some(x) if *x != 0 => Some(i),
+                    _ => None,
+                }).collect(),
+            ColumnData::Float(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| match val {
+                    Some(x) if *x != 0.0 => Some(i),
+                    _ => None,
+                }).collect(),
+            ColumnData::String(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| if val.is_some() { Some(i) } else { None }).collect(),
+            ColumnData::Vector(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| if val.is_some() { Some(i) } else { None }).collect(),
+            ColumnData::List(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| if val.is_some() { Some(i) } else { None }).collect(),
+            ColumnData::Dict(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| if val.is_some() { Some(i) } else { None }).collect(),
+            ColumnData::DateTime(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| if val.is_some() { Some(i) } else { None }).collect(),
+            ColumnData::Flexible(v) => v.iter().enumerate()
+                .filter_map(|(i, val)| match val {
+                    FlexType::Integer(x) if *x != 0 => Some(i),
+                    FlexType::Float(x) if *x != 0.0 => Some(i),
+                    FlexType::Undefined | FlexType::Integer(_) | FlexType::Float(_) => None,
+                    _ => Some(i),
+                }).collect(),
+        }
+    }
 }
 
 impl SFrameRows {
@@ -284,8 +446,7 @@ impl SFrameRows {
             column_data[0].len()
         };
 
-        let mut columns = Vec::with_capacity(dtypes.len());
-        for (col_idx, (data, &dtype)) in column_data.iter().zip(dtypes.iter()).enumerate() {
+        for (col_idx, data) in column_data.iter().enumerate() {
             if data.len() != num_rows {
                 return Err(SFrameError::Format(format!(
                     "Column {} has {} rows, expected {}",
@@ -294,12 +455,13 @@ impl SFrameRows {
                     num_rows
                 )));
             }
-            let mut col = ColumnData::empty(dtype);
-            for val in data {
-                col.push(val)?;
-            }
-            columns.push(col);
         }
+
+        let columns: Vec<ColumnData> = column_data
+            .into_iter()
+            .zip(dtypes.iter())
+            .map(|(data, &dtype)| ColumnData::from_flex_vec(data, dtype))
+            .collect();
 
         Ok(SFrameRows { columns, num_rows })
     }
@@ -350,24 +512,20 @@ impl SFrameRows {
             )));
         }
 
-        // Collect indices of rows that pass the predicate
-        let mut keep_indices: Vec<usize> = Vec::new();
-        for i in 0..self.num_rows {
-            let val = self.columns[column].get(i);
-            if pred(&val) {
-                keep_indices.push(i);
-            }
-        }
+        let keep_indices = self.columns[column].filter_indices(pred);
 
-        self.take(&keep_indices)
+        let columns: Vec<ColumnData> = self.columns.iter()
+            .map(|col| col.gather(&keep_indices))
+            .collect();
+
+        Ok(SFrameRows {
+            num_rows: keep_indices.len(),
+            columns,
+        })
     }
 
     /// Select rows by indices (gather operation).
     pub fn take(&self, indices: &[usize]) -> Result<Self> {
-        let dtypes = self.dtypes();
-        let mut new_columns: Vec<ColumnData> =
-            dtypes.iter().map(|&dt| ColumnData::empty(dt)).collect();
-
         for &idx in indices {
             if idx >= self.num_rows {
                 return Err(SFrameError::Format(format!(
@@ -375,15 +533,15 @@ impl SFrameRows {
                     idx, self.num_rows
                 )));
             }
-            for (col_idx, col) in self.columns.iter().enumerate() {
-                let val = col.get(idx);
-                new_columns[col_idx].push(&val)?;
-            }
         }
+
+        let columns: Vec<ColumnData> = self.columns.iter()
+            .map(|col| col.gather(indices))
+            .collect();
 
         Ok(SFrameRows {
             num_rows: indices.len(),
-            columns: new_columns,
+            columns,
         })
     }
 

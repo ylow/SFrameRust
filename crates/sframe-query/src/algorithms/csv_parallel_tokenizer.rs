@@ -848,6 +848,260 @@ pub(crate) fn split_fields_bytes(line: &[u8], config: &ByteConfig) -> Vec<String
 }
 
 // ---------------------------------------------------------------------------
+// Callback-based field iteration (zero-copy fast path)
+// ---------------------------------------------------------------------------
+
+/// Check if a line contains characters that require the full state machine.
+/// If false, the line can be split purely by delimiter with zero-copy field refs.
+#[inline]
+fn line_needs_complex_parse(line: &[u8], config: &ByteConfig) -> bool {
+    let q = config.quote;
+    let e = config.escape;
+    let c = config.comment;
+    for &b in line {
+        if b == q || b == e || b == b'[' || b == b'{' {
+            return true;
+        }
+        if let Some(cc) = c {
+            if b == cc {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Iterate over fields in a CSV line, calling `callback(field_index, field_str)`
+/// for each field. Uses a zero-copy fast path for simple lines (no quotes,
+/// escapes, brackets, or comments) and falls back to the full state machine
+/// for complex lines.
+#[inline]
+fn for_each_field<F>(line: &[u8], config: &ByteConfig, callback: F)
+where
+    F: FnMut(usize, &str),
+{
+    if !line_needs_complex_parse(line, config) {
+        for_each_field_simple(line, config, callback);
+    } else {
+        for_each_field_complex(line, config, callback);
+    }
+}
+
+/// Fast-path field iteration for simple lines (no quotes, escapes, brackets).
+/// Zero-copy: field_str borrows directly from the input line.
+#[inline]
+fn for_each_field_simple<F>(line: &[u8], config: &ByteConfig, mut callback: F)
+where
+    F: FnMut(usize, &str),
+{
+    let delim = &config.delimiter;
+    let mut field_idx = 0usize;
+    let mut start = 0usize;
+
+    if config.skip_initial_space {
+        while start < line.len() && line[start] == b' ' {
+            start += 1;
+        }
+    }
+
+    let single_byte_delim = if delim.len() == 1 { Some(delim[0]) } else { None };
+    let mut i = start;
+
+    while i < line.len() {
+        let is_delim = if let Some(d) = single_byte_delim {
+            line[i] == d
+        } else {
+            i + delim.len() <= line.len() && line[i..i + delim.len()] == *delim
+        };
+
+        if is_delim {
+            let field = trim_ascii(&line[start..i]);
+            match std::str::from_utf8(field) {
+                Ok(s) => callback(field_idx, s),
+                Err(_) => {
+                    let owned = String::from_utf8_lossy(field);
+                    callback(field_idx, &owned);
+                }
+            }
+            field_idx += 1;
+            i += delim.len();
+            if config.skip_initial_space {
+                while i < line.len() && line[i] == b' ' {
+                    i += 1;
+                }
+            }
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Trailing field (always emit if we saw any delimiter, or if there's content)
+    let field = trim_ascii(&line[start..]);
+    if !field.is_empty() || field_idx > 0 {
+        match std::str::from_utf8(field) {
+            Ok(s) => callback(field_idx, s),
+            Err(_) => {
+                let owned = String::from_utf8_lossy(field);
+                callback(field_idx, &owned);
+            }
+        }
+    }
+}
+
+/// Complex-path field iteration: full state machine with quotes, escapes,
+/// brackets. Uses callback instead of collecting into Vec<String>.
+fn for_each_field_complex<F>(line: &[u8], config: &ByteConfig, mut callback: F)
+where
+    F: FnMut(usize, &str),
+{
+    let mut field_idx = 0usize;
+    let mut current = Vec::<u8>::new();
+    let delim = &config.delimiter;
+    let mut i = 0;
+    let mut in_quote = false;
+    let mut escape_next = false;
+    let mut in_field = false;
+    let mut had_delimiter = false;
+    let mut bracket_depth = 0i32;
+    let mut brace_depth = 0i32;
+
+    if config.skip_initial_space {
+        while i < line.len() && line[i] == b' ' {
+            i += 1;
+        }
+    }
+
+    while i < line.len() {
+        if escape_next {
+            current.push(line[i]);
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        let ch = line[i];
+
+        if ch == config.escape && in_quote {
+            current.push(ch);
+            escape_next = true;
+            i += 1;
+            continue;
+        }
+
+        if ch == config.quote {
+            if in_quote {
+                if config.double_quote
+                    && i + 1 < line.len()
+                    && line[i + 1] == config.quote
+                {
+                    current.push(ch);
+                    current.push(line[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                current.push(ch);
+                in_quote = false;
+                i += 1;
+                continue;
+            } else if current.is_empty()
+                || current.iter().all(|&b| (b as char).is_whitespace())
+            {
+                current.push(ch);
+                in_quote = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        if !in_quote {
+            if let Some(cc) = config.comment {
+                if ch == cc && bracket_depth == 0 && brace_depth == 0 {
+                    let s = finish_field_bytes(&current, config);
+                    callback(field_idx, &s);
+                    return;
+                }
+            }
+
+            let at_field_start = current.is_empty()
+                || current.iter().all(|&b| (b as char).is_whitespace());
+
+            if at_field_start && bracket_depth == 0 && brace_depth == 0 {
+                if ch == b'[' {
+                    if let Some(close_pos) = find_balanced_close_bytes(line, i, b'[', b']', delim, config.skip_initial_space) {
+                        let field_bytes = &line[i..=close_pos];
+                        let s = finish_field_bytes(field_bytes, config);
+                        callback(field_idx, &s);
+                        field_idx += 1;
+                        current.clear();
+                        in_field = false;
+                        had_delimiter = false;
+                        i = close_pos + 1;
+                        skip_post_bracket_bytes(line, &mut i, delim, config, &mut had_delimiter);
+                        continue;
+                    }
+                } else if ch == b'{' {
+                    if let Some(close_pos) = find_balanced_close_bytes(line, i, b'{', b'}', delim, config.skip_initial_space) {
+                        let inner = &line[i + 1..close_pos];
+                        if has_colon_at_depth0_bytes(inner) {
+                            let field_bytes = &line[i..=close_pos];
+                            let s = finish_field_bytes(field_bytes, config);
+                            callback(field_idx, &s);
+                            field_idx += 1;
+                            current.clear();
+                            in_field = false;
+                            had_delimiter = false;
+                            i = close_pos + 1;
+                            skip_post_bracket_bytes(line, &mut i, delim, config, &mut had_delimiter);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if bracket_depth > 0 || brace_depth > 0 {
+                match ch {
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth = (bracket_depth - 1).max(0),
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth = (brace_depth - 1).max(0),
+                    _ => {}
+                }
+            }
+
+            if bracket_depth == 0 && brace_depth == 0 && !delim.is_empty() {
+                if i + delim.len() <= line.len()
+                    && line[i..i + delim.len()] == *delim
+                {
+                    let s = finish_field_bytes(&current, config);
+                    callback(field_idx, &s);
+                    field_idx += 1;
+                    current.clear();
+                    in_field = false;
+                    had_delimiter = true;
+                    i += delim.len();
+                    if config.skip_initial_space {
+                        while i < line.len() && line[i] == b' ' {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        current.push(ch);
+        in_field = true;
+        i += 1;
+    }
+
+    if in_field || had_delimiter {
+        let s = finish_field_bytes(&current, config);
+        callback(field_idx, &s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parallel tokenization orchestrator
 // ---------------------------------------------------------------------------
 
@@ -1121,12 +1375,46 @@ where
     (col_vecs, last_parsed)
 }
 
+/// Process a single line: iterate fields via `for_each_field`, parse needed
+/// columns, and push into column vectors. Extracted as a standalone function
+/// to avoid borrow-checker issues with closures capturing `col_vecs`.
+#[inline]
+fn process_line_fused<F>(
+    line: &[u8],
+    config: &ByteConfig,
+    col_map: &[Option<(usize, FlexTypeEnum)>],
+    col_types: &[FlexTypeEnum],
+    col_indices: &[usize],
+    parse_fn: &F,
+    col_vecs: &mut [Vec<FlexType>],
+) where
+    F: Fn(&str, FlexTypeEnum) -> FlexType + Sync,
+{
+    let n_out = col_vecs.len();
+    let prev_len = if n_out > 0 { col_vecs[0].len() } else { return };
+    for_each_field(line, config, |field_idx, field_str| {
+        if field_idx < col_map.len() {
+            if let Some((out_idx, col_type)) = col_map[field_idx] {
+                col_vecs[out_idx].push(parse_fn(field_str, col_type));
+            }
+        }
+    });
+    // Fill any missing columns (row had fewer fields than expected)
+    for out_idx in 0..n_out {
+        if col_vecs[out_idx].len() == prev_len {
+            let col_type = col_types[col_indices[out_idx]];
+            col_vecs[out_idx].push(parse_fn("", col_type));
+        }
+    }
+}
+
 /// Per-thread fused tokenize+parse worker.
 ///
-/// Finds its byte range (same logic as `parse_thread`), tokenizes each line
-/// via `split_fields_bytes`, immediately parses each field into `FlexType`,
-/// and builds column-major output directly. The per-line `Vec<String>` from
-/// `split_fields_bytes` is short-lived and dropped after each line.
+/// Finds its byte range (same logic as `parse_thread`), then for each line
+/// uses `for_each_field` (zero-copy for simple fields) to iterate fields,
+/// immediately parsing needed columns into `FlexType` and building
+/// column-major output directly. Avoids `Vec<String>` allocation entirely
+/// for lines without quotes, escapes, or brackets.
 fn parse_thread_fused<F>(
     buffer: &[u8],
     parity: &DenseBitset,
@@ -1181,6 +1469,13 @@ where
         return (Vec::new(), 0);
     }
 
+    // --- Build column lookup: src_col -> (out_idx, col_type) ---
+    let max_src = col_indices.iter().copied().max().unwrap_or(0);
+    let mut col_map: Vec<Option<(usize, FlexTypeEnum)>> = vec![None; max_src + 1];
+    for (out_idx, &src_col) in col_indices.iter().enumerate() {
+        col_map[src_col] = Some((out_idx, col_types[src_col]));
+    }
+
     // --- Parse lines, building column-major output directly ---
     let mut col_vecs: Vec<Vec<FlexType>> = (0..n_out).map(|_| Vec::new()).collect();
     let mut pos = start;
@@ -1192,12 +1487,7 @@ where
             let line_end = find_line_content_end(buffer, pos, next_pos, config);
             let line = &buffer[pos..line_end];
             if !is_empty_line(line) {
-                let fields = split_fields_bytes(line, config);
-                for (out_idx, &src_col) in col_indices.iter().enumerate() {
-                    let val_str = if src_col < fields.len() { &fields[src_col] } else { "" };
-                    let val = parse_fn(val_str, col_types[src_col]);
-                    col_vecs[out_idx].push(val);
-                }
+                process_line_fused(line, config, &col_map, col_types, col_indices, parse_fn, &mut col_vecs);
             }
             last_parsed = next_pos;
             pos = next_pos;
@@ -1205,12 +1495,7 @@ where
             if eof && pos < end {
                 let line = &buffer[pos..end];
                 if !is_empty_line(line) {
-                    let fields = split_fields_bytes(line, config);
-                    for (out_idx, &src_col) in col_indices.iter().enumerate() {
-                        let val_str = if src_col < fields.len() { &fields[src_col] } else { "" };
-                        let val = parse_fn(val_str, col_types[src_col]);
-                        col_vecs[out_idx].push(val);
-                    }
+                    process_line_fused(line, config, &col_map, col_types, col_indices, parse_fn, &mut col_vecs);
                 }
                 last_parsed = end;
             }

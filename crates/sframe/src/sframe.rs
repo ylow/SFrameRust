@@ -20,6 +20,7 @@ use sframe_query::batch::SFrameRows;
 use sframe_query::execute::{
     compile, for_each_batch_sync, materialize_head_sync, materialize_sync,
 };
+use sframe_query::optimizer;
 use sframe_query::planner::PlannerNode;
 use sframe_storage::sframe_reader::SFrameReader;
 use sframe_storage::sframe_writer::SFrameWriter;
@@ -389,6 +390,28 @@ impl SFrame {
             .collect()
     }
 
+    /// Return a Graphviz DOT representation of the query plan.
+    ///
+    /// Shows each column's plan (or the shared plan if all columns share one),
+    /// both before and after optimizer passes. Shared subexpressions appear
+    /// as a single node with multiple incoming edges.
+    pub fn explain(&self) -> String {
+        let mut buf = String::new();
+        if let Some(plan) = self.shared_plan() {
+            buf.push_str("Logical Plan:\n");
+            buf.push_str(&plan.explain());
+            let optimized = optimizer::optimize(plan);
+            buf.push_str("\nOptimized Plan:\n");
+            buf.push_str(&optimized.explain());
+        } else {
+            for (i, col) in self.columns.iter().enumerate() {
+                buf.push_str(&format!("Column {} (\"{}\") plan:\n", i, self.column_names[i]));
+                buf.push_str(&col.plan().explain());
+            }
+        }
+        buf
+    }
+
     /// Get a metadata value by key.
     pub fn get_metadata(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).map(|s| s.as_str())
@@ -464,10 +487,27 @@ impl SFrame {
     ) -> Result<SFrame> {
         let filter_col_idx = self.column_index(column_name)?;
 
-        // Lazy path: if all columns share the same plan, build a filter node
+        // Lazy path: build LogicalFilter(source, Transform(pred) → Project → source)
         if let Some(plan) = self.shared_plan() {
             let plan_col_idx = self.columns[filter_col_idx].column_index();
-            let filtered_plan = PlannerNode::filter(plan.clone(), plan_col_idx, pred);
+
+            // Right branch: project out the filter column, transform predicate to int
+            let mask_source = PlannerNode::project(plan.clone(), vec![plan_col_idx]);
+            let mask = PlannerNode::transform(
+                mask_source,
+                0, // column 0 after projection
+                Arc::new(move |v: &FlexType| -> FlexType {
+                    if pred(v) {
+                        FlexType::Integer(1)
+                    } else {
+                        FlexType::Integer(0)
+                    }
+                }),
+                FlexTypeEnum::Integer,
+            );
+
+            // LogicalFilter: emit rows from source where mask is truthy
+            let filtered_plan = PlannerNode::logical_filter(plan.clone(), mask);
 
             let columns: Vec<SArray> = self
                 .columns

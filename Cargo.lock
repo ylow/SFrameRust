@@ -1958,6 +1958,7 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "lz4_flex",
+ "rayon",
  "serde",
  "serde_json",
  "sframe-io",

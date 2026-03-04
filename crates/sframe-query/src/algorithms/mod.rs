@@ -13,3 +13,5 @@ pub mod space_saving;
 
 #[cfg(test)]
 mod csv_compat_tests;
+#[cfg(test)]
+mod csv_profile;
