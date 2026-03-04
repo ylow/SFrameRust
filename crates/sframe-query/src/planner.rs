@@ -241,9 +241,10 @@ impl PlannerNode {
 
         match op {
             LogicalOp::SFrameSource {
-                path, column_types, begin_row, end_row, ..
+                path, column_names, column_types, begin_row, end_row, ..
             } => {
                 path.hash(&mut h);
+                column_names.hash(&mut h);
                 column_types.hash(&mut h);
                 begin_row.hash(&mut h);
                 end_row.hash(&mut h);
