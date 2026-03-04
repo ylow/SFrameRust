@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use sframe_core::{SArray, SFrame};
@@ -219,6 +219,16 @@ impl PySFrame {
     fn __getitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let py = key.py();
 
+        // Integer index -> single row as dict
+        if let Ok(index) = key.extract::<isize>() {
+            return self.getitem_int(index, py);
+        }
+
+        // Slice -> lazy SFrame
+        if let Ok(slice) = key.downcast::<pyo3::types::PySlice>() {
+            return self.getitem_slice(slice, py);
+        }
+
         // String key -> return column as PySArray
         if let Ok(name) = key.extract::<String>() {
             let sa = self.inner.column(&name).into_pyresult()?;
@@ -251,7 +261,7 @@ impl PySFrame {
         }
 
         Err(PyTypeError::new_err(
-            "SFrame index must be a column name (str), list of column names, or a boolean SArray mask",
+            "SFrame index must be an int, slice, column name (str), list of column names, or a boolean SArray mask",
         ))
     }
 
@@ -554,22 +564,93 @@ impl PySFrame {
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PySFrameIter> {
         let inner = slf.inner.clone();
-        let rows = slf.py().allow_threads(move || inner.iter_rows()).into_pyresult()?;
+        let rx = slf
+            .py()
+            .allow_threads(move || inner.batch_channel(2))
+            .into_pyresult()?;
         let names = slf.inner.column_names().to_vec();
         Ok(PySFrameIter {
-            rows,
+            receiver: std::sync::Mutex::new(rx),
             names,
-            index: 0,
+            current_batch: None,
+            batch_offset: 0,
         })
     }
 }
 
-/// Iterator for PySFrame rows (yields dicts).
+impl PySFrame {
+    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let len = allow(py, move || inner.num_rows())? as isize;
+        let idx = if index < 0 { len + index } else { index };
+        if idx < 0 || idx >= len {
+            return Err(PyIndexError::new_err("SFrame index out of range"));
+        }
+        let begin = idx as u64;
+        let inner = self.inner.clone();
+        let sliced_sf = allow(py, move || inner.slice(begin, begin + 1))?;
+        // Convert single row to dict
+        let names = sliced_sf.column_names();
+        let dict = PyDict::new(py);
+        for name in names {
+            let col = sliced_sf.column(name).into_pyresult()?;
+            let vals = col.to_vec().into_pyresult()?;
+            if let Some(v) = vals.into_iter().next() {
+                dict.set_item(name, flextype_to_py(py, &v))?;
+            }
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    fn getitem_slice(
+        &self,
+        slice: &Bound<'_, pyo3::types::PySlice>,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let len = allow(py, move || inner.num_rows())? as isize;
+
+        let indices = slice.indices(len)?;
+        let start = indices.start;
+        let stop = indices.stop;
+        let step = indices.step;
+
+        if step != 1 {
+            return Err(PyValueError::new_err(
+                "SFrame slicing with step != 1 is not supported",
+            ));
+        }
+
+        if start >= stop {
+            let inner = self.inner.clone();
+            let empty = allow(py, move || inner.head(0))?;
+            return Ok(PySFrame::new(empty)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind());
+        }
+
+        let begin = start as u64;
+        let end = stop as u64;
+        let inner = self.inner.clone();
+        let sliced = allow(py, move || inner.slice(begin, end))?;
+        Ok(PySFrame::new(sliced)
+            .into_pyobject(py)?
+            .into_any()
+            .unbind())
+    }
+}
+
+/// Streaming iterator for PySFrame rows (yields dicts).
+///
+/// Pulls batches on demand through a bounded channel so memory stays
+/// O(batch_size) instead of O(total_rows).
 #[pyclass]
 pub struct PySFrameIter {
-    rows: Vec<Vec<FlexType>>,
+    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<sframe_types::error::Result<sframe_query::batch::SFrameRows>>>,
     names: Vec<String>,
-    index: usize,
+    current_batch: Option<sframe_query::batch::SFrameRows>,
+    batch_offset: usize,
 }
 
 #[pymethods]
@@ -578,17 +659,36 @@ impl PySFrameIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> Option<PyObject> {
-        if self.index < self.rows.len() {
-            let row = &self.rows[self.index];
-            let dict = PyDict::new(py);
-            for (name, val) in self.names.iter().zip(row.iter()) {
-                dict.set_item(name, flextype_to_py(py, val)).ok();
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        loop {
+            // Yield from current batch if available.
+            if let Some(batch) = &self.current_batch {
+                if self.batch_offset < batch.num_rows() {
+                    let dict = PyDict::new(py);
+                    for (col_idx, name) in self.names.iter().enumerate() {
+                        let val = batch.column(col_idx).get(self.batch_offset);
+                        dict.set_item(name, flextype_to_py(py, &val))?;
+                    }
+                    self.batch_offset += 1;
+                    return Ok(Some(dict.into_any().unbind()));
+                }
+                // Current batch exhausted.
+                self.current_batch = None;
+                self.batch_offset = 0;
             }
-            self.index += 1;
-            Some(dict.into_any().unbind())
-        } else {
-            None
+
+            // Pull next batch. The heavy I/O happens in the background
+            // thread; recv typically returns immediately from the prefetch
+            // buffer.
+            match self.receiver.lock().unwrap().recv() {
+                Ok(Ok(batch)) => {
+                    self.current_batch = Some(batch);
+                }
+                Ok(Err(e)) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)));
+                }
+                Err(_) => return Ok(None), // Channel closed, stream finished.
+            }
         }
     }
 }

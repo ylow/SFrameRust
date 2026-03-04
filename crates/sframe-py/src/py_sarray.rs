@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyIndexError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use sframe_core::SArray;
@@ -478,8 +478,16 @@ impl PySArray {
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PySArrayIter> {
         let inner = slf.inner.clone();
-        let vals = slf.py().allow_threads(move || inner.to_vec()).into_pyresult()?;
-        Ok(PySArrayIter { values: vals, index: 0 })
+        let (rx, col_idx) = slf
+            .py()
+            .allow_threads(move || inner.batch_channel(2))
+            .into_pyresult()?;
+        Ok(PySArrayIter {
+            receiver: std::sync::Mutex::new(rx),
+            column_index: col_idx,
+            current_batch: None,
+            batch_offset: 0,
+        })
     }
 
     fn __bool__(&self) -> PyResult<bool> {
@@ -488,28 +496,33 @@ impl PySArray {
         ))
     }
 
-    fn __getitem__(&self, index: isize, py: Python<'_>) -> PyResult<PyObject> {
-        let inner = self.inner.clone();
-        let len = allow(py, move || inner.len())? as isize;
-        let idx = if index < 0 { len + index } else { index };
-        if idx < 0 || idx >= len {
-            return Err(PyIndexError::new_err("SArray index out of range"));
+    fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyObject> {
+        // Integer index -> single value
+        if let Ok(index) = key.extract::<isize>() {
+            return self.getitem_int(index, py);
         }
-        let inner = self.inner.clone();
-        let n = idx as usize + 1;
-        let vals = allow(py, move || inner.head(n))?;
-        match vals.last() {
-            Some(v) => Ok(flextype_to_py(py, v)),
-            None => Err(PyIndexError::new_err("SArray index out of range")),
+
+        // Slice -> lazy SArray
+        if let Ok(slice) = key.downcast::<pyo3::types::PySlice>() {
+            return self.getitem_slice(slice, py);
         }
+
+        Err(PyTypeError::new_err(
+            "SArray indices must be integers or slices",
+        ))
     }
 }
 
-/// Iterator for PySArray values.
+/// Streaming iterator for PySArray values.
+///
+/// Pulls batches on demand through a bounded channel so memory stays
+/// O(batch_size) instead of O(total_rows).
 #[pyclass]
 pub struct PySArrayIter {
-    values: Vec<FlexType>,
-    index: usize,
+    receiver: std::sync::Mutex<std::sync::mpsc::Receiver<sframe_types::error::Result<sframe_query::batch::SFrameRows>>>,
+    column_index: usize,
+    current_batch: Option<sframe_query::batch::SFrameRows>,
+    batch_offset: usize,
 }
 
 #[pymethods]
@@ -518,13 +531,34 @@ impl PySArrayIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> Option<PyObject> {
-        if self.index < self.values.len() {
-            let val = flextype_to_py(py, &self.values[self.index]);
-            self.index += 1;
-            Some(val)
-        } else {
-            None
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        loop {
+            // Yield from current batch if available.
+            if let Some(batch) = &self.current_batch {
+                if self.batch_offset < batch.num_rows() {
+                    let col = batch.column(self.column_index);
+                    let val = col.get(self.batch_offset);
+                    self.batch_offset += 1;
+                    return Ok(Some(flextype_to_py(py, &val)));
+                }
+                // Current batch exhausted.
+                self.current_batch = None;
+                self.batch_offset = 0;
+            }
+
+            // Pull next batch. The heavy I/O happens in the background
+            // thread; recv typically returns immediately from the prefetch
+            // buffer.
+            match self.receiver.lock().unwrap().recv() {
+                Ok(Ok(batch)) => {
+                    self.current_batch = Some(batch);
+                    // Loop back to yield from this batch.
+                }
+                Ok(Err(e)) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)));
+                }
+                Err(_) => return Ok(None), // Channel closed, stream finished.
+            }
         }
     }
 }
@@ -540,6 +574,59 @@ enum BinOp {
 }
 
 impl PySArray {
+    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let len = allow(py, move || inner.len())? as isize;
+        let idx = if index < 0 { len + index } else { index };
+        if idx < 0 || idx >= len {
+            return Err(PyIndexError::new_err("SArray index out of range"));
+        }
+        let begin = idx as u64;
+        let inner = self.inner.clone();
+        let vals = allow(py, move || {
+            let sliced = inner.slice(begin, begin + 1)?;
+            sliced.to_vec()
+        })?;
+        match vals.into_iter().next() {
+            Some(v) => Ok(flextype_to_py(py, &v)),
+            None => Err(PyIndexError::new_err("SArray index out of range")),
+        }
+    }
+
+    fn getitem_slice(
+        &self,
+        slice: &Bound<'_, pyo3::types::PySlice>,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let len = allow(py, move || inner.len())? as isize;
+
+        let indices = slice.indices(len)?;
+        let start = indices.start;
+        let stop = indices.stop;
+        let step = indices.step;
+
+        if step != 1 {
+            return Err(PyValueError::new_err(
+                "SArray slicing with step != 1 is not supported",
+            ));
+        }
+
+        if start >= stop {
+            // Empty slice
+            let inner = self.inner.clone();
+            let empty = SArray::from_vec(vec![], inner.dtype())
+                .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+            return Ok(PySArray::new(empty).into_pyobject(py)?.into_any().unbind());
+        }
+
+        let begin = start as u64;
+        let end = stop as u64;
+        let inner = self.inner.clone();
+        let sliced = allow(py, move || inner.slice(begin, end))?;
+        Ok(PySArray::new(sliced).into_pyobject(py)?.into_any().unbind())
+    }
+
     fn binop(&self, other: &Bound<'_, PyAny>, op: BinOp) -> PyResult<PySArray> {
         if let Ok(rhs) = other.extract::<PyRef<PySArray>>() {
             let result = match op {
