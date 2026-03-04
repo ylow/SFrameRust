@@ -1584,13 +1584,20 @@ impl std::fmt::Display for SFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let max_display = 10;
 
-        // Stream at most max_display rows instead of materializing the whole table.
-        let batch = match self
-            .compile_stream()
-            .and_then(|s| materialize_head_sync(s, max_display))
-        {
-            Ok(b) => b,
-            Err(e) => return write!(f, "[SFrame error: {}]", e),
+        // Try slicing first to avoid reading the entire dataset.
+        // Falls back to compile_stream + materialize_head if slicing isn't possible.
+        let batch = match self.try_slice(0, (max_display as u64).min(self.known_len().unwrap_or(max_display as u64))) {
+            Ok(sliced) => match sliced.compile_stream().and_then(|s| materialize_sync(s)) {
+                Ok(b) => b,
+                Err(e) => return write!(f, "[SFrame error: {}]", e),
+            },
+            Err(_) => match self
+                .compile_stream()
+                .and_then(|s| materialize_head_sync(s, max_display))
+            {
+                Ok(b) => b,
+                Err(e) => return write!(f, "[SFrame error: {}]", e),
+            },
         };
 
         // Get total row count cheaply (no materialization).
