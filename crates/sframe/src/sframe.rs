@@ -241,6 +241,7 @@ fn write_to_cache(batch: SFrameRows, column_names: Vec<String>) -> Result<SFrame
 }
 
 /// A columnar dataframe with lazy evaluation.
+#[derive(Clone)]
 pub struct SFrame {
     columns: Vec<SArray>,
     column_names: Vec<String>,

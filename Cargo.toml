@@ -7,4 +7,5 @@ members = [
     "crates/sframe-storage",
     "crates/sframe-query",
     "crates/sframe",
+    "crates/sframe-py",
 ]
