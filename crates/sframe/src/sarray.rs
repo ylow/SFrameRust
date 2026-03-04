@@ -2162,4 +2162,20 @@ mod tests {
         assert!(sa.slice(0, 11).is_err());
         assert!(sa.slice(5, 3).is_err());
     }
+
+    #[test]
+    fn test_sarray_slice_appended() {
+        let a: Vec<FlexType> = (0..30).map(|i| FlexType::Integer(i)).collect();
+        let b: Vec<FlexType> = (30..50).map(|i| FlexType::Integer(i)).collect();
+        let sa_a = SArray::from_vec(a, FlexTypeEnum::Integer).unwrap();
+        let sa_b = SArray::from_vec(b, FlexTypeEnum::Integer).unwrap();
+        let appended = sa_a.append(&sa_b).unwrap();
+        assert_eq!(appended.len().unwrap(), 50);
+
+        // Slice across the boundary
+        let sliced = appended.slice(25, 35).unwrap();
+        let result = sliced.to_vec().unwrap();
+        let expected: Vec<FlexType> = (25..35).map(|i| FlexType::Integer(i)).collect();
+        assert_eq!(result, expected);
+    }
 }

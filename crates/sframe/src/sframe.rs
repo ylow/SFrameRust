@@ -2376,4 +2376,20 @@ mod tests {
         ]).unwrap();
         assert!(sf.slice(0, 11).is_err());
     }
+
+    #[test]
+    fn test_sframe_slice_preserves_laziness() {
+        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
+        let added = sf.add_column(
+            "y",
+            sf.column("x").unwrap().add_scalar(FlexType::Integer(1)),
+        ).unwrap();
+        let sliced = added.slice(90, 100).unwrap();
+        assert_eq!(sliced.num_rows().unwrap(), 10);
+        let x = sliced.column("x").unwrap().to_vec().unwrap();
+        let expected: Vec<FlexType> = (90..100).map(|i| FlexType::Integer(i)).collect();
+        assert_eq!(x, expected);
+    }
 }
