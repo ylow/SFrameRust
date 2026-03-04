@@ -821,6 +821,211 @@ fn slice_recursive(
     }
 }
 
+// ---------------------------------------------------------------------------
+// ColumnEval: evaluates a single output column from a base plan's row.
+// ---------------------------------------------------------------------------
+
+/// Evaluates a single output column's value from a base plan's row.
+///
+/// Used by plan fusion to describe how each output column is computed from the
+/// base source's row data, without materializing intermediate plans.
+pub enum ColumnEval {
+    /// Direct column from the base batch.
+    Project(usize),
+    /// Unary transform on an inner evaluator.
+    Transform {
+        input: Box<ColumnEval>,
+        func: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync>,
+    },
+    /// Binary transform on two inner evaluators.
+    BinaryTransform {
+        left: Box<ColumnEval>,
+        right: Box<ColumnEval>,
+        func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
+    },
+    /// GeneralizedTransform whose input IS the base -- call func on full row,
+    /// take the value at `output_index`.
+    GeneralizedProject {
+        func: Arc<dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync>,
+        output_index: usize,
+    },
+}
+
+impl ColumnEval {
+    /// Evaluate this expression given a base row (one FlexType per base column).
+    pub fn evaluate(&self, base_row: &[FlexType]) -> FlexType {
+        match self {
+            ColumnEval::Project(idx) => base_row[*idx].clone(),
+            ColumnEval::Transform { input, func } => {
+                let val = input.evaluate(base_row);
+                func(&val)
+            }
+            ColumnEval::BinaryTransform { left, right, func } => {
+                let l = left.evaluate(base_row);
+                let r = right.evaluate(base_row);
+                func(&l, &r)
+            }
+            ColumnEval::GeneralizedProject { func, output_index } => {
+                let outputs = func(base_row);
+                outputs[*output_index].clone()
+            }
+        }
+    }
+}
+
+/// Walk from a column's plan root toward the base (identified by content_hash).
+/// Returns `None` if the chain contains non-fusible operators (Filter, Append,
+/// Reduce, etc.).
+///
+/// `plan` is the plan node to walk, `col_idx` is the column index we want from
+/// that node's output, and `base_hash` is the content_hash of the base plan we
+/// are fusing toward.
+pub fn try_build_evaluator(
+    plan: &Arc<PlannerNode>,
+    col_idx: usize,
+    base_hash: u64,
+) -> Option<ColumnEval> {
+    // Base case: we've reached the base plan itself.
+    if plan.content_hash() == base_hash {
+        return Some(ColumnEval::Project(col_idx));
+    }
+
+    match &plan.op {
+        LogicalOp::Project { column_indices } => {
+            // Map our output col_idx through the projection indices.
+            if col_idx >= column_indices.len() {
+                return None;
+            }
+            let input_col = column_indices[col_idx];
+            try_build_evaluator(&plan.inputs[0], input_col, base_hash)
+        }
+
+        LogicalOp::Transform { input_column, func, .. } => {
+            // Transform produces a single output column (index 0).
+            if col_idx != 0 {
+                return None;
+            }
+            let input_eval = try_build_evaluator(&plan.inputs[0], *input_column, base_hash)?;
+            Some(ColumnEval::Transform {
+                input: Box::new(input_eval),
+                func: func.clone(),
+            })
+        }
+
+        LogicalOp::BinaryTransform { left_column, right_column, func, .. } => {
+            // BinaryTransform produces a single output column (index 0).
+            if col_idx != 0 {
+                return None;
+            }
+            let left_eval = try_build_evaluator(&plan.inputs[0], *left_column, base_hash)?;
+            let right_eval = try_build_evaluator(&plan.inputs[0], *right_column, base_hash)?;
+            Some(ColumnEval::BinaryTransform {
+                left: Box::new(left_eval),
+                right: Box::new(right_eval),
+                func: func.clone(),
+            })
+        }
+
+        LogicalOp::GeneralizedTransform { func, .. } => {
+            // Only fusible if the input IS the base plan directly.
+            if plan.inputs[0].content_hash() == base_hash {
+                Some(ColumnEval::GeneralizedProject {
+                    func: func.clone(),
+                    output_index: col_idx,
+                })
+            } else {
+                None
+            }
+        }
+
+        // Source nodes that don't match the base hash -- unfusible.
+        LogicalOp::SFrameSource { .. }
+        | LogicalOp::MaterializedSource { .. }
+        | LogicalOp::Range { .. } => None,
+
+        // Multi-input or sub-linear operators are not fusible.
+        LogicalOp::Filter { .. }
+        | LogicalOp::LogicalFilter
+        | LogicalOp::Append
+        | LogicalOp::Union
+        | LogicalOp::Reduce { .. } => None,
+    }
+}
+
+/// Walk a plan chain to find the leaf source node. Follows single-input linear
+/// ops (Transform, BinaryTransform, Project, GeneralizedTransform). Stops at
+/// Source ops (which are the leaf), or returns `None` for multi-input or
+/// sub-linear ops.
+fn find_leaf_source(plan: &Arc<PlannerNode>) -> Option<Arc<PlannerNode>> {
+    match &plan.op {
+        // Source nodes are the leaf.
+        LogicalOp::SFrameSource { .. }
+        | LogicalOp::MaterializedSource { .. }
+        | LogicalOp::Range { .. } => Some(plan.clone()),
+
+        // Single-input linear ops: recurse into inputs[0].
+        LogicalOp::Project { .. }
+        | LogicalOp::Transform { .. }
+        | LogicalOp::BinaryTransform { .. }
+        | LogicalOp::GeneralizedTransform { .. } => {
+            find_leaf_source(&plan.inputs[0])
+        }
+
+        // Everything else is not fusible.
+        LogicalOp::Filter { .. }
+        | LogicalOp::LogicalFilter
+        | LogicalOp::Append
+        | LogicalOp::Union
+        | LogicalOp::Reduce { .. } => None,
+    }
+}
+
+/// Given N `(plan, column_index, dtype)` tuples, try to find a common base plan
+/// and build a single fused plan that produces all columns.
+///
+/// Returns `None` if columns can't be fused (no common base, or unfusible ops
+/// in any chain).
+pub fn try_fuse_plans(
+    columns: &[(Arc<PlannerNode>, usize, FlexTypeEnum)],
+) -> Option<Arc<PlannerNode>> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    // Step 1: For each column, find the leaf source.
+    let mut leaves: Vec<Arc<PlannerNode>> = Vec::with_capacity(columns.len());
+    for (plan, _, _) in columns {
+        let leaf = find_leaf_source(plan)?;
+        leaves.push(leaf);
+    }
+
+    // Step 2: Check that all leaves have the same content_hash.
+    let base_hash = leaves[0].content_hash();
+    for leaf in &leaves[1..] {
+        if leaf.content_hash() != base_hash {
+            return None;
+        }
+    }
+
+    // Step 3: Use the first leaf as the base plan (they're equivalent by hash).
+    let base_plan = leaves.into_iter().next().unwrap();
+
+    // Step 4: Build evaluators for each column.
+    let mut evaluators: Vec<ColumnEval> = Vec::with_capacity(columns.len());
+    for (plan, col_idx, _) in columns {
+        let eval = try_build_evaluator(plan, *col_idx, base_hash)?;
+        evaluators.push(eval);
+    }
+
+    // Step 5: Build a GeneralizedTransform on the base plan.
+    let output_types: Vec<FlexTypeEnum> = columns.iter().map(|c| c.2).collect();
+    let func = Arc::new(move |row: &[FlexType]| -> Vec<FlexType> {
+        evaluators.iter().map(|e| e.evaluate(row)).collect()
+    });
+
+    Some(PlannerNode::generalized_transform(base_plan, func, output_types))
+}
+
 fn plan_output_types(plan: &Arc<PlannerNode>) -> Vec<FlexTypeEnum> {
     match &plan.op {
         LogicalOp::SFrameSource { column_types, .. } => column_types.clone(),
@@ -1126,5 +1331,239 @@ mod tests {
             50,
         ).unwrap();
         assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    // ColumnEval tests
+
+    #[test]
+    fn test_eval_project() {
+        let row = vec![
+            FlexType::Integer(10),
+            FlexType::Float(3.14),
+            FlexType::String("hello".into()),
+        ];
+        let eval = ColumnEval::Project(1);
+        assert_eq!(eval.evaluate(&row), FlexType::Float(3.14));
+    }
+
+    #[test]
+    fn test_eval_transform() {
+        let row = vec![
+            FlexType::Integer(10),
+            FlexType::Integer(20),
+        ];
+        let eval = ColumnEval::Transform {
+            input: Box::new(ColumnEval::Project(1)),
+            func: Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(i * 3),
+                _ => FlexType::Undefined,
+            }),
+        };
+        assert_eq!(eval.evaluate(&row), FlexType::Integer(60));
+    }
+
+    #[test]
+    fn test_eval_binary_transform() {
+        let row = vec![
+            FlexType::Integer(10),
+            FlexType::Integer(20),
+        ];
+        let eval = ColumnEval::BinaryTransform {
+            left: Box::new(ColumnEval::Project(0)),
+            right: Box::new(ColumnEval::Project(1)),
+            func: Arc::new(|a: &FlexType, b: &FlexType| match (a, b) {
+                (FlexType::Integer(x), FlexType::Integer(y)) => FlexType::Integer(x + y),
+                _ => FlexType::Undefined,
+            }),
+        };
+        assert_eq!(eval.evaluate(&row), FlexType::Integer(30));
+    }
+
+    #[test]
+    fn test_eval_chained_transforms() {
+        // Transform(Transform(Project(2), *2), +1)
+        let row = vec![
+            FlexType::Integer(0),
+            FlexType::Integer(0),
+            FlexType::Integer(5),
+        ];
+        let inner = ColumnEval::Transform {
+            input: Box::new(ColumnEval::Project(2)),
+            func: Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(i * 2),
+                _ => FlexType::Undefined,
+            }),
+        };
+        let outer = ColumnEval::Transform {
+            input: Box::new(inner),
+            func: Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(i + 1),
+                _ => FlexType::Undefined,
+            }),
+        };
+        assert_eq!(outer.evaluate(&row), FlexType::Integer(11)); // (5*2)+1 = 11
+    }
+
+    #[test]
+    fn test_eval_generalized_project() {
+        let row = vec![
+            FlexType::Integer(10),
+            FlexType::Integer(20),
+        ];
+        let eval = ColumnEval::GeneralizedProject {
+            func: Arc::new(|r: &[FlexType]| {
+                // Output: [sum, product]
+                match (&r[0], &r[1]) {
+                    (FlexType::Integer(a), FlexType::Integer(b)) => {
+                        vec![FlexType::Integer(a + b), FlexType::Integer(a * b)]
+                    }
+                    _ => vec![FlexType::Undefined, FlexType::Undefined],
+                }
+            }),
+            output_index: 1,
+        };
+        assert_eq!(eval.evaluate(&row), FlexType::Integer(200)); // 10*20
+    }
+
+    // try_build_evaluator tests
+
+    #[test]
+    fn test_build_evaluator_direct_col() {
+        // Column IS base -> Project
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into(), "b".into()],
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::Float],
+            100,
+        );
+        let base_hash = src.content_hash();
+        let eval = try_build_evaluator(&src, 1, base_hash).unwrap();
+        // Should be Project(1)
+        let row = vec![FlexType::Integer(42), FlexType::Float(3.14)];
+        assert_eq!(eval.evaluate(&row), FlexType::Float(3.14));
+    }
+
+    #[test]
+    fn test_build_evaluator_transform() {
+        // Source -> Transform(col=0, *2) : output is 1 column
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let base_hash = src.content_hash();
+        let xform = PlannerNode::transform(
+            src,
+            0,
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(i * 2),
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Integer,
+        );
+        let eval = try_build_evaluator(&xform, 0, base_hash).unwrap();
+        let row = vec![FlexType::Integer(7)];
+        assert_eq!(eval.evaluate(&row), FlexType::Integer(14));
+    }
+
+    #[test]
+    fn test_build_evaluator_filter_fails() {
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let base_hash = src.content_hash();
+        let filtered = PlannerNode::filter(
+            src,
+            0,
+            Arc::new(|_: &FlexType| true),
+        );
+        // Can't fuse through a filter
+        assert!(try_build_evaluator(&filtered, 0, base_hash).is_none());
+    }
+
+    // try_fuse_plans tests
+
+    #[test]
+    fn test_fuse_plans_shared_source() {
+        // All columns from the same source, just projections
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::Float, FlexTypeEnum::String],
+            100,
+        );
+        let col0 = PlannerNode::project(src.clone(), vec![0]);
+        let col1 = PlannerNode::project(src.clone(), vec![1]);
+        let col2 = PlannerNode::project(src.clone(), vec![2]);
+
+        let columns: Vec<(Arc<PlannerNode>, usize, FlexTypeEnum)> = vec![
+            (col0, 0, FlexTypeEnum::Integer),
+            (col1, 0, FlexTypeEnum::Float),
+            (col2, 0, FlexTypeEnum::String),
+        ];
+        let fused = try_fuse_plans(&columns).unwrap();
+        // Fused plan should be a GeneralizedTransform on the source
+        assert!(matches!(fused.op, LogicalOp::GeneralizedTransform { .. }));
+        assert_eq!(fused.length(), Some(100));
+    }
+
+    #[test]
+    fn test_fuse_plans_with_transform() {
+        // col0: direct from source col 0
+        // col1: Transform(source col 1, *2)
+        let src = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into(), "b".into()],
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::Integer],
+            50,
+        );
+
+        // col0: Project([0]) -> take column 0
+        let col0_plan = PlannerNode::project(src.clone(), vec![0]);
+
+        // col1: Transform on col 1 of source, multiplied by 2
+        let col1_plan = PlannerNode::transform(
+            src.clone(),
+            1,
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(i * 2),
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Integer,
+        );
+
+        let columns: Vec<(Arc<PlannerNode>, usize, FlexTypeEnum)> = vec![
+            (col0_plan, 0, FlexTypeEnum::Integer),
+            (col1_plan, 0, FlexTypeEnum::Integer),
+        ];
+        let fused = try_fuse_plans(&columns).unwrap();
+        assert!(matches!(fused.op, LogicalOp::GeneralizedTransform { .. }));
+        assert_eq!(fused.length(), Some(50));
+    }
+
+    #[test]
+    fn test_fuse_plans_different_sources() {
+        let src_a = PlannerNode::sframe_source(
+            "a.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+        let src_b = PlannerNode::sframe_source(
+            "b.sf",
+            vec!["col".into()],
+            vec![FlexTypeEnum::Integer],
+            100,
+        );
+
+        let columns: Vec<(Arc<PlannerNode>, usize, FlexTypeEnum)> = vec![
+            (src_a, 0, FlexTypeEnum::Integer),
+            (src_b, 0, FlexTypeEnum::Integer),
+        ];
+        assert!(try_fuse_plans(&columns).is_none());
     }
 }
