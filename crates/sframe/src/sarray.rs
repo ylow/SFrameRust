@@ -69,6 +69,11 @@ impl SArray {
         self.dtype
     }
 
+    /// Return the length if cheaply available (no materialization).
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        self.len.or_else(|| self.plan.length())
+    }
+
     /// Known length (may require materialization if unknown).
     pub fn len(&self) -> Result<u64> {
         if let Some(l) = self.len {
@@ -94,6 +99,13 @@ impl SArray {
     pub fn head(&self, n: usize) -> Result<Vec<FlexType>> {
         if n == 0 {
             return Ok(vec![]);
+        }
+        // Try slicing for O(n) reads instead of streaming.
+        if let Some(len) = self.known_len() {
+            let end = (n as u64).min(len);
+            if let Ok(sliced) = self.try_slice(0, end) {
+                return sliced.to_vec();
+            }
         }
         let stream = compile(&self.plan)?;
         let batch = materialize_head_sync(stream, n)?;
@@ -425,7 +437,11 @@ impl SArray {
         let output_type = infer_binary_output_type(self.dtype, other.dtype, &func);
 
         // Case A: same underlying plan — use GeneralizedTransform (lazy, streaming)
-        if Arc::ptr_eq(&self.plan, &other.plan) {
+        // Also matches when plans are structurally identical (same content_hash)
+        // but wrapped in different Arc instances (e.g. after slicing or rebuilding).
+        if Arc::ptr_eq(&self.plan, &other.plan)
+            || self.plan.content_hash() == other.plan.content_hash()
+        {
             let l = self.column_index;
             let r = other.column_index;
             let f = func;
@@ -481,6 +497,13 @@ impl SArray {
         if n == 0 {
             return Ok(vec![]);
         }
+        // Try slicing for O(n) reads instead of streaming all rows.
+        if let Some(len) = self.known_len() {
+            let begin = len.saturating_sub(n as u64);
+            if let Ok(sliced) = self.try_slice(begin, len) {
+                return sliced.to_vec();
+            }
+        }
         let stream = compile(&self.plan)?;
         let batch = materialize_tail_sync(stream, n)?;
         let col = batch.column(self.column_index);
@@ -491,11 +514,32 @@ impl SArray {
     ///
     /// The plan must be fully linear (no Filter/LogicalFilter/Reduce).
     /// Returns an error for non-sliceable plans or out-of-bounds ranges.
-    pub fn slice(&self, begin: u64, end: u64) -> Result<SArray> {
+    pub fn try_slice(&self, begin: u64, end: u64) -> Result<SArray> {
         use sframe_query::planner::slice_plan;
         let sliced = slice_plan(&self.plan, begin, end)?;
         let new_len = end - begin;
         Ok(SArray::from_plan(sliced, self.dtype, Some(new_len), self.column_index))
+    }
+
+    /// Slice this array to rows `[begin, end)`.
+    ///
+    /// Tries lazy plan rewriting first. If the plan is not sliceable
+    /// (contains Filter/LogicalFilter/Reduce), falls back to materializing.
+    pub fn slice(&self, begin: u64, end: u64) -> Result<SArray> {
+        if let Ok(sa) = self.try_slice(begin, end) {
+            return Ok(sa);
+        }
+        // Fallback: materialize, then slice the data.
+        let len = self.len()?;
+        if begin > end || end > len {
+            return Err(SFrameError::Format(format!(
+                "Slice [{}, {}) out of range for length {}",
+                begin, end, len
+            )));
+        }
+        let all = self.to_vec()?;
+        let sliced = all[begin as usize..end as usize].to_vec();
+        SArray::from_vec(sliced, self.dtype)
     }
 
     /// Sort the array.
@@ -1243,7 +1287,10 @@ impl std::fmt::Display for SArray {
             Ok(v) => v,
             Err(e) => return write!(f, "[SArray error: {}]", e),
         };
-        let len = self.len.map(|l| l.to_string()).unwrap_or("?".to_string());
+        let len = self.len
+            .or_else(|| self.plan.length())
+            .map(|l| l.to_string())
+            .unwrap_or("?".to_string());
 
         writeln!(f, "dtype: {}", self.dtype)?;
         writeln!(f, "Rows: {}", len)?;
@@ -2139,11 +2186,17 @@ mod tests {
     }
 
     #[test]
-    fn test_sarray_slice_rejects_filtered() {
+    fn test_sarray_try_slice_rejects_filtered() {
         let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let filtered = sa.filter(Arc::new(|_| true));
-        assert!(filtered.slice(0, 10).is_err());
+        // try_slice fails on non-linear plans
+        assert!(filtered.try_slice(0, 10).is_err());
+        // slice falls back to materialization
+        let sliced = filtered.slice(0, 10).unwrap();
+        let result = sliced.to_vec().unwrap();
+        let expected: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        assert_eq!(result, expected);
     }
 
     #[test]
