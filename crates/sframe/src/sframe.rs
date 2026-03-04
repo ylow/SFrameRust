@@ -524,6 +524,60 @@ impl SFrame {
         self.from_batch(filtered)
     }
 
+    /// Filter rows using a boolean mask SArray.
+    ///
+    /// Keeps rows where `mask` is non-zero. The mask must be an Integer
+    /// SArray of the same length. This is the SArray-based alternative to
+    /// `filter()` — useful when the mask is computed from scalar comparisons
+    /// or logical combinations of SArrays.
+    ///
+    /// ```ignore
+    /// let mask = sf.column("score").gt_scalar(500);
+    /// let filtered = sf.logical_filter(mask)?;
+    /// ```
+    pub fn logical_filter(&self, mask: SArray) -> Result<SFrame> {
+        if let Some(plan) = self.shared_plan() {
+            let filtered_plan = PlannerNode::logical_filter(plan.clone(), mask.plan().clone());
+
+            let columns: Vec<SArray> = self
+                .columns
+                .iter()
+                .map(|c| {
+                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, c.column_index())
+                })
+                .collect();
+
+            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
+        }
+
+        // Fallback: materialize both sides
+        let batch = self.materialize_batch()?;
+        let mask_vals = mask.to_vec()?;
+        let nrows = batch.num_rows();
+        let ncols = batch.num_columns();
+
+        if mask_vals.len() != nrows {
+            return Err(SFrameError::Format(format!(
+                "logical_filter: mask length {} != frame rows {}",
+                mask_vals.len(), nrows
+            )));
+        }
+
+        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        for (row, m) in mask_vals.iter().enumerate() {
+            let keep = matches!(m, FlexType::Integer(i) if *i != 0);
+            if keep {
+                for col in 0..ncols {
+                    col_vecs[col].push(batch.column(col).get(row).clone());
+                }
+            }
+        }
+
+        let dtypes = self.column_types();
+        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        self.from_batch(result)
+    }
+
     /// Append another SFrame vertically.
     ///
     /// Returns a lazy SFrame backed by an Append plan node when possible,

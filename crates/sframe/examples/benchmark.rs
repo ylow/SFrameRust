@@ -32,7 +32,10 @@ fn main() {
     let csv_path = format!("bench.csv");
 
     // Force-initialize the global cache so the spill directory is created.
-    let cache_dir = sframe_io::cache_fs::global_cache_fs().root().to_string_lossy().to_string();
+    let cache_dir = sframe_io::cache_fs::global_cache_fs()
+        .root()
+        .to_string_lossy()
+        .to_string();
     let n_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
@@ -81,6 +84,24 @@ fn main() {
         .unwrap();
     println!();
     println!("  Filter query plan:");
+    for line in filtered.explain().lines() {
+        println!("    {}", line);
+    }
+    println!();
+    let t = Instant::now();
+    let filt_n = filtered.num_rows().unwrap() as usize;
+    report(
+        &format!("Filter (score > 500) -> {} rows", format_num(filt_n)),
+        n,
+        t,
+    );
+
+    // ── Filter 2 ────────────────────────────────────────────────────────
+    let filtered = sf
+        .logical_filter(sf.column("score").unwrap().gt_scalar(FlexType::Integer(500)))
+        .unwrap();
+    println!();
+    println!("  Filter 2 query plan:");
     for line in filtered.explain().lines() {
         println!("    {}", line);
     }

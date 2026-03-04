@@ -142,6 +142,42 @@ impl SArray {
         }
     }
 
+    /// Filter elements using a boolean mask SArray.
+    ///
+    /// Keeps elements where `mask` is non-zero. The mask must be an Integer
+    /// SArray of the same length.
+    pub fn logical_filter(&self, mask: &SArray) -> Result<SArray> {
+        if Arc::ptr_eq(&self.plan, &mask.plan) {
+            // Same plan — use LogicalFilter lazily
+            let data = PlannerNode::project(self.plan.clone(), vec![self.column_index]);
+            let mask_plan = PlannerNode::project(mask.plan.clone(), vec![mask.column_index]);
+            let filtered = PlannerNode::logical_filter(data, mask_plan);
+            return Ok(SArray {
+                plan: filtered,
+                dtype: self.dtype,
+                len: None,
+                column_index: 0,
+            });
+        }
+
+        // Different plans — materialize both
+        let values = self.to_vec()?;
+        let mask_vals = mask.to_vec()?;
+        if values.len() != mask_vals.len() {
+            return Err(SFrameError::Format(format!(
+                "logical_filter: length mismatch ({} vs {})",
+                values.len(), mask_vals.len()
+            )));
+        }
+        let result: Vec<FlexType> = values
+            .into_iter()
+            .zip(mask_vals.iter())
+            .filter(|(_, m)| matches!(m, FlexType::Integer(i) if *i != 0))
+            .map(|(v, _)| v)
+            .collect();
+        SArray::from_vec(result, self.dtype)
+    }
+
     // === Element-wise binary operations ===
 
     /// Element-wise addition: self + other.
@@ -209,6 +245,15 @@ impl SArray {
         )
     }
 
+    /// Remainder of each element by a scalar. Integer only.
+    pub fn rem_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar.clone();
+        self.apply(
+            Arc::new(move |v| v.clone() % s.clone()),
+            result_type_for_arith(self.dtype, scalar.type_enum()),
+        )
+    }
+
     // === Comparison operations (return Integer 0/1) ===
 
     /// Element-wise equality: returns Integer array (1 where equal, 0 where not).
@@ -239,6 +284,62 @@ impl SArray {
     /// Element-wise greater-than-or-equal.
     pub fn ge(&self, other: &SArray) -> Result<SArray> {
         self.comparison_op(other, Arc::new(|a, b| a >= b))
+    }
+
+    // === Scalar comparison operations (return Integer 0/1) ===
+
+    /// Compare each element to a scalar for equality.
+    pub fn eq_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v == &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Compare each element to a scalar for inequality.
+    pub fn ne_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v != &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Compare each element < scalar.
+    pub fn lt_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v < &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Compare each element <= scalar.
+    pub fn le_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v <= &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Compare each element > scalar.
+    pub fn gt_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v > &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
+    }
+
+    /// Compare each element >= scalar.
+    pub fn ge_scalar(&self, scalar: FlexType) -> SArray {
+        let s = scalar;
+        self.apply(
+            Arc::new(move |v| FlexType::Integer(if v >= &s { 1 } else { 0 })),
+            FlexTypeEnum::Integer,
+        )
     }
 
     // === Logical operations ===
