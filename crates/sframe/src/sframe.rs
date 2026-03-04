@@ -21,7 +21,7 @@ use sframe_query::execute::{
     compile, for_each_batch_sync, materialize_head_sync, materialize_sync, materialize_tail_sync,
 };
 use sframe_query::optimizer;
-use sframe_query::planner::PlannerNode;
+use sframe_query::planner::{try_fuse_plans, PlannerNode};
 use sframe_storage::sframe_writer::SFrameWriter;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -365,6 +365,15 @@ impl SFrame {
         self.columns[0].len()
     }
 
+    /// Return the row count if cheaply available (no materialization).
+    fn known_len(&self) -> Option<u64> {
+        if self.columns.is_empty() {
+            Some(0)
+        } else {
+            self.columns[0].known_len()
+        }
+    }
+
     /// Number of columns.
     pub fn num_columns(&self) -> usize {
         self.columns.len()
@@ -662,6 +671,13 @@ impl SFrame {
             let dtypes = self.column_types();
             let batch = SFrameRows::empty(&dtypes);
             return self.from_batch(batch);
+        }
+        // Try slicing for O(n) reads instead of streaming.
+        if let Some(len) = self.known_len() {
+            let end = (n as u64).min(len);
+            if let Ok(sliced) = self.try_slice(0, end) {
+                return Ok(sliced);
+            }
         }
         let stream = self.compile_stream()?;
         let batch = materialize_head_sync(stream, n)?;
@@ -1350,6 +1366,13 @@ impl SFrame {
             let batch = SFrameRows::empty(&dtypes);
             return self.from_batch(batch);
         }
+        // Try slicing for O(n) reads instead of streaming all rows.
+        if let Some(len) = self.known_len() {
+            let begin = len.saturating_sub(n as u64);
+            if let Ok(sliced) = self.try_slice(begin, len) {
+                return Ok(sliced);
+            }
+        }
         let stream = self.compile_stream()?;
         let batch = materialize_tail_sync(stream, n)?;
         self.from_batch(batch)
@@ -1358,17 +1381,42 @@ impl SFrame {
     /// Lazily slice this SFrame to rows `[begin, end)`.
     ///
     /// All column plans must be fully linear (no Filter/LogicalFilter/Reduce).
-    pub fn slice(&self, begin: u64, end: u64) -> Result<SFrame> {
+    /// Returns an error for non-sliceable plans or out-of-bounds ranges.
+    pub fn try_slice(&self, begin: u64, end: u64) -> Result<SFrame> {
         let new_columns: Vec<SArray> = self
             .columns
             .iter()
-            .map(|col| col.slice(begin, end))
+            .map(|col| col.try_slice(begin, end))
             .collect::<Result<Vec<_>>>()?;
         Ok(SFrame {
             columns: new_columns,
             column_names: self.column_names.clone(),
             metadata: self.metadata.clone(),
         })
+    }
+
+    /// Slice this SFrame to rows `[begin, end)`.
+    ///
+    /// Tries lazy plan rewriting first. If the plan is not sliceable,
+    /// falls back to materializing.
+    pub fn slice(&self, begin: u64, end: u64) -> Result<SFrame> {
+        if let Ok(sf) = self.try_slice(begin, end) {
+            return Ok(sf);
+        }
+        // Fallback: materialize the needed range via streaming.
+        let len = self.num_rows()?;
+        if begin > end || end > len {
+            return Err(SFrameError::Format(format!(
+                "Slice [{}, {}) out of range for length {}",
+                begin, end, len
+            )));
+        }
+        // Stream head(end), then take the tail portion.
+        let stream = self.compile_stream()?;
+        let batch = materialize_head_sync(stream, end as usize)?;
+        let indices: Vec<usize> = (begin as usize..end as usize).collect();
+        let sliced = batch.take(&indices)?;
+        self.from_batch(sliced)
     }
 
     /// Materialize all lazy computations.
@@ -1457,17 +1505,28 @@ impl SFrame {
             return compile(&plan);
         }
 
+        // Fast path: all columns share exact same plan Arc
         if let Some(plan) = self.shared_plan() {
             let indices: Vec<usize> =
                 self.columns.iter().map(|c| c.column_index()).collect();
             let projected = PlannerNode::project(plan.clone(), indices);
-            compile(&projected)
-        } else {
-            // Different plans: materialize all columns and wrap as a single batch
-            let batch = self.materialize_batch()?;
-            let plan = PlannerNode::materialized(batch);
-            compile(&plan)
+            return compile(&projected);
         }
+
+        // Medium path: try plan fusion via content hash
+        let col_specs: Vec<_> = self
+            .columns
+            .iter()
+            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
+            .collect();
+        if let Some(fused) = try_fuse_plans(&col_specs) {
+            return compile(&fused);
+        }
+
+        // Slow path: materialize all columns and wrap as a single batch
+        let batch = self.materialize_batch()?;
+        let plan = PlannerNode::materialized(batch);
+        compile(&plan)
     }
 
     fn column_index(&self, name: &str) -> Result<usize> {
@@ -1493,16 +1552,27 @@ impl SFrame {
 
             // Project to just the columns we need
             let indices: Vec<usize> = self.columns.iter().map(|c| c.column_index()).collect();
-            batch.select_columns(&indices)
-        } else {
-            // Materialize each column independently
-            let mut column_vecs: Vec<Vec<FlexType>> = Vec::new();
-            for col in &self.columns {
-                column_vecs.push(col.to_vec()?);
-            }
-            let dtypes: Vec<FlexTypeEnum> = self.columns.iter().map(|c| c.dtype()).collect();
-            SFrameRows::from_column_vecs(column_vecs, &dtypes)
+            return batch.select_columns(&indices);
         }
+
+        // Medium path: try plan fusion via content hash
+        let col_specs: Vec<_> = self
+            .columns
+            .iter()
+            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
+            .collect();
+        if let Some(fused) = try_fuse_plans(&col_specs) {
+            let stream = compile(&fused)?;
+            return materialize_sync(stream);
+        }
+
+        // Slow path: materialize each column independently
+        let mut column_vecs: Vec<Vec<FlexType>> = Vec::new();
+        for col in &self.columns {
+            column_vecs.push(col.to_vec()?);
+        }
+        let dtypes: Vec<FlexTypeEnum> = self.columns.iter().map(|c| c.dtype()).collect();
+        SFrameRows::from_column_vecs(column_vecs, &dtypes)
     }
 
     fn from_batch(&self, batch: SFrameRows) -> Result<SFrame> {
@@ -1523,12 +1593,8 @@ impl std::fmt::Display for SFrame {
             Err(e) => return write!(f, "[SFrame error: {}]", e),
         };
 
-        // Get total row count from metadata (cheap when cached).
-        let nrows = match self.num_rows() {
-            Ok(n) => n as usize,
-            // If unknown, we only know we have at least this many rows.
-            Err(_) => batch.num_rows(),
-        };
+        // Get total row count cheaply (no materialization).
+        let known_len: Option<u64> = self.known_len();
         let ncols = self.column_names.len();
 
         // Determine column widths
@@ -1597,7 +1663,12 @@ impl std::fmt::Display for SFrame {
             writeln!(f, "{}", row)?;
         }
 
-        if nrows > max_display {
+        // Show "..." if there are (or might be) more rows than displayed.
+        let has_more = match known_len {
+            Some(n) => n as usize > display_rows,
+            None => display_rows >= max_display,
+        };
+        if has_more {
             let dots: String = col_widths
                 .iter()
                 .map(|&w| format!("| {:width$} ", "...", width = w))
@@ -1608,7 +1679,12 @@ impl std::fmt::Display for SFrame {
         }
 
         writeln!(f, "{}", sep)?;
-        write!(f, "[{} rows x {} columns]", nrows, ncols)
+        let len_str = match known_len {
+            Some(n) => n.to_string(),
+            None if !has_more => display_rows.to_string(),
+            None => "?".to_string(),
+        };
+        write!(f, "[{} rows x {} columns]", len_str, ncols)
     }
 }
 
