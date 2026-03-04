@@ -12,7 +12,7 @@ use sframe_query::algorithms::aggregators::{
     StdDevAggregator, SumAggregator, VarianceAggregator,
 };
 use sframe_query::batch::{ColumnData, SFrameRows};
-use sframe_query::execute::{compile, materialize_head_sync, materialize_sync};
+use sframe_query::execute::{compile, materialize_head_sync, materialize_sync, materialize_tail_sync};
 use sframe_query::planner::{Aggregator, PlannerNode};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -74,6 +74,10 @@ impl SArray {
         if let Some(l) = self.len {
             return Ok(l);
         }
+        // Try plan-level length propagation before materializing
+        if let Some(l) = self.plan.length() {
+            return Ok(l);
+        }
         let data = self.materialize_column()?;
         Ok(data.len() as u64)
     }
@@ -105,6 +109,41 @@ impl SArray {
         }
         let col = batch.column(self.column_index);
         Ok((0..col.len()).map(|i| col.get(i)).collect())
+    }
+
+    /// Compile the plan and stream batches through a bounded channel.
+    ///
+    /// Returns `(receiver, column_index)`. A background thread drives the
+    /// stream, sending each `SFrameRows` batch through the channel.  The
+    /// receiver yields batches in order; the caller should extract column
+    /// `column_index` from each batch. Memory is bounded to `buffer + 1`
+    /// batches.
+    pub fn batch_channel(
+        &self,
+        buffer: usize,
+    ) -> Result<(std::sync::mpsc::Receiver<Result<SFrameRows>>, usize)> {
+        let stream = compile(&self.plan)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(buffer);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(SFrameError::Format(
+                        format!("Failed to create tokio runtime: {}", e),
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let mut stream = stream;
+                while let Some(batch_result) = futures::StreamExt::next(&mut stream).await {
+                    if tx.send(batch_result).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+            });
+        });
+        Ok((rx, self.column_index))
     }
 
     /// Apply a unary transform, producing a new SArray.
@@ -435,10 +474,28 @@ impl SArray {
     // === Phase 10.1: Core operations ===
 
     /// Return the last n values.
+    ///
+    /// Streams the entire plan but only keeps the last n rows in memory,
+    /// so peak memory is O(n) regardless of total array size.
     pub fn tail(&self, n: usize) -> Result<Vec<FlexType>> {
-        let all = self.to_vec()?;
-        let start = all.len().saturating_sub(n);
-        Ok(all[start..].to_vec())
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let stream = compile(&self.plan)?;
+        let batch = materialize_tail_sync(stream, n)?;
+        let col = batch.column(self.column_index);
+        Ok((0..col.len()).map(|i| col.get(i)).collect())
+    }
+
+    /// Lazily slice this array to rows `[begin, end)`.
+    ///
+    /// The plan must be fully linear (no Filter/LogicalFilter/Reduce).
+    /// Returns an error for non-sliceable plans or out-of-bounds ranges.
+    pub fn slice(&self, begin: u64, end: u64) -> Result<SArray> {
+        use sframe_query::planner::slice_plan;
+        let sliced = slice_plan(&self.plan, begin, end)?;
+        let new_len = end - begin;
+        Ok(SArray::from_plan(sliced, self.dtype, Some(new_len), self.column_index))
     }
 
     /// Sort the array.
@@ -517,25 +574,42 @@ impl SArray {
     }
 
     /// Random sample of the array (fraction between 0.0 and 1.0).
+    ///
+    /// Builds a lazy plan: `Range(0..len)` → seeded-hash transform → 0/1 mask
+    /// → `logical_filter`. No data is materialized until the result is consumed.
     pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SArray> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let values = self.to_vec()?;
-        let mut result = Vec::new();
+        let n = self.len()?;
         let seed = seed.unwrap_or(42);
+        let threshold = (fraction * u64::MAX as f64) as u64;
 
-        for (i, v) in values.into_iter().enumerate() {
-            let mut hasher = DefaultHasher::new();
-            (seed, i as u64).hash(&mut hasher);
-            let hash = hasher.finish();
-            let threshold = (fraction * u64::MAX as f64) as u64;
-            if hash < threshold {
-                result.push(v);
-            }
-        }
+        // Build mask: Range(0,1,n) → Transform(seeded hash → 0/1)
+        let indices = PlannerNode::range(0, 1, n);
+        let mask = PlannerNode::transform(
+            indices,
+            0,
+            Arc::new(move |v: &FlexType| {
+                if let FlexType::Integer(i) = v {
+                    let mut hasher = DefaultHasher::new();
+                    (seed, *i as u64).hash(&mut hasher);
+                    FlexType::Integer(if hasher.finish() < threshold { 1 } else { 0 })
+                } else {
+                    FlexType::Integer(0)
+                }
+            }),
+            FlexTypeEnum::Integer,
+        );
 
-        SArray::from_vec(result, self.dtype)
+        let filtered = PlannerNode::logical_filter(self.plan.clone(), mask);
+        let projected = PlannerNode::project(filtered, vec![self.column_index]);
+        Ok(SArray {
+            plan: projected,
+            dtype: self.dtype,
+            len: None,
+            column_index: 0,
+        })
     }
 
     // === Phase 10.2: Missing value handling ===
@@ -2038,5 +2112,54 @@ mod tests {
         // "warm" should be second
         assert_eq!(top[1].0, FlexType::String("warm".into()));
         assert_eq!(top[1].1, 30);
+    }
+
+    // === Slice tests ===
+
+    #[test]
+    fn test_sarray_slice() {
+        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let sliced = sa.slice(10, 20).unwrap();
+        assert_eq!(sliced.len().unwrap(), 10);
+        let result = sliced.to_vec().unwrap();
+        let expected: Vec<FlexType> = (10..20).map(|i| FlexType::Integer(i)).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sarray_slice_with_transform() {
+        let vals: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let doubled = sa.add_scalar(FlexType::Integer(100));
+        let sliced = doubled.slice(5, 10).unwrap();
+        let result = sliced.to_vec().unwrap();
+        let expected: Vec<FlexType> = (5..10).map(|i| FlexType::Integer(i + 100)).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sarray_slice_rejects_filtered() {
+        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let filtered = sa.filter(Arc::new(|_| true));
+        assert!(filtered.slice(0, 10).is_err());
+    }
+
+    #[test]
+    fn test_sarray_len_uses_plan_length() {
+        let vals: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let transformed = sa.add_scalar(FlexType::Integer(1));
+        // len() should still work via plan.length() without materializing
+        assert_eq!(transformed.len().unwrap(), 50);
+    }
+
+    #[test]
+    fn test_sarray_slice_out_of_bounds() {
+        let vals: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        assert!(sa.slice(0, 11).is_err());
+        assert!(sa.slice(5, 3).is_err());
     }
 }

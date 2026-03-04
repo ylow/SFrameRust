@@ -18,7 +18,7 @@ use sframe_query::algorithms::join::{self, JoinOn, JoinType};
 use sframe_query::algorithms::sort::{self, SortKey, SortOrder};
 use sframe_query::batch::SFrameRows;
 use sframe_query::execute::{
-    compile, for_each_batch_sync, materialize_head_sync, materialize_sync,
+    compile, for_each_batch_sync, materialize_head_sync, materialize_sync, materialize_tail_sync,
 };
 use sframe_query::optimizer;
 use sframe_query::planner::PlannerNode;
@@ -368,6 +368,39 @@ impl SFrame {
     /// Number of columns.
     pub fn num_columns(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Compile the plan and stream batches through a bounded channel.
+    ///
+    /// A background thread drives the async stream and sends each
+    /// `SFrameRows` batch through the channel. Memory is bounded to
+    /// `buffer + 1` batches.
+    pub fn batch_channel(
+        &self,
+        buffer: usize,
+    ) -> Result<std::sync::mpsc::Receiver<sframe_types::error::Result<SFrameRows>>> {
+        let stream = self.compile_stream()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(buffer);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(SFrameError::Format(
+                        format!("Failed to create tokio runtime: {}", e),
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let mut stream = stream;
+                while let Some(batch_result) = stream.next().await {
+                    if tx.send(batch_result).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+            });
+        });
+        Ok(rx)
     }
 
     /// Column names.
@@ -884,30 +917,64 @@ impl SFrame {
     // === Phase 11.3: Sampling & Splitting ===
 
     /// Random sample of rows.
+    ///
+    /// Builds a lazy plan: `Range(0..n)` → seeded-hash transform → 0/1 mask
+    /// → `logical_filter`. Falls back to materialization only when columns
+    /// have different plans.
     pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SFrame> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let batch = self.materialize_batch()?;
-        let nrows = batch.num_rows();
-        let ncols = batch.num_columns();
+        let n = self.num_rows()?;
         let seed = seed.unwrap_or(42);
         let threshold = (fraction * u64::MAX as f64) as u64;
 
-        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-        for row in 0..nrows {
-            let mut hasher = DefaultHasher::new();
-            (seed, row as u64).hash(&mut hasher);
-            if hasher.finish() < threshold {
-                for col in 0..ncols {
-                    col_vecs[col].push(batch.column(col).get(row).clone());
+        let make_mask = || {
+            let indices = PlannerNode::range(0, 1, n);
+            PlannerNode::transform(
+                indices,
+                0,
+                Arc::new(move |v: &FlexType| {
+                    if let FlexType::Integer(i) = v {
+                        let mut hasher = DefaultHasher::new();
+                        (seed, *i as u64).hash(&mut hasher);
+                        FlexType::Integer(if hasher.finish() < threshold { 1 } else { 0 })
+                    } else {
+                        FlexType::Integer(0)
+                    }
+                }),
+                FlexTypeEnum::Integer,
+            )
+        };
+
+        if let Some(plan) = self.shared_plan() {
+            let mask = make_mask();
+            let filtered = PlannerNode::logical_filter(plan.clone(), mask);
+            let columns: Vec<SArray> = self
+                .columns
+                .iter()
+                .map(|c| SArray::from_plan(filtered.clone(), c.dtype(), None, c.column_index()))
+                .collect();
+            Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
+        } else {
+            // Different plans: materialize and filter in memory.
+            let batch = self.materialize_batch()?;
+            let nrows = batch.num_rows();
+            let ncols = batch.num_columns();
+            let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+            for row in 0..nrows {
+                let mut hasher = DefaultHasher::new();
+                (seed, row as u64).hash(&mut hasher);
+                if hasher.finish() < threshold {
+                    for col in 0..ncols {
+                        col_vecs[col].push(batch.column(col).get(row).clone());
+                    }
                 }
             }
+            let dtypes = self.column_types();
+            let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+            self.from_batch(result)
         }
-
-        let dtypes = self.column_types();
-        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-        self.from_batch(result)
     }
 
     /// Random split into two SFrames.
@@ -1275,23 +1342,33 @@ impl SFrame {
     // === Phase 11.7: Tail ===
 
     /// Return the last n rows.
+    ///
+    /// Streams the plan but only retains the last n rows in memory.
     pub fn tail(&self, n: usize) -> Result<SFrame> {
-        let batch = self.materialize_batch()?;
-        let nrows = batch.num_rows();
-        if n >= nrows {
+        if n == 0 {
+            let dtypes = self.column_types();
+            let batch = SFrameRows::empty(&dtypes);
             return self.from_batch(batch);
         }
-        let start = nrows - n;
-        let ncols = batch.num_columns();
-        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-        for row in start..nrows {
-            for col in 0..ncols {
-                col_vecs[col].push(batch.column(col).get(row).clone());
-            }
-        }
-        let dtypes = self.column_types();
-        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-        self.from_batch(result)
+        let stream = self.compile_stream()?;
+        let batch = materialize_tail_sync(stream, n)?;
+        self.from_batch(batch)
+    }
+
+    /// Lazily slice this SFrame to rows `[begin, end)`.
+    ///
+    /// All column plans must be fully linear (no Filter/LogicalFilter/Reduce).
+    pub fn slice(&self, begin: u64, end: u64) -> Result<SFrame> {
+        let new_columns: Vec<SArray> = self
+            .columns
+            .iter()
+            .map(|col| col.slice(begin, end))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SFrame {
+            columns: new_columns,
+            column_names: self.column_names.clone(),
+            metadata: self.metadata.clone(),
+        })
     }
 
     /// Materialize all lazy computations.
@@ -1435,17 +1512,27 @@ impl SFrame {
 
 impl std::fmt::Display for SFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let batch = match self.materialize_batch() {
+        let max_display = 10;
+
+        // Stream at most max_display rows instead of materializing the whole table.
+        let batch = match self
+            .compile_stream()
+            .and_then(|s| materialize_head_sync(s, max_display))
+        {
             Ok(b) => b,
             Err(e) => return write!(f, "[SFrame error: {}]", e),
         };
 
-        let nrows = batch.num_rows();
+        // Get total row count from metadata (cheap when cached).
+        let nrows = match self.num_rows() {
+            Ok(n) => n as usize,
+            // If unknown, we only know we have at least this many rows.
+            Err(_) => batch.num_rows(),
+        };
         let ncols = self.column_names.len();
 
         // Determine column widths
-        let max_display = 10;
-        let display_rows = nrows.min(max_display);
+        let display_rows = batch.num_rows();
 
         let mut col_widths: Vec<usize> = self
             .column_names
@@ -2251,5 +2338,42 @@ mod tests {
         ]).unwrap();
         let result = sf.unique().unwrap();
         assert_eq!(result.num_rows().unwrap(), 2); // (1.0, 10) deduped, (2.0, 20) kept
+    }
+
+    // === Slice tests ===
+
+    #[test]
+    fn test_sframe_slice() {
+        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
+        let sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
+        let sliced = sf.slice(10, 20).unwrap();
+        assert_eq!(sliced.num_rows().unwrap(), 10);
+        let col = sliced.column("x").unwrap();
+        let result = col.to_vec().unwrap();
+        let expected: Vec<FlexType> = (10..20).map(|i| FlexType::Integer(i)).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sframe_slice_multi_column() {
+        let ints: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let floats: Vec<FlexType> = (0..50).map(|i| FlexType::Float(i as f64 * 0.5)).collect();
+        let sf = SFrame::from_columns(vec![
+            ("i", SArray::from_vec(ints, FlexTypeEnum::Integer).unwrap()),
+            ("f", SArray::from_vec(floats, FlexTypeEnum::Float).unwrap()),
+        ]).unwrap();
+        let sliced = sf.slice(5, 10).unwrap();
+        assert_eq!(sliced.num_rows().unwrap(), 5);
+        assert_eq!(sliced.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_sframe_slice_out_of_bounds() {
+        let vals: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        let sf = SFrame::from_columns(vec![
+            ("x", SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap()),
+        ]).unwrap();
+        assert!(sf.slice(0, 11).is_err());
     }
 }
