@@ -229,8 +229,6 @@ mod tests {
 
     #[test]
     fn test_not_sliceable_different_paths() {
-        use sframe_types::flex_type::FlexType;
-
         let s1 = PlannerNode::sframe_source(
             "a.sf",
             vec!["a".into()],

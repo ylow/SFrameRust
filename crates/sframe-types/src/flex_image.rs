@@ -53,7 +53,7 @@ pub struct FlexImage {
     /// Pixel/compression format.
     format: ImageFormat,
     /// Image version (for format evolution).
-    version: u8,
+    _version: u8,
 }
 
 impl FlexImage {
@@ -71,7 +71,7 @@ impl FlexImage {
             height,
             channels,
             format,
-            version: 0,
+            _version: 0,
         }
     }
 
@@ -83,7 +83,7 @@ impl FlexImage {
             height: 0,
             channels: 0,
             format: ImageFormat::Raw,
-            version: 0,
+            _version: 0,
         }
     }
 

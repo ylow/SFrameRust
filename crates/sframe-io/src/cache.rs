@@ -4,10 +4,10 @@
 //! caches file read results to avoid repeated I/O for the same data.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
-use sframe_types::error::{Result, SFrameError};
+use sframe_types::error::Result;
 
 use crate::vfs::{ReadableFile, VirtualFileSystem, WritableFile};
 
@@ -191,7 +191,6 @@ impl<F: VirtualFileSystem> VirtualFileSystem for CachedFileSystem<F> {
 mod tests {
     use super::*;
     use crate::local_fs::LocalFileSystem;
-    use std::io::Write as _;
 
     #[test]
     fn test_cached_read() {

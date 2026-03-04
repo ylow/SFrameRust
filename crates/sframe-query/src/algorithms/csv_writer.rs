@@ -208,7 +208,6 @@ fn quote_field(field: &str, options: &CsvWriterOptions) -> String {
 mod tests {
     use super::*;
     use crate::batch::ColumnData;
-    use sframe_types::flex_type::FlexTypeEnum;
 
     #[test]
     fn test_basic_csv_write() {

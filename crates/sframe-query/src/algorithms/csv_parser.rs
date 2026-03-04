@@ -1006,7 +1006,6 @@ impl CsvStreamingParse {
                                     col
                                 })
                                 .collect();
-                            total_rows += remaining;
                             consumer(truncated)?;
                             break;
                         }

@@ -377,31 +377,6 @@ fn read_columns_block_range(
 }
 
 /// Read only projected columns from a segment file.
-///
-/// Like `read_segment_independently` but only reads columns at the given
-/// indices, returning `column_indices.len()` vecs in the same order as
-/// `column_indices`. The full `column_types` slice is needed to open the
-/// segment reader for validation.
-pub(super) fn read_segment_columns_projected(
-    vfs: &dyn VirtualFileSystem,
-    segment_path: &str,
-    column_types: &[FlexTypeEnum],
-    column_indices: &[usize],
-) -> Result<Vec<Vec<FlexType>>> {
-    let file = vfs.open_read(segment_path)?;
-    let file_size = file.size()?;
-    let mut seg_reader = SegmentReader::open(
-        Box::new(file),
-        file_size,
-        column_types.to_vec(),
-    )?;
-    let mut columns = Vec::with_capacity(column_indices.len());
-    for &col_idx in column_indices {
-        columns.push(seg_reader.read_column(col_idx)?);
-    }
-    Ok(columns)
-}
-
 /// Read projected columns for a global row range `[begin_row, end_row)`
 /// across potentially multiple segments.
 ///

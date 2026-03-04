@@ -27,7 +27,6 @@ fn num_rows() -> usize {
 
 fn main() {
     let n = num_rows();
-    let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let sf_path = format!("bench.sf");
     let csv_path = format!("bench.csv");
 

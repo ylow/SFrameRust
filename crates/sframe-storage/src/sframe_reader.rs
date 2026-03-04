@@ -60,7 +60,6 @@ pub struct SFrameReader {
     pub frame_index: FrameIndex,
     pub group_index: GroupIndex,
     pub segment_readers: Vec<SegmentReader>,
-    base_path: String,
 }
 
 impl SFrameReader {
@@ -97,7 +96,6 @@ impl SFrameReader {
             frame_index: meta.frame_index,
             group_index: meta.group_index,
             segment_readers,
-            base_path: base_path.to_string(),
         })
     }
 

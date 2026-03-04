@@ -16,7 +16,6 @@ use crate::block_info::{read_block_index, BlockInfo};
 pub struct SegmentReader {
     file: Box<dyn ReadSeek>,
     pub block_index: Vec<Vec<BlockInfo>>,
-    column_types: Vec<FlexTypeEnum>,
 }
 
 /// Helper trait combining Read + Seek for boxed storage.
@@ -43,7 +42,6 @@ impl SegmentReader {
         Ok(SegmentReader {
             file,
             block_index,
-            column_types,
         })
     }
 

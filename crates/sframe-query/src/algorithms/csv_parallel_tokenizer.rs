@@ -56,29 +56,6 @@ impl DenseBitset {
         (self.bits[word] >> bit) & 1 != 0
     }
 
-    /// Set the bit at `idx` to `val`.
-    pub fn set_to(&mut self, idx: usize, val: bool) {
-        debug_assert!(idx < self.len);
-        if val {
-            self.set(idx);
-        } else {
-            self.clear_bit(idx);
-        }
-    }
-
-    /// Zero all bits, keeping the current allocation and length.
-    pub fn clear_all(&mut self) {
-        self.bits.fill(0);
-    }
-
-    /// Resize to `len` bits and zero everything.
-    /// Reuses the existing heap allocation when possible.
-    pub fn resize_and_clear(&mut self, len: usize) {
-        let num_words = (len + 63) / 64;
-        self.bits.clear();
-        self.bits.resize(num_words, 0);
-        self.len = len;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,45 +1533,24 @@ mod tests {
     }
 
     #[test]
-    fn test_bitset_clear_all() {
-        let mut bs = DenseBitset::new(200);
-
-        // Set a spread of bits across multiple words.
-        for i in [0, 33, 64, 100, 127, 150, 199] {
-            bs.set(i);
-        }
-        // Sanity: they are set.
-        for i in [0, 33, 64, 100, 127, 150, 199] {
-            assert!(bs.get(i));
-        }
-
-        bs.clear_all();
-
-        // Every bit should be zero now.
-        for i in 0..200 {
-            assert!(!bs.get(i), "bit {i} should be cleared");
-        }
-    }
-
-    #[test]
-    fn test_bitset_set_to() {
+    fn test_bitset_set_and_clear() {
         let mut bs = DenseBitset::new(128);
 
-        // set_to true
-        bs.set_to(42, true);
+        // set then verify
+        bs.set(42);
         assert!(bs.get(42));
 
-        // set_to false
-        bs.set_to(42, false);
+        // clear then verify
+        bs.clear_bit(42);
         assert!(!bs.get(42));
 
-        // set_to true then true again (idempotent)
-        bs.set_to(99, true);
-        bs.set_to(99, true);
+        // set twice (idempotent)
+        bs.set(99);
+        bs.set(99);
         assert!(bs.get(99));
 
-        // set_to false on an already-unset bit (idempotent)
-        bs.set_to(10, false);
+        // clear an already-unset bit (idempotent)
+        bs.clear_bit(10);
         assert!(!bs.get(10));
     }
 
