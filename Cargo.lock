@@ -2054,6 +2054,7 @@ name = "sframe-query"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "genawaiter",
  "pin-project-lite",
  "rayon",
  "serde_json",

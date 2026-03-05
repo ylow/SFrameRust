@@ -8,6 +8,7 @@
 //! Rate analysis inserts rebatch adapters at lockstep multi-input operators
 //! when input batch boundaries may be misaligned.
 
+mod batch_iter;
 mod broadcast;
 mod consumer;
 mod filter;
@@ -17,6 +18,8 @@ mod rebatch;
 mod reduce;
 mod source;
 mod transform;
+
+pub use batch_iter::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
 
 use std::collections::HashMap;
 use std::pin::Pin;
