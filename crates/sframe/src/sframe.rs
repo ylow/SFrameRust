@@ -455,7 +455,7 @@ impl SFrame {
         }
 
         // --- Execution plan (what will actually run) ---
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let optimized = optimizer::optimize(&fused);
             buf.push_str("\nExecution Plan:\n");
             buf.push_str(&optimized.explain());
@@ -513,7 +513,7 @@ impl SFrame {
             )));
         }
 
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let existing_ncols = self.columns.len();
             let col_plan = PlannerNode::project(col.plan().clone(), vec![col.column_index()]);
 
@@ -575,7 +575,7 @@ impl SFrame {
         let filter_col_idx = self.column_index(column_name)?;
 
         // Lazy path: fuse columns into a single plan, then apply LogicalFilter.
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             // After fusion, column indices are 0..N in SFrame order.
             let mask_source = PlannerNode::project(fused.clone(), vec![filter_col_idx]);
             let mask = PlannerNode::transform(
@@ -623,7 +623,7 @@ impl SFrame {
     /// let filtered = sf.logical_filter(mask)?;
     /// ```
     pub fn logical_filter(&self, mask: SArray) -> Result<SFrame> {
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let filtered_plan = PlannerNode::logical_filter(fused, mask.plan().clone());
 
             let columns: Vec<SArray> = self
@@ -678,7 +678,7 @@ impl SFrame {
         }
 
         // Lazy path: fuse each side into a single plan, then Append.
-        if let (Some(left), Some(right)) = (self.fuse_plan(), other.fuse_plan()) {
+        if let (Ok(left), Ok(right)) = (self.fuse_plan(), other.fuse_plan()) {
             let appended = PlannerNode::append(left, right);
 
             let columns: Vec<SArray> = self
@@ -879,7 +879,7 @@ impl SFrame {
     pub fn replace_column(&self, name: &str, col: SArray) -> Result<SFrame> {
         let idx = self.column_index(name)?;
 
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let col_plan = PlannerNode::project(col.plan().clone(), vec![col.column_index()]);
             let existing_len = fused.length();
             let new_len = col_plan.length();
@@ -1054,7 +1054,7 @@ impl SFrame {
             )
         };
 
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let mask = make_mask();
             let filtered = PlannerNode::logical_filter(fused, mask);
             let columns: Vec<SArray> = self
@@ -1589,18 +1589,18 @@ impl SFrame {
     /// Try to produce a single unified plan for all columns.
     ///
     /// Output columns are always 0..N matching the SFrame's column order.
-    /// Returns `None` only if columns have truly incompatible plans (e.g.
-    /// different source tables with no common ancestor).
-    fn fuse_plan(&self) -> Option<Arc<PlannerNode>> {
+    /// Returns an error only if columns have truly incompatible plans (e.g.
+    /// different source tables with different row counts).
+    fn fuse_plan(&self) -> Result<Arc<PlannerNode>> {
         if self.columns.is_empty() {
-            return None;
+            return Ok(PlannerNode::materialized(SFrameRows::empty(&[])));
         }
 
         // Fast path: all columns share the same plan Arc — just project.
         if let Some(plan) = self.shared_plan() {
             let indices: Vec<usize> =
                 self.columns.iter().map(|c| c.column_index()).collect();
-            return Some(PlannerNode::project(plan.clone(), indices));
+            return Ok(PlannerNode::project(plan.clone(), indices));
         }
 
         // Group columns by plan Arc, preserving original order.
@@ -1643,7 +1643,7 @@ impl SFrame {
                 .filter_map(|p| p.length())
                 .collect();
             if known_lengths.len() >= 2 && !known_lengths.windows(2).all(|w| w[0] == w[1]) {
-                return None;
+                return Err(SFrameError::Format("Cannot fuse columns with different row counts".to_string()));
             }
             PlannerNode::column_union(union_inputs)
         };
@@ -1656,9 +1656,9 @@ impl SFrame {
         // If final_indices is already 0..N, skip the extra Project
         let is_identity = final_indices.iter().enumerate().all(|(i, &c)| c == i);
         if is_identity {
-            Some(fused)
+            Ok(fused)
         } else {
-            Some(PlannerNode::project(fused, final_indices))
+            Ok(PlannerNode::project(fused, final_indices))
         }
     }
 
@@ -1672,7 +1672,7 @@ impl SFrame {
             return compile(&plan);
         }
 
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             return compile(&fused);
         }
 
@@ -1694,7 +1694,7 @@ impl SFrame {
             return Ok(SFrameRows::empty(&[]));
         }
 
-        if let Some(fused) = self.fuse_plan() {
+        if let Ok(fused) = self.fuse_plan() {
             let stream = compile(&fused)?;
             return materialize_sync(stream);
         }
