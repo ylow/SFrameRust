@@ -10,7 +10,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use genawaiter::rc::{Co, Gen};
+use genawaiter::sync::{Co, Gen};
 use genawaiter::GeneratorState;
 
 use sframe_types::bitset::DenseBitset;
@@ -52,7 +52,7 @@ pub enum DecoderResponse {
 
 /// Streaming block decoder backed by a genawaiter coroutine.
 pub struct EncodedBlockRange {
-    gen: Gen<DecoderResponse, DecoderCmd, Pin<Box<dyn Future<Output = ()>>>>,
+    gen: Gen<DecoderResponse, DecoderCmd, Pin<Box<dyn Future<Output = ()> + Send>>>,
     current_row: usize,
     total_rows: usize,
 }
@@ -65,10 +65,10 @@ impl EncodedBlockRange {
     pub fn new(data: Vec<u8>, block_info: BlockInfo) -> Self {
         let total_rows = block_info.num_elem as usize;
 
-        let mut gen: Gen<DecoderResponse, DecoderCmd, Pin<Box<dyn Future<Output = ()>>>> =
+        let mut gen: Gen<DecoderResponse, DecoderCmd, Pin<Box<dyn Future<Output = ()> + Send>>> =
             Gen::new(|co| {
                 Box::pin(decode_block_stream(co, data, block_info))
-                    as Pin<Box<dyn Future<Output = ()>>>
+                    as Pin<Box<dyn Future<Output = ()> + Send>>
             });
 
         // Bootstrap handshake: first resume_with value is dropped by genawaiter.
