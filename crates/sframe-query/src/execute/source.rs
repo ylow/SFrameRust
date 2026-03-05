@@ -16,13 +16,10 @@ use crate::batch::{ColumnData, SFrameRows};
 
 use super::BatchStream;
 
-/// State for segment-prefetching source reading.
+/// State for chunk-prefetching source reading.
 struct PrefetchSourceState {
     rx: std::sync::mpsc::Receiver<Result<Vec<Vec<FlexType>>>>,
     dtypes: Vec<FlexTypeEnum>,
-    batch_size: usize,
-    seg_data: Option<Vec<Vec<FlexType>>>,
-    row_offset: usize,
 }
 
 /// Resolve a path to the appropriate VFS backend.
@@ -112,6 +109,7 @@ pub(super) fn compile_sframe_source(
 
     let slices = compute_segment_slices(&segment_paths, &segment_sizes, begin_row, end_row);
 
+    let chunk_size = batch_size as u64;
     let (tx, rx) =
         std::sync::mpsc::sync_channel::<Result<Vec<Vec<FlexType>>>>(n_prefetch);
     let dtypes_bg = dtypes.clone();
@@ -119,26 +117,22 @@ pub(super) fn compile_sframe_source(
 
     std::thread::spawn(move || {
         for slice in slices {
-            let result = read_segment_row_range(
+            if !read_segment_chunked(
                 &*vfs_bg,
                 &slice.segment_path,
                 &dtypes_bg,
+                None,
                 slice.local_begin,
                 slice.local_end,
-            );
-            if tx.send(result).is_err() {
+                chunk_size,
+                &tx,
+            ) {
                 break; // receiver dropped
             }
         }
     });
 
-    let state = PrefetchSourceState {
-        rx,
-        dtypes,
-        batch_size,
-        seg_data: None,
-        row_offset: 0,
-    };
+    let state = PrefetchSourceState { rx, dtypes };
 
     Ok(Box::pin(unfold_prefetch(state)))
 }
@@ -179,120 +173,63 @@ pub(super) fn compile_sframe_source_projected(
 
     let slices = compute_segment_slices(&segment_paths, &segment_sizes, begin_row, end_row);
 
+    let chunk_size = batch_size as u64;
     let (tx, rx) =
         std::sync::mpsc::sync_channel::<Result<Vec<Vec<FlexType>>>>(n_prefetch);
     let vfs_bg = vfs.clone();
 
     std::thread::spawn(move || {
         for slice in slices {
-            let result = read_segment_columns_projected_row_range(
+            if !read_segment_chunked(
                 &*vfs_bg,
                 &slice.segment_path,
                 &all_col_types,
-                &proj_indices,
+                Some(&proj_indices),
                 slice.local_begin,
                 slice.local_end,
-            );
-            if tx.send(result).is_err() {
-                break;
+                chunk_size,
+                &tx,
+            ) {
+                break; // receiver dropped
             }
         }
     });
 
-    let state = PrefetchSourceState {
-        rx,
-        dtypes: projected_dtypes,
-        batch_size,
-        seg_data: None,
-        row_offset: 0,
-    };
+    let state = PrefetchSourceState { rx, dtypes: projected_dtypes };
 
     Ok(Box::pin(unfold_prefetch(state)))
 }
 
-/// Shared unfold logic for prefetched segment reading.
+/// Shared unfold logic for prefetched chunk reading.
 fn unfold_prefetch(
     state: PrefetchSourceState,
 ) -> impl Stream<Item = Result<SFrameRows>> {
-    stream::unfold(state, |mut state| async move {
-        loop {
-            if let Some(ref data) = state.seg_data {
-                let seg_rows = if data.is_empty() { 0 } else { data[0].len() };
-                if state.row_offset < seg_rows {
-                    let end = (state.row_offset + state.batch_size).min(seg_rows);
-                    let batch = slice_columns_to_batch(
-                        data,
-                        &state.dtypes,
-                        state.row_offset,
-                        end,
-                    );
-                    state.row_offset = end;
-                    return Some((batch, state));
+    stream::unfold(state, |state| async move {
+        match state.rx.recv() {
+            Err(_) => None,
+            Ok(Ok(data)) => {
+                if data.is_empty() || data.first().map(|c| c.is_empty()).unwrap_or(true) {
+                    Some((Ok(SFrameRows::empty(&state.dtypes)), state))
+                } else {
+                    let batch = columns_to_batch(&data, &state.dtypes);
+                    Some((batch, state))
                 }
-                state.seg_data = None;
-                state.row_offset = 0;
             }
-
-            match state.rx.recv() {
-                Err(_) => return None, // channel closed, all segments done
-                Ok(Ok(data)) => {
-                    if data.is_empty() || data.first().map(|c| c.is_empty()).unwrap_or(true) {
-                        continue;
-                    }
-                    state.seg_data = Some(data);
-                }
-                Ok(Err(e)) => return Some((Err(e), state)),
-            }
+            Ok(Err(e)) => Some((Err(e), state)),
         }
     })
 }
 
-/// Slice column data into an SFrameRows batch for rows [start..end).
-fn slice_columns_to_batch(
+/// Convert column vectors to an SFrameRows batch.
+fn columns_to_batch(
     data: &[Vec<FlexType>],
     dtypes: &[FlexTypeEnum],
-    start: usize,
-    end: usize,
 ) -> Result<SFrameRows> {
     let columns: Vec<ColumnData> = data.iter()
         .zip(dtypes.iter())
-        .map(|(col_data, &dtype)| ColumnData::from_flex_slice(&col_data[start..end], dtype))
+        .map(|(col_data, &dtype)| ColumnData::from_flex_slice(col_data, dtype))
         .collect();
     SFrameRows::new(columns)
-}
-
-/// Read a row range `[local_begin, local_end)` from a segment.
-///
-/// Fast path: when reading the entire segment, delegates to
-/// `read_segment_independently`. Otherwise, walks the block index
-/// to skip non-overlapping blocks and slices partial blocks at boundaries.
-fn read_segment_row_range(
-    vfs: &dyn VirtualFileSystem,
-    segment_path: &str,
-    column_types: &[FlexTypeEnum],
-    local_begin: u64,
-    local_end: u64,
-) -> Result<Vec<Vec<FlexType>>> {
-    let file = vfs.open_read(segment_path)?;
-    let file_size = file.size()?;
-    let mut seg_reader = SegmentReader::open(
-        Box::new(file),
-        file_size,
-        column_types.to_vec(),
-    )?;
-
-    // Fast path: full segment read
-    let seg_total = seg_reader.column_len(0);
-    if local_begin == 0 && local_end >= seg_total {
-        let num_cols = seg_reader.num_columns();
-        let mut columns = Vec::with_capacity(num_cols);
-        for col in 0..num_cols {
-            columns.push(seg_reader.read_column(col)?);
-        }
-        return Ok(columns);
-    }
-
-    read_columns_block_range(&mut seg_reader, local_begin, local_end, None)
 }
 
 /// Read a row range from a segment, reading only projected columns.
@@ -374,6 +311,53 @@ fn read_columns_block_range(
     }
 
     Ok(result)
+}
+
+/// Read a segment in chunks, sending each chunk through the channel.
+///
+/// Opens the segment once, then reads row ranges of `chunk_size` rows
+/// via `read_columns_block_range`, sending each chunk through `tx`.
+/// Returns `true` if the channel is still open, `false` if dropped.
+fn read_segment_chunked(
+    vfs: &dyn VirtualFileSystem,
+    segment_path: &str,
+    column_types: &[FlexTypeEnum],
+    column_indices: Option<&[usize]>,
+    local_begin: u64,
+    local_end: u64,
+    chunk_size: u64,
+    tx: &std::sync::mpsc::SyncSender<Result<Vec<Vec<FlexType>>>>,
+) -> bool {
+    let open_result = (|| -> Result<()> {
+        let file = vfs.open_read(segment_path)?;
+        let file_size = file.size()?;
+        let mut seg_reader = SegmentReader::open(
+            Box::new(file),
+            file_size,
+            column_types.to_vec(),
+        )?;
+
+        let mut offset = local_begin;
+        while offset < local_end {
+            let chunk_end = (offset + chunk_size).min(local_end);
+            let result = read_columns_block_range(
+                &mut seg_reader,
+                offset,
+                chunk_end,
+                column_indices,
+            );
+            if tx.send(result).is_err() {
+                return Ok(()); // receiver dropped
+            }
+            offset = chunk_end;
+        }
+        Ok(())
+    })();
+
+    match open_result {
+        Ok(()) => true,
+        Err(e) => tx.send(Err(e)).is_ok(),
+    }
 }
 
 /// Read only projected columns from a segment file.
