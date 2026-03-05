@@ -2608,4 +2608,161 @@ mod tests {
         let expected: Vec<FlexType> = (90..100).map(|i| FlexType::Integer(i)).collect();
         assert_eq!(x, expected);
     }
+
+    // === ColumnUnion end-to-end tests ===
+
+    #[test]
+    fn test_add_column_then_filter() {
+        // Scenario: add a derived column, then filter.
+        // After add_column, fuse_plan should produce a ColumnUnion.
+        // After filter, the result should still be lazily evaluated.
+        let sf = make_test_sf(); // columns: id (Int), name (String), score (Float)
+        let score = sf.column("score").unwrap();
+        let doubled = score.apply(
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Float(f) => FlexType::Float(f * 2.0),
+                other => other.clone(),
+            }),
+            FlexTypeEnum::Float,
+        );
+        let sf2 = sf.add_column("score2", doubled).unwrap();
+
+        // fuse_plan should succeed (tested via explain not saying "materialized independently")
+        let explanation = sf2.explain();
+        assert!(
+            !explanation.contains("materialized independently"),
+            "fuse_plan should succeed after add_column, but got:\n{}",
+            explanation,
+        );
+
+        // Filter on score > 75.0
+        let filtered = sf2
+            .filter(
+                "score",
+                Arc::new(|v: &FlexType| matches!(v, FlexType::Float(f) if *f > 75.0)),
+            )
+            .unwrap();
+
+        // Verify data correctness
+        let score_vals = filtered.column("score").unwrap().to_vec().unwrap();
+        let score2_vals = filtered.column("score2").unwrap().to_vec().unwrap();
+        assert!(!score_vals.is_empty(), "should have some filtered rows");
+        assert_eq!(score_vals.len(), score2_vals.len());
+        for (s, s2) in score_vals.iter().zip(score2_vals.iter()) {
+            if let (FlexType::Float(a), FlexType::Float(b)) = (s, s2) {
+                assert!(
+                    (b - a * 2.0).abs() < 1e-10,
+                    "score2 should be 2x score, got score={} score2={}",
+                    a,
+                    b,
+                );
+                assert!(*a > 75.0, "filter should have removed scores <= 75, got {}", a);
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_then_add_column() {
+        // Scenario: filter first, then add a derived column.
+        let sf = make_test_sf();
+
+        let filtered = sf
+            .filter(
+                "score",
+                Arc::new(|v: &FlexType| matches!(v, FlexType::Float(f) if *f > 75.0)),
+            )
+            .unwrap();
+
+        let score = filtered.column("score").unwrap();
+        let doubled = score.apply(
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Float(f) => FlexType::Float(f * 2.0),
+                other => other.clone(),
+            }),
+            FlexTypeEnum::Float,
+        );
+        let result = filtered.add_column("score2", doubled).unwrap();
+
+        // fuse_plan should succeed (ColumnUnion-based)
+        let explanation = result.explain();
+        assert!(
+            !explanation.contains("materialized independently"),
+            "fuse_plan should succeed after filter + add_column, but got:\n{}",
+            explanation,
+        );
+
+        // Verify ColumnUnion appears in the explanation
+        assert!(
+            explanation.contains("ColumnUnion"),
+            "Expected ColumnUnion in explanation:\n{}",
+            explanation,
+        );
+
+        // Verify data correctness
+        let score_vals = result.column("score").unwrap().to_vec().unwrap();
+        let score2_vals = result.column("score2").unwrap().to_vec().unwrap();
+        assert!(!score_vals.is_empty(), "should have some filtered rows");
+        assert_eq!(score_vals.len(), score2_vals.len());
+        for (s, s2) in score_vals.iter().zip(score2_vals.iter()) {
+            if let (FlexType::Float(a), FlexType::Float(b)) = (s, s2) {
+                assert!(
+                    (b - a * 2.0).abs() < 1e-10,
+                    "score2 should be 2x score, got score={} score2={}",
+                    a,
+                    b,
+                );
+                assert!(*a > 75.0, "filter should have removed scores <= 75, got {}", a);
+            }
+        }
+    }
+
+    #[test]
+    fn test_replace_column_then_filter() {
+        let sf = make_test_sf();
+        let score = sf.column("score").unwrap();
+        let negated = score.apply(
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Float(f) => FlexType::Float(-f),
+                other => other.clone(),
+            }),
+            FlexTypeEnum::Float,
+        );
+        let sf2 = sf.replace_column("score", negated).unwrap();
+
+        // fuse_plan should succeed
+        let explanation = sf2.explain();
+        assert!(
+            !explanation.contains("materialized independently"),
+            "fuse_plan should succeed after replace_column, but got:\n{}",
+            explanation,
+        );
+
+        // Verify the replaced column has negated values
+        let vals = sf2.column("score").unwrap().to_vec().unwrap();
+        for v in &vals {
+            if let FlexType::Float(f) = v {
+                assert!(*f <= 0.0, "scores should be negated: {}", f);
+            }
+        }
+
+        // Now filter on the negated score (score < -75 means original > 75)
+        let filtered = sf2
+            .filter(
+                "score",
+                Arc::new(|v: &FlexType| matches!(v, FlexType::Float(f) if *f < -75.0)),
+            )
+            .unwrap();
+
+        let filtered_scores = filtered.column("score").unwrap().to_vec().unwrap();
+        assert!(!filtered_scores.is_empty(), "should have some filtered rows");
+        for v in &filtered_scores {
+            if let FlexType::Float(f) = v {
+                assert!(*f < -75.0, "filter should keep only scores < -75, got {}", f);
+            }
+        }
+
+        // Verify other columns survived the pipeline
+        let ids = filtered.column("id").unwrap().to_vec().unwrap();
+        assert_eq!(ids.len(), filtered_scores.len());
+    }
 }
