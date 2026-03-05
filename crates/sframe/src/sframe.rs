@@ -976,83 +976,66 @@ impl SFrame {
 
     // === Phase 11.3: Sampling & Splitting ===
 
-    /// Random sample of rows.
+    /// Build a boolean mask SArray for random sampling.
     ///
-    /// Builds a lazy plan: `Range(0..n)` → seeded-hash transform → 0/1 mask
-    /// → `logical_filter`. Falls back to materialization only when columns
-    /// have different plans.
-    pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SFrame> {
+    /// Returns a lazy Integer SArray of 0/1 values where 1 indicates the row
+    /// should be included (hash of seed + row index < threshold).
+    fn make_sample_mask(&self, fraction: f64, seed: u64) -> Result<SArray> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let n = self.num_rows()?;
-        let seed = seed.unwrap_or(42);
         let threshold = (fraction * u64::MAX as f64) as u64;
 
-        let make_mask = || {
-            let indices = PlannerNode::range(0, 1, n);
-            PlannerNode::transform(
-                indices,
-                0,
-                Arc::new(move |v: &FlexType| {
-                    if let FlexType::Integer(i) = v {
-                        let mut hasher = DefaultHasher::new();
-                        (seed, *i as u64).hash(&mut hasher);
-                        FlexType::Integer(if hasher.finish() < threshold { 1 } else { 0 })
-                    } else {
-                        FlexType::Integer(0)
-                    }
-                }),
-                FlexTypeEnum::Integer,
-            )
-        };
+        let indices = SArray::from_plan(
+            PlannerNode::range(0, 1, n),
+            FlexTypeEnum::Integer,
+            Some(n),
+            0,
+        );
+        Ok(indices.apply(
+            Arc::new(move |v: &FlexType| {
+                if let FlexType::Integer(i) = v {
+                    let mut hasher = DefaultHasher::new();
+                    (seed, *i as u64).hash(&mut hasher);
+                    FlexType::Integer(if hasher.finish() < threshold { 1 } else { 0 })
+                } else {
+                    FlexType::Integer(0)
+                }
+            }),
+            FlexTypeEnum::Integer,
+        ))
+    }
 
-        let fused = self.fuse_plan()?;
-        let mask = make_mask();
-        let filtered = PlannerNode::logical_filter(fused, mask);
-        let columns: Vec<SArray> = self
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| SArray::from_plan(filtered.clone(), c.dtype(), None, i))
-            .collect();
-        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
+    /// Random sample of rows.
+    ///
+    /// Builds a lazy plan: `Range(0..n)` → seeded-hash transform → 0/1 mask
+    /// → `logical_filter`. No data is materialized until the result is consumed.
+    pub fn sample(&self, fraction: f64, seed: Option<u64>) -> Result<SFrame> {
+        let mask = self.make_sample_mask(fraction, seed.unwrap_or(42))?;
+        self.logical_filter(mask)
     }
 
     /// Random split into two SFrames.
     ///
     /// Returns `(train, test)` where `train` contains approximately `fraction`
-    /// of the rows and `test` contains the rest.
+    /// of the rows and `test` contains the rest. Both sides are lazy.
     pub fn random_split(&self, fraction: f64, seed: Option<u64>) -> Result<(SFrame, SFrame)> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        let mask = self.make_sample_mask(fraction, seed.unwrap_or(42))?;
 
-        let batch = self.materialize_batch()?;
-        let nrows = batch.num_rows();
-        let ncols = batch.num_columns();
-        let seed = seed.unwrap_or(42);
-        let threshold = (fraction * u64::MAX as f64) as u64;
+        let left = self.logical_filter(mask.clone())?;
 
-        let mut left_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-        let mut right_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
+        // Negate the mask for the other side
+        let neg_mask = mask.apply(
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(if *i != 0 { 0 } else { 1 }),
+                _ => FlexType::Integer(1),
+            }),
+            FlexTypeEnum::Integer,
+        );
+        let right = self.logical_filter(neg_mask)?;
 
-        for row in 0..nrows {
-            let mut hasher = DefaultHasher::new();
-            (seed, row as u64).hash(&mut hasher);
-            let target = if hasher.finish() < threshold {
-                &mut left_vecs
-            } else {
-                &mut right_vecs
-            };
-            for col in 0..ncols {
-                target[col].push(batch.column(col).get(row).clone());
-            }
-        }
-
-        let dtypes = self.column_types();
-        let left = SFrameRows::from_column_vecs(left_vecs, &dtypes)?;
-        let right = SFrameRows::from_column_vecs(right_vecs, &dtypes)?;
-        Ok((self.from_batch(left)?, self.from_batch(right)?))
+        Ok((left, right))
     }
 
     /// Top-k rows by a column.
@@ -1357,28 +1340,11 @@ impl SFrame {
     // === Phase 11.5: Deduplication ===
 
     /// Remove duplicate rows.
+    ///
+    /// Implemented as a groupby on all columns with no aggregators.
     pub fn unique(&self) -> Result<SFrame> {
-        let batch = self.materialize_batch()?;
-        let nrows = batch.num_rows();
-        let ncols = batch.num_columns();
-
-        let mut seen: std::collections::HashSet<Vec<FlexType>> = std::collections::HashSet::new();
-        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-
-        for row in 0..nrows {
-            let row_values: Vec<FlexType> = (0..ncols)
-                .map(|c| batch.column(c).get(row).clone())
-                .collect();
-            if seen.insert(row_values.clone()) {
-                for (col, v) in row_values.into_iter().enumerate() {
-                    col_vecs[col].push(v);
-                }
-            }
-        }
-
-        let dtypes = self.column_types();
-        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-        self.from_batch(result)
+        let key_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
+        self.groupby(&key_names, vec![])
     }
 
     // === Phase 11.7: Tail ===

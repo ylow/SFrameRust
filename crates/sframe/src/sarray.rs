@@ -554,52 +554,12 @@ impl SArray {
 
     /// Deduplicated values.
     ///
-    /// For small arrays, uses an in-memory HashSet (preserves first-occurrence order).
-    /// For large arrays, uses sort + streaming dedup (returns sorted order).
+    /// Implemented as a groupby with no aggregators on a single-column SFrame.
     pub fn unique(&self) -> Result<SArray> {
-        let estimated_size = self.estimate_unique_size();
-        let budget = sframe_config::global().sort_memory_budget;
-
-        if estimated_size <= budget {
-            self.unique_in_memory()
-        } else {
-            self.unique_via_sort()
-        }
-    }
-
-    fn estimate_unique_size(&self) -> usize {
-        let num_rows = self.len().unwrap_or(0) as usize;
-        let per_elem: usize = match self.dtype {
-            FlexTypeEnum::Integer | FlexTypeEnum::Float => 9,
-            FlexTypeEnum::String => 32,
-            _ => 64,
-        };
-        num_rows * per_elem
-    }
-
-    fn unique_in_memory(&self) -> Result<SArray> {
-        let values = self.to_vec()?;
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        for v in values {
-            if seen.insert(v.clone()) {
-                result.push(v);
-            }
-        }
-        SArray::from_vec(result, self.dtype)
-    }
-
-    fn unique_via_sort(&self) -> Result<SArray> {
-        // Sort the array, then do a streaming dedup pass
-        let sorted = self.sort(true)?;
-        let values = sorted.to_vec()?;
-        let mut result = Vec::new();
-        for v in values {
-            if result.last() != Some(&v) {
-                result.push(v);
-            }
-        }
-        SArray::from_vec(result, self.dtype)
+        use crate::sframe::SFrame;
+        let sf = SFrame::from_columns(vec![("__col", self.clone())])?;
+        let result = sf.unique()?;
+        Ok(result.column("__col")?.clone())
     }
 
     /// Concatenate with another SArray.
@@ -1235,6 +1195,11 @@ impl SArray {
     fn materialize_column(&self) -> Result<ColumnData> {
         let stream = compile(&self.plan)?;
         let batch = materialize_sync(stream)?;
+        // A filter that removes all rows produces an empty stream, yielding
+        // a 0-column batch.  Return a typed empty column in that case.
+        if batch.num_columns() == 0 {
+            return Ok(ColumnData::empty(self.dtype));
+        }
         if self.column_index >= batch.num_columns() {
             return Err(SFrameError::Format(format!(
                 "Column index {} out of range ({})",
@@ -1605,10 +1570,12 @@ mod tests {
         .unwrap();
 
         let u = sa.unique().unwrap();
-        assert_eq!(
-            u.to_vec().unwrap(),
-            vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)]
-        );
+        let result = u.to_vec().unwrap();
+        assert_eq!(result.len(), 3);
+        let set: std::collections::HashSet<_> = result.into_iter().collect();
+        assert!(set.contains(&FlexType::Integer(1)));
+        assert!(set.contains(&FlexType::Integer(2)));
+        assert!(set.contains(&FlexType::Integer(3)));
     }
 
     #[test]
