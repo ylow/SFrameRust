@@ -15,7 +15,7 @@ use sframe_types::error::Result;
 use sframe_types::flex_type::FlexType;
 
 use crate::batch::SFrameRows;
-use crate::execute::BatchStream;
+use crate::execute::BatchIterator;
 
 /// Sort order for a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,7 @@ impl SortKey {
 /// Materializes the input stream, then sorts using an index-based
 /// permutation (EC-Sort pattern). Only key columns are accessed during
 /// comparison; the permutation is applied to all columns in one pass.
-pub fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
+pub fn sort(input: BatchIterator, keys: &[SortKey]) -> Result<SFrameRows> {
     let (batch, indices) = sort_indices(input, keys)?;
     batch.take(&indices)
 }
@@ -64,7 +64,7 @@ pub fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
 /// (e.g. via `CacheSFrameBuilder::write_indexed_chunked`) to avoid
 /// holding a full sorted copy in memory.
 pub fn sort_indices(
-    mut input: BatchStream,
+    mut input: BatchIterator,
     keys: &[SortKey],
 ) -> Result<(SFrameRows, Vec<usize>)> {
     // Materialize all batches
@@ -202,7 +202,7 @@ mod tests {
     use crate::execute::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
     use sframe_types::flex_type::FlexTypeEnum;
 
-    fn make_sort_input(batch: SFrameRows) -> BatchStream {
+    fn make_sort_input(batch: SFrameRows) -> BatchIterator {
         BatchIterator::new(move |co: BatchCo| async move {
             let cmd = co.yield_(BatchResponse::Ready).await;
             if matches!(cmd, BatchCommand::NextBatch) {

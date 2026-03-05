@@ -10,7 +10,7 @@ use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::{ColumnData, SFrameRows};
-use crate::execute::{BatchCo, BatchCommand, BatchResponse, BatchStream};
+use crate::execute::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
 
 /// Join type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,16 +51,16 @@ impl JoinOn {
 
 /// Perform a hash join of two streams.
 ///
-/// Returns a BatchStream of result batches. For small inputs, uses an in-memory
+/// Returns a BatchIterator of result batches. For small inputs, uses an in-memory
 /// hash join. For large inputs, will use GRACE hash partitioned join.
 ///
 /// Output schema: all left columns followed by all right columns (except join key columns).
 pub fn join(
-    mut left_stream: BatchStream,
-    mut right_stream: BatchStream,
+    mut left_stream: BatchIterator,
+    mut right_stream: BatchIterator,
     on: &JoinOn,
     join_type: JoinType,
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     // Materialize both sides to estimate sizes
     let left = materialize_stream(&mut left_stream)?;
     let right = materialize_stream(&mut right_stream)?;
@@ -182,7 +182,7 @@ fn in_memory_join(
     }))
 }
 
-fn materialize_stream(stream: &mut BatchStream) -> Result<SFrameRows> {
+fn materialize_stream(stream: &mut BatchIterator) -> Result<SFrameRows> {
     let mut result: Option<SFrameRows> = None;
     while let Some(batch_result) = stream.next_batch() {
         let batch = batch_result?;
@@ -252,7 +252,7 @@ fn grace_hash_join(
     on: &JoinOn,
     join_type: JoinType,
     budget: usize,
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     let left_key_cols = on.left_columns();
     let right_key_cols = on.right_columns();
 
@@ -345,7 +345,7 @@ mod tests {
     use super::*;
     use crate::execute::BatchIterator;
 
-    fn make_stream(batch: SFrameRows) -> BatchStream {
+    fn make_stream(batch: SFrameRows) -> BatchIterator {
         BatchIterator::new(move |co: BatchCo| async move {
             let cmd = co.yield_(BatchResponse::Ready).await;
             if matches!(cmd, BatchCommand::NextBatch) {
@@ -355,7 +355,7 @@ mod tests {
     }
 
     /// Consume a join result stream into a single batch for testing.
-    fn collect_stream(mut stream: BatchStream) -> SFrameRows {
+    fn collect_stream(mut stream: BatchIterator) -> SFrameRows {
         let mut result: Option<SFrameRows> = None;
         while let Some(batch_result) = stream.next_batch() {
             let batch = batch_result.unwrap();
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_join_returns_stream() {
-        // Test that join returns a BatchStream, not SFrameRows
+        // Test that join returns a BatchIterator, not SFrameRows
         let left_rows = vec![
             vec![FlexType::Integer(1), FlexType::String("alice".into())],
             vec![FlexType::Integer(2), FlexType::String("bob".into())],

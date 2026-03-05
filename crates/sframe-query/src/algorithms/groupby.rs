@@ -182,7 +182,7 @@ fn ingest_parallel(
 }
 
 fn ingest_stream(
-    stream: crate::execute::BatchStream,
+    stream: crate::execute::BatchIterator,
     key_columns: &[usize],
     agg_specs: &[AggSpec],
     num_segments: usize,

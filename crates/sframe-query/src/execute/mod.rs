@@ -33,7 +33,7 @@ use crate::planner::{LogicalOp, OperatorRate, PlannerNode};
 
 use broadcast::BroadcastState;
 
-/// A BatchStream is now a type alias for BatchIterator.
+/// Deprecated alias — use `BatchIterator` directly.
 pub type BatchStream = BatchIterator;
 
 pub use consumer::consume_to_segment;
@@ -692,7 +692,7 @@ pub fn materialize(iter: &mut BatchIterator) -> Result<SFrameRows> {
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Synchronous alias for [`materialize`] — kept for API compatibility.
+/// Convenience wrapper for [`materialize`] that takes ownership of the iterator.
 pub fn materialize_sync(mut iter: BatchIterator) -> Result<SFrameRows> {
     materialize(&mut iter)
 }
@@ -729,7 +729,7 @@ pub fn materialize_head(iter: &mut BatchIterator, limit: usize) -> Result<SFrame
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Synchronous alias for [`materialize_head`] — kept for API compatibility.
+/// Convenience wrapper for [`materialize_head`] that takes ownership of the iterator.
 pub fn materialize_head_sync(mut iter: BatchIterator, limit: usize) -> Result<SFrameRows> {
     materialize_head(&mut iter, limit)
 }
@@ -788,7 +788,7 @@ pub fn materialize_tail(iter: &mut BatchIterator, limit: usize) -> Result<SFrame
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Synchronous alias for [`materialize_tail`] — kept for API compatibility.
+/// Convenience wrapper for [`materialize_tail`] that takes ownership of the iterator.
 pub fn materialize_tail_sync(mut iter: BatchIterator, limit: usize) -> Result<SFrameRows> {
     materialize_tail(&mut iter, limit)
 }

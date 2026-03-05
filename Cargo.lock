@@ -2053,9 +2053,7 @@ dependencies = [
 name = "sframe-query"
 version = "0.1.0"
 dependencies = [
- "futures",
  "genawaiter",
- "pin-project-lite",
  "rayon",
  "serde_json",
  "sframe-config",
@@ -2063,7 +2061,6 @@ dependencies = [
  "sframe-storage",
  "sframe-types",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
