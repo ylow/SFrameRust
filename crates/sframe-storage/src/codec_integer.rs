@@ -14,7 +14,7 @@
 //!   bits 2-7: shiftpos = 1 + log2(nbits); if 0, nbits=0 (all identical)
 //!             nbits = 1 << (shiftpos - 1) when shiftpos > 0
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::varint::{decode_varint, encode_varint};
@@ -51,7 +51,7 @@ pub fn decode_integers_for_reader(
 }
 
 /// Decode a single group of up to 128 values.
-fn decode_group(
+pub fn decode_group(
     reader: &mut (impl Read + ?Sized),
     output: &mut Vec<i64>,
     group_size: usize,
@@ -127,6 +127,81 @@ fn decode_group(
         }
     }
 
+    Ok(())
+}
+
+/// Skip a single FoR group without decoding values.
+///
+/// Reads the header and base varint to determine how many packed bytes
+/// to skip, then advances the reader past them. This is much cheaper
+/// than `decode_group` when the values are not needed.
+pub fn skip_group(
+    reader: &mut (impl Read + Seek + ?Sized),
+    group_size: usize,
+) -> Result<()> {
+    if group_size == 0 {
+        return Ok(());
+    }
+
+    // Read header byte
+    let mut header_buf = [0u8; 1];
+    reader.read_exact(&mut header_buf)?;
+    let header = header_buf[0];
+
+    let codec = header & 0x03;
+    let shiftpos = (header >> 2) as usize;
+    let nbits = if shiftpos == 0 {
+        0usize
+    } else {
+        1usize << (shiftpos - 1)
+    };
+
+    // Skip base value (variable-length encoded)
+    skip_varint(reader)?;
+
+    if nbits == 0 {
+        // All values identical — no packed data to skip
+        return Ok(());
+    }
+
+    // Compute packed data size
+    let pack_count = match codec {
+        CODEC_FOR => group_size,
+        CODEC_FOR_DELTA | CODEC_FOR_DELTA_NEGATIVE => {
+            if group_size > 1 { group_size - 1 } else { 0 }
+        }
+        _ => group_size,
+    };
+
+    if nbits == 64 {
+        let skip_bytes = pack_count * 8;
+        reader.seek(SeekFrom::Current(skip_bytes as i64))?;
+    } else {
+        let total_bits = pack_count * nbits;
+        let total_bytes = (total_bits + 7) / 8;
+        reader.seek(SeekFrom::Current(total_bytes as i64))?;
+    }
+
+    Ok(())
+}
+
+/// Skip a single varint without decoding its value.
+pub fn skip_varint(reader: &mut (impl Read + Seek + ?Sized)) -> Result<()> {
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first)?;
+    let b = first[0];
+
+    if b & 1 == 0 {
+        return Ok(());
+    }
+
+    if b == 0x7F {
+        reader.seek(SeekFrom::Current(8))?;
+        return Ok(());
+    }
+
+    let trailing_ones = b.trailing_ones() as i64;
+    reader.seek(SeekFrom::Current(trailing_ones))?;
     Ok(())
 }
 
@@ -590,5 +665,86 @@ mod tests {
             let nbits = if sp == 0 { 0 } else { 1usize << (sp - 1) };
             assert_eq!(nbits, exp, "shiftpos {} → nbits {}, expected {}", sp, nbits, exp);
         }
+    }
+
+    #[test]
+    fn test_skip_group_for() {
+        let values: Vec<i64> = (100..110).collect();
+        let mut encoded = Vec::new();
+        encode_integers_for(&mut encoded, &values).unwrap();
+
+        let mut cursor_decode = Cursor::new(&encoded[..]);
+        let mut output = Vec::new();
+        decode_group(&mut cursor_decode, &mut output, 10).unwrap();
+        let pos_after_decode = cursor_decode.position();
+
+        let mut cursor_skip = Cursor::new(&encoded[..]);
+        skip_group(&mut cursor_skip, 10).unwrap();
+        let pos_after_skip = cursor_skip.position();
+
+        assert_eq!(pos_after_skip, pos_after_decode);
+    }
+
+    #[test]
+    fn test_skip_group_identical_values() {
+        let values = vec![42i64; 128];
+        let mut encoded = Vec::new();
+        encode_integers_for(&mut encoded, &values).unwrap();
+
+        let mut cursor_decode = Cursor::new(&encoded[..]);
+        let mut output = Vec::new();
+        decode_group(&mut cursor_decode, &mut output, 128).unwrap();
+
+        let mut cursor_skip = Cursor::new(&encoded[..]);
+        skip_group(&mut cursor_skip, 128).unwrap();
+
+        assert_eq!(cursor_skip.position(), cursor_decode.position());
+    }
+
+    #[test]
+    fn test_skip_group_delta() {
+        let values: Vec<i64> = (0..128).collect();
+        let mut encoded = Vec::new();
+        encode_integers_for(&mut encoded, &values).unwrap();
+
+        let mut cursor_decode = Cursor::new(&encoded[..]);
+        let mut output = Vec::new();
+        decode_group(&mut cursor_decode, &mut output, 128).unwrap();
+
+        let mut cursor_skip = Cursor::new(&encoded[..]);
+        skip_group(&mut cursor_skip, 128).unwrap();
+
+        assert_eq!(cursor_skip.position(), cursor_decode.position());
+    }
+
+    #[test]
+    fn test_skip_group_delta_negative() {
+        let values: Vec<i64> = (0..128).map(|i| if i % 2 == 0 { i * 10 } else { -(i * 10) }).collect();
+        let mut encoded = Vec::new();
+        encode_integers_for(&mut encoded, &values).unwrap();
+
+        let mut cursor_decode = Cursor::new(&encoded[..]);
+        let mut output = Vec::new();
+        decode_group(&mut cursor_decode, &mut output, 128).unwrap();
+
+        let mut cursor_skip = Cursor::new(&encoded[..]);
+        skip_group(&mut cursor_skip, 128).unwrap();
+
+        assert_eq!(cursor_skip.position(), cursor_decode.position());
+    }
+
+    #[test]
+    fn test_skip_multiple_groups() {
+        let values: Vec<i64> = (0..300).collect();
+        let mut encoded = Vec::new();
+        encode_integers_for(&mut encoded, &values).unwrap();
+
+        let mut cursor = Cursor::new(&encoded[..]);
+        skip_group(&mut cursor, 128).unwrap();
+        skip_group(&mut cursor, 128).unwrap();
+        let mut output = Vec::new();
+        decode_group(&mut cursor, &mut output, 44).unwrap();
+
+        assert_eq!(output, (256..300).map(|i| i as i64).collect::<Vec<_>>());
     }
 }

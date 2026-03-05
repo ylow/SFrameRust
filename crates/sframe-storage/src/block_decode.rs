@@ -101,7 +101,7 @@ pub fn decode_typed_block(data: &[u8], block_info: &BlockInfo) -> Result<Vec<Fle
 }
 
 /// Decode values of a specific type from encoded data.
-fn decode_typed_values(
+pub(crate) fn decode_typed_values(
     data: &[u8],
     num_elements: usize,
     dtype: FlexTypeEnum,

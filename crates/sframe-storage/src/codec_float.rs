@@ -107,7 +107,7 @@ fn rotate_double_bits(bits: u64) -> u64 {
 ///
 /// C++ encoding: `encoded = (bits << 1) | (bits >> 63)`
 /// Decoding: `bits = (encoded >> 1) | (encoded << 63)`
-fn unrotate_double_bits(encoded: u64) -> u64 {
+pub fn unrotate_double_bits(encoded: u64) -> u64 {
     (encoded >> 1) | (encoded << 63)
 }
 
