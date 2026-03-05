@@ -36,6 +36,7 @@ use broadcast::BroadcastState;
 pub type BatchStream = Pin<Box<dyn Stream<Item = Result<SFrameRows>> + Send>>;
 
 pub use consumer::consume_to_segment;
+pub use parallel::{execute_parallel, parallel_slice_row_count};
 
 /// Default broadcast buffer capacity (batches per consumer channel).
 const BROADCAST_BUFFER: usize = 4;
