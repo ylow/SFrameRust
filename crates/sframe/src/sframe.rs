@@ -811,19 +811,61 @@ impl SFrame {
             .map(|name| self.column_index(name))
             .collect::<Result<_>>()?;
 
-        let stream = self.compile_stream()?;
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
+        let plan = self.fuse_plan()?;
+        let input_types = self.column_types();
 
-        let grouped = rt.block_on(groupby::groupby(stream, &key_indices, &agg_specs))?;
-
-        // Build output names: key columns + agg output names
-        let mut names: Vec<String> = key_names.iter().map(|s| s.to_string()).collect();
+        // Build output column names: key columns + agg output names
+        let mut out_names: Vec<String> = key_names.iter().map(|s| s.to_string()).collect();
         for spec in &agg_specs {
-            names.push(spec.output_name.clone());
+            out_names.push(spec.output_name.clone());
         }
 
-        write_to_cache(grouped, names)
+        // Build output column types: key types + agg output types
+        let mut out_types: Vec<FlexTypeEnum> = key_indices
+            .iter()
+            .map(|&i| input_types[i])
+            .collect();
+        for spec in &agg_specs {
+            out_types.push(spec.aggregator.output_type(&[input_types[spec.column]]));
+        }
+
+        let cache_path =
+            groupby::groupby(&plan, &key_indices, &agg_specs, &out_names, &out_types)?;
+
+        // Build SFrame from the cache:// path produced by groupby
+        let cache_fs = global_cache_fs();
+        let vfs: Arc<dyn VirtualFileSystem> =
+            Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+        let meta =
+            sframe_storage::sframe_reader::SFrameMetadata::open_with_fs(&*vfs, &cache_path)?;
+        let total_rows: u64 = if meta.group_index.columns.is_empty() {
+            0
+        } else {
+            meta.group_index.columns[0]
+                .segment_sizes
+                .iter()
+                .sum()
+        };
+
+        let store: Arc<dyn Send + Sync> = Arc::new(AnonymousStore {
+            path: cache_path.clone(),
+            cache_fs: cache_fs.clone(),
+        });
+        let plan = PlannerNode::sframe_source_cached(
+            &cache_path,
+            out_names.clone(),
+            out_types.clone(),
+            total_rows,
+            store,
+        );
+
+        let columns: Vec<SArray> = out_types
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(total_rows), i))
+            .collect();
+
+        Ok(SFrame::new_with_columns(columns, out_names))
     }
 
     // === Phase 11.1: Column Mutation ===
