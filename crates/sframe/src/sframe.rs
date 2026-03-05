@@ -1007,35 +1007,16 @@ impl SFrame {
             )
         };
 
-        if let Ok(fused) = self.fuse_plan() {
-            let mask = make_mask();
-            let filtered = PlannerNode::logical_filter(fused, mask);
-            let columns: Vec<SArray> = self
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| SArray::from_plan(filtered.clone(), c.dtype(), None, i))
-                .collect();
-            Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
-        } else {
-            // Unfusible plans: materialize and filter in memory.
-            let batch = self.materialize_batch()?;
-            let nrows = batch.num_rows();
-            let ncols = batch.num_columns();
-            let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-            for row in 0..nrows {
-                let mut hasher = DefaultHasher::new();
-                (seed, row as u64).hash(&mut hasher);
-                if hasher.finish() < threshold {
-                    for col in 0..ncols {
-                        col_vecs[col].push(batch.column(col).get(row).clone());
-                    }
-                }
-            }
-            let dtypes = self.column_types();
-            let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-            self.from_batch(result)
-        }
+        let fused = self.fuse_plan()?;
+        let mask = make_mask();
+        let filtered = PlannerNode::logical_filter(fused, mask);
+        let columns: Vec<SArray> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SArray::from_plan(filtered.clone(), c.dtype(), None, i))
+            .collect();
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 
     /// Random split into two SFrames.
