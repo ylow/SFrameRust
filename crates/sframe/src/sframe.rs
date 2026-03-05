@@ -637,25 +637,18 @@ impl SFrame {
             ));
         }
 
-        // Lazy path: fuse each side into a single plan, then Append.
-        if let (Ok(left), Ok(right)) = (self.fuse_plan(), other.fuse_plan()) {
-            let appended = PlannerNode::append(left, right);
+        let left = self.fuse_plan()?;
+        let right = other.fuse_plan()?;
+        let appended = PlannerNode::append(left, right);
 
-            let columns: Vec<SArray> = self
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| SArray::from_plan(appended.clone(), c.dtype(), None, i))
-                .collect();
+        let columns: Vec<SArray> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SArray::from_plan(appended.clone(), c.dtype(), None, i))
+            .collect();
 
-            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
-        }
-
-        // Fallback: materialize both sides
-        let mut batch1 = self.materialize_batch()?;
-        let batch2 = other.materialize_batch()?;
-        batch1.append(&batch2)?;
-        self.from_batch(batch1)
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 
     /// Return the first n rows as a new SFrame.
