@@ -573,42 +573,32 @@ impl SFrame {
         pred: Arc<dyn Fn(&FlexType) -> bool + Send + Sync>,
     ) -> Result<SFrame> {
         let filter_col_idx = self.column_index(column_name)?;
+        let fused = self.fuse_plan()?;
 
-        // Lazy path: fuse columns into a single plan, then apply LogicalFilter.
-        if let Ok(fused) = self.fuse_plan() {
-            // After fusion, column indices are 0..N in SFrame order.
-            let mask_source = PlannerNode::project(fused.clone(), vec![filter_col_idx]);
-            let mask = PlannerNode::transform(
-                mask_source,
-                0, // column 0 after projection
-                Arc::new(move |v: &FlexType| -> FlexType {
-                    if pred(v) {
-                        FlexType::Integer(1)
-                    } else {
-                        FlexType::Integer(0)
-                    }
-                }),
-                FlexTypeEnum::Integer,
-            );
+        let mask_source = PlannerNode::project(fused.clone(), vec![filter_col_idx]);
+        let mask = PlannerNode::transform(
+            mask_source,
+            0,
+            Arc::new(move |v: &FlexType| -> FlexType {
+                if pred(v) {
+                    FlexType::Integer(1)
+                } else {
+                    FlexType::Integer(0)
+                }
+            }),
+            FlexTypeEnum::Integer,
+        );
 
-            let filtered_plan = PlannerNode::logical_filter(fused, mask);
+        let filtered_plan = PlannerNode::logical_filter(fused, mask);
 
-            let columns: Vec<SArray> = self
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i)
-                })
-                .collect();
+        let columns: Vec<SArray> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i))
+            .collect();
 
-            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
-        }
-
-        // Fallback: materialize, filter, rebuild
-        let batch = self.materialize_batch()?;
-        let filtered = batch.filter_by_column(filter_col_idx, &*pred)?;
-        self.from_batch(filtered)
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 
     /// Filter rows using a boolean mask SArray.
@@ -623,47 +613,17 @@ impl SFrame {
     /// let filtered = sf.logical_filter(mask)?;
     /// ```
     pub fn logical_filter(&self, mask: SArray) -> Result<SFrame> {
-        if let Ok(fused) = self.fuse_plan() {
-            let filtered_plan = PlannerNode::logical_filter(fused, mask.plan().clone());
+        let fused = self.fuse_plan()?;
+        let filtered_plan = PlannerNode::logical_filter(fused, mask.plan().clone());
 
-            let columns: Vec<SArray> = self
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i)
-                })
-                .collect();
+        let columns: Vec<SArray> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i))
+            .collect();
 
-            return Ok(SFrame::new_with_columns(columns, self.column_names.clone()));
-        }
-
-        // Fallback: materialize both sides
-        let batch = self.materialize_batch()?;
-        let mask_vals = mask.to_vec()?;
-        let nrows = batch.num_rows();
-        let ncols = batch.num_columns();
-
-        if mask_vals.len() != nrows {
-            return Err(SFrameError::Format(format!(
-                "logical_filter: mask length {} != frame rows {}",
-                mask_vals.len(), nrows
-            )));
-        }
-
-        let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
-        for (row, m) in mask_vals.iter().enumerate() {
-            let keep = matches!(m, FlexType::Integer(i) if *i != 0);
-            if keep {
-                for col in 0..ncols {
-                    col_vecs[col].push(batch.column(col).get(row).clone());
-                }
-            }
-        }
-
-        let dtypes = self.column_types();
-        let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-        self.from_batch(result)
+        Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
     }
 
     /// Append another SFrame vertically.
