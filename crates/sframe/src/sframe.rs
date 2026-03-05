@@ -21,7 +21,7 @@ use sframe_query::execute::{
     compile, for_each_batch_sync, materialize_head_sync, materialize_sync, materialize_tail_sync,
 };
 use sframe_query::optimizer;
-use sframe_query::planner::{try_fuse_plans, PlannerNode};
+use sframe_query::planner::PlannerNode;
 use sframe_storage::sframe_writer::SFrameWriter;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -1603,13 +1603,63 @@ impl SFrame {
             return Some(PlannerNode::project(plan.clone(), indices));
         }
 
-        // Medium path: fuse divergent column plans via content-hash matching.
-        let col_specs: Vec<_> = self
-            .columns
-            .iter()
-            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
+        // Group columns by plan Arc, preserving original order.
+        use std::collections::HashMap;
+        let mut plan_to_group: HashMap<usize, usize> = HashMap::new();
+        let mut groups: Vec<(Arc<PlannerNode>, Vec<usize>)> = Vec::new();
+        // For each SFrame column, record (group_idx, position_within_group)
+        let mut col_positions: Vec<(usize, usize)> = Vec::with_capacity(self.columns.len());
+
+        for col in &self.columns {
+            let ptr = Arc::as_ptr(col.plan()) as usize;
+            let group_idx = if let Some(&gi) = plan_to_group.get(&ptr) {
+                gi
+            } else {
+                let gi = groups.len();
+                plan_to_group.insert(ptr, gi);
+                groups.push((col.plan().clone(), Vec::new()));
+                gi
+            };
+            let pos = groups[group_idx].1.len();
+            groups[group_idx].1.push(col.column_index());
+            col_positions.push((group_idx, pos));
+        }
+
+        // Build Project for each group
+        let mut union_inputs: Vec<Arc<PlannerNode>> = Vec::new();
+        let mut group_col_offsets: Vec<usize> = Vec::new();
+        let mut offset = 0;
+        for (plan, indices) in &groups {
+            group_col_offsets.push(offset);
+            offset += indices.len();
+            union_inputs.push(PlannerNode::project(plan.clone(), indices.clone()));
+        }
+
+        let fused = if union_inputs.len() == 1 {
+            union_inputs.remove(0)
+        } else {
+            // Verify length compatibility
+            let known_lengths: Vec<u64> = union_inputs.iter()
+                .filter_map(|p| p.length())
+                .collect();
+            if known_lengths.len() >= 2 && !known_lengths.windows(2).all(|w| w[0] == w[1]) {
+                return None;
+            }
+            PlannerNode::column_union(union_inputs)
+        };
+
+        // Build final column order: map each original column to its position
+        let final_indices: Vec<usize> = col_positions.iter()
+            .map(|&(gi, pos)| group_col_offsets[gi] + pos)
             .collect();
-        try_fuse_plans(&col_specs)
+
+        // If final_indices is already 0..N, skip the extra Project
+        let is_identity = final_indices.iter().enumerate().all(|(i, &c)| c == i);
+        if is_identity {
+            Some(fused)
+        } else {
+            Some(PlannerNode::project(fused, final_indices))
+        }
     }
 
     /// Compile the SFrame's plan into a BatchStream.
