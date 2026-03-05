@@ -51,6 +51,8 @@ pub struct SFrameConfig {
     pub join_buffer_num_cells: usize,
     /// Number of segments to prefetch for lazy source reading.
     pub source_prefetch_segments: usize,
+    /// Maximum number of cached blocks per CachedSegmentReader.
+    pub max_blocks_in_cache: usize,
 }
 
 impl SFrameConfig {
@@ -84,6 +86,7 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
     let mut groupby_buffer_num_rows: usize = 1_048_576;
     let mut join_buffer_num_cells: usize = 50_000_000;
     let mut source_prefetch_segments: usize = 2;
+    let mut max_blocks_in_cache: usize = 64;
 
     if let Ok(val) = std::env::var("SFRAME_CACHE_CAPACITY") {
         if let Ok(n) = parse_byte_size(&val) {
@@ -125,6 +128,11 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
             source_prefetch_segments = n;
         }
     }
+    if let Ok(val) = std::env::var("SFRAME_MAX_BLOCKS_IN_CACHE") {
+        if let Ok(n) = val.parse::<usize>() {
+            max_blocks_in_cache = n;
+        }
+    }
 
     SFrameConfig {
         cache_capacity: AtomicUsize::new(cache_cap),
@@ -135,6 +143,7 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
         groupby_buffer_num_rows,
         join_buffer_num_cells,
         source_prefetch_segments,
+        max_blocks_in_cache,
     }
 });
 

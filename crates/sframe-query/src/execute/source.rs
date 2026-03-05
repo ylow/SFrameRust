@@ -8,7 +8,7 @@ use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_storage::sframe_reader::SFrameMetadata;
-use sframe_storage::segment_reader::SegmentReader;
+use sframe_storage::segment_reader::{CachedSegmentReader, SegmentReader};
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
@@ -315,9 +315,9 @@ fn read_columns_block_range(
 
 /// Read a segment in chunks, sending each chunk through the channel.
 ///
-/// Opens the segment once, then reads row ranges of `chunk_size` rows
-/// via `read_columns_block_range`, sending each chunk through `tx`.
-/// Returns `true` if the channel is still open, `false` if dropped.
+/// Opens the segment once with a `CachedSegmentReader` for incremental
+/// streaming decode. Reads row ranges of `chunk_size` rows, sending each
+/// chunk through `tx`. Returns `true` if channel is open, `false` if dropped.
 fn read_segment_chunked(
     vfs: &dyn VirtualFileSystem,
     segment_path: &str,
@@ -331,21 +331,23 @@ fn read_segment_chunked(
     let open_result = (|| -> Result<()> {
         let file = vfs.open_read(segment_path)?;
         let file_size = file.size()?;
-        let mut seg_reader = SegmentReader::open(
+        let seg_reader = SegmentReader::open(
             Box::new(file),
             file_size,
             column_types.to_vec(),
         )?;
+        let max_blocks = sframe_config::global().max_blocks_in_cache;
+        let mut cached = CachedSegmentReader::new(seg_reader, max_blocks);
+
+        let cols_to_read: Vec<usize> = match column_indices {
+            Some(indices) => indices.to_vec(),
+            None => (0..cached.num_columns()).collect(),
+        };
 
         let mut offset = local_begin;
         while offset < local_end {
             let chunk_end = (offset + chunk_size).min(local_end);
-            let result = read_columns_block_range(
-                &mut seg_reader,
-                offset,
-                chunk_end,
-                column_indices,
-            );
+            let result = cached.read_columns_rows(&cols_to_read, offset, chunk_end);
             if tx.send(result).is_err() {
                 return Ok(()); // receiver dropped
             }
