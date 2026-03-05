@@ -5,9 +5,14 @@
 //! - **Project fusion**: Merge adjacent Project nodes
 //! - **Identity elimination**: Remove no-op Project nodes
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::planner::{LogicalOp, PlannerNode};
+
+/// Cache mapping original Arc pointer → optimized Arc, used to preserve
+/// DAG sharing through optimization passes.
+type PassCache = HashMap<usize, Arc<PlannerNode>>;
 
 /// Apply all optimization passes to a plan.
 pub fn optimize(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
@@ -24,12 +29,22 @@ pub fn optimize(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
 /// Fuse adjacent Project nodes: `Project(b) → Project(a) → input`
 /// becomes `Project(a[b[i]]) → input`.
 pub fn fuse_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let mut cache = PassCache::new();
+    fuse_projects_impl(plan, &mut cache)
+}
+
+fn fuse_projects_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     // First recursively optimize inputs
-    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| fuse_projects(i)).collect();
+    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| fuse_projects_impl(i, cache)).collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
     // Check: is this a Project whose input is also a Project?
-    if let LogicalOp::Project { column_indices: outer_indices } = &plan.op {
+    let result = if let LogicalOp::Project { column_indices: outer_indices } = &plan.op {
         if plan.inputs.len() == 1 {
             if let LogicalOp::Project { column_indices: inner_indices } = &plan.inputs[0].op {
                 // Compose: outer[i] → inner[outer[i]]
@@ -37,23 +52,40 @@ pub fn fuse_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
                     .iter()
                     .map(|&i| inner_indices[i])
                     .collect();
-                return Arc::new(PlannerNode::new(
+                Arc::new(PlannerNode::new(
                     LogicalOp::Project { column_indices: composed },
                     plan.inputs[0].inputs.clone(),
-                ));
+                ))
+            } else {
+                plan
             }
+        } else {
+            plan
         }
-    }
+    } else {
+        plan
+    };
 
-    plan
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Eliminate identity Project nodes (those that select all columns in order).
 pub fn eliminate_identity_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
-    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| eliminate_identity_projects(i)).collect();
+    let mut cache = PassCache::new();
+    eliminate_identity_projects_impl(plan, &mut cache)
+}
+
+fn eliminate_identity_projects_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
+    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| eliminate_identity_projects_impl(i, cache)).collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
-    if let LogicalOp::Project { column_indices } = &plan.op {
+    let result = if let LogicalOp::Project { column_indices } = &plan.op {
         if plan.inputs.len() == 1 {
             // Check if this is an identity projection (0, 1, 2, ..., n-1)
             let is_identity = column_indices.iter().enumerate().all(|(i, &c)| c == i);
@@ -62,14 +94,25 @@ pub fn eliminate_identity_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> 
                 let input_ncols = count_output_columns(&plan.inputs[0]);
                 if let Some(n) = input_ncols {
                     if column_indices.len() == n {
-                        return plan.inputs[0].clone();
+                        plan.inputs[0].clone()
+                    } else {
+                        plan
                     }
+                } else {
+                    plan
                 }
+            } else {
+                plan
             }
+        } else {
+            plan
         }
-    }
+    } else {
+        plan
+    };
 
-    plan
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Push Project nodes closer to data sources.
@@ -78,11 +121,21 @@ pub fn eliminate_identity_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> 
 /// the filter (keeping the filter's column in the projection, and adjusting
 /// the filter's column index).
 pub fn pushdown_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
-    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| pushdown_projects(i)).collect();
+    let mut cache = PassCache::new();
+    pushdown_projects_impl(plan, &mut cache)
+}
+
+fn pushdown_projects_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
+    let new_inputs: Vec<Arc<PlannerNode>> = plan.inputs.iter().map(|i| pushdown_projects_impl(i, cache)).collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
     // Project over Filter: push project below filter
-    if let LogicalOp::Project { column_indices } = &plan.op {
+    let result = if let LogicalOp::Project { column_indices } = &plan.op {
         if plan.inputs.len() == 1 {
             if let LogicalOp::Filter { column: filter_col, predicate } = &plan.inputs[0].op {
                 if plan.inputs[0].inputs.len() == 1 {
@@ -120,19 +173,27 @@ pub fn pushdown_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
                         && filter_in_output.is_some()
                     {
                         // The final project would be identity, skip it
-                        return new_filter;
+                        new_filter
+                    } else {
+                        PlannerNode::project(new_filter, final_indices)
                     }
-
-                    return PlannerNode::project(new_filter, final_indices);
+                } else {
+                    plan
                 }
+            } else {
+                // Transform outputs a single column, so Project([0]) over Transform
+                // is an identity — handled by eliminate_identity_projects.
+                plan
             }
-
-            // Transform outputs a single column, so Project([0]) over Transform
-            // is an identity — handled by eliminate_identity_projects.
+        } else {
+            plan
         }
-    }
+    } else {
+        plan
+    };
 
-    plan
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Flatten nested Union nodes and eliminate singleton Unions.
@@ -140,14 +201,24 @@ pub fn pushdown_projects(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
 /// - `Union([x])` becomes `x`
 /// - `Union(a, Union(b, c))` becomes `Union(a, b, c)`
 pub fn eliminate_trivial_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let mut cache = PassCache::new();
+    eliminate_trivial_unions_impl(plan, &mut cache)
+}
+
+fn eliminate_trivial_unions_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     let new_inputs: Vec<Arc<PlannerNode>> = plan
         .inputs
         .iter()
-        .map(|i| eliminate_trivial_unions(i))
+        .map(|i| eliminate_trivial_unions_impl(i, cache))
         .collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
-    if let LogicalOp::Union = &plan.op {
+    let result = if let LogicalOp::Union = &plan.op {
         // Flatten nested Unions
         let mut flattened: Vec<Arc<PlannerNode>> = Vec::new();
         for input in &plan.inputs {
@@ -159,17 +230,21 @@ pub fn eliminate_trivial_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
         }
         // Singleton elimination
         if flattened.len() == 1 {
-            return flattened.remove(0);
-        }
-        if flattened.len() != plan.inputs.len() {
-            return Arc::new(PlannerNode::new(
+            flattened.remove(0)
+        } else if flattened.len() != plan.inputs.len() {
+            Arc::new(PlannerNode::new(
                 LogicalOp::Union,
                 flattened,
-            ));
+            ))
+        } else {
+            plan
         }
-    }
+    } else {
+        plan
+    };
 
-    plan
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Remove empty sources from Append nodes.
@@ -177,26 +252,41 @@ pub fn eliminate_trivial_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
 /// - `Append(X, empty)` becomes `X`
 /// - `Append(empty, X)` becomes `X`
 pub fn eliminate_empty_appends(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let mut cache = PassCache::new();
+    eliminate_empty_appends_impl(plan, &mut cache)
+}
+
+fn eliminate_empty_appends_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     let new_inputs: Vec<Arc<PlannerNode>> = plan
         .inputs
         .iter()
-        .map(|i| eliminate_empty_appends(i))
+        .map(|i| eliminate_empty_appends_impl(i, cache))
         .collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
-    if let LogicalOp::Append = &plan.op {
+    let result = if let LogicalOp::Append = &plan.op {
         if plan.inputs.len() == 2 {
             let left_empty = is_empty_source(&plan.inputs[0]);
             let right_empty = is_empty_source(&plan.inputs[1]);
             match (left_empty, right_empty) {
-                (true, false) => return plan.inputs[1].clone(),
-                (false, true) => return plan.inputs[0].clone(),
-                _ => {}
+                (true, false) => plan.inputs[1].clone(),
+                (false, true) => plan.inputs[0].clone(),
+                _ => plan,
             }
+        } else {
+            plan
         }
-    }
+    } else {
+        plan
+    };
 
-    plan
+    cache.insert(key, result.clone());
+    result
 }
 
 fn is_empty_source(plan: &PlannerNode) -> bool {
@@ -210,19 +300,35 @@ fn is_empty_source(plan: &PlannerNode) -> bool {
 ///
 /// `ColumnUnion([x])` becomes just `x`.
 pub fn eliminate_singleton_column_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let mut cache = PassCache::new();
+    eliminate_singleton_column_unions_impl(plan, &mut cache)
+}
+
+fn eliminate_singleton_column_unions_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     let new_inputs: Vec<Arc<PlannerNode>> = plan
         .inputs
         .iter()
-        .map(|i| eliminate_singleton_column_unions(i))
+        .map(|i| eliminate_singleton_column_unions_impl(i, cache))
         .collect();
     let plan = rebuild_with_inputs(plan, new_inputs);
 
-    if let LogicalOp::ColumnUnion = &plan.op {
+    let result = if let LogicalOp::ColumnUnion = &plan.op {
         if plan.inputs.len() == 1 {
-            return plan.inputs[0].clone();
+            plan.inputs[0].clone()
+        } else {
+            plan
         }
-    }
-    plan
+    } else {
+        plan
+    };
+
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Push Filter below Transform when the filter references a column from
@@ -235,12 +341,25 @@ pub fn eliminate_singleton_column_unions(plan: &Arc<PlannerNode>) -> Arc<Planner
 /// This pass is kept for GeneralizedTransform which may output multiple
 /// columns.
 pub fn push_filter_through_transform(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let mut cache = PassCache::new();
+    push_filter_through_transform_impl(plan, &mut cache)
+}
+
+fn push_filter_through_transform_impl(plan: &Arc<PlannerNode>, cache: &mut PassCache) -> Arc<PlannerNode> {
+    let key = Arc::as_ptr(plan) as usize;
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+
     let new_inputs: Vec<Arc<PlannerNode>> = plan
         .inputs
         .iter()
-        .map(|i| push_filter_through_transform(i))
+        .map(|i| push_filter_through_transform_impl(i, cache))
         .collect();
-    rebuild_with_inputs(plan, new_inputs)
+    let result = rebuild_with_inputs(plan, new_inputs);
+
+    cache.insert(key, result.clone());
+    result
 }
 
 /// Count the number of output columns for a plan node (if known statically).
@@ -503,5 +622,62 @@ mod tests {
         let optimized = push_filter_through_transform(&filtered);
         assert!(matches!(optimized.op, LogicalOp::Filter { .. }));
         assert!(matches!(optimized.inputs[0].op, LogicalOp::Transform { .. }));
+    }
+
+    #[test]
+    fn test_optimizer_preserves_dag_sharing() {
+        use sframe_types::flex_type::FlexType;
+        // Simulate: filter → add_column (score2 = score * 2)
+        // This creates a ColumnUnion where both branches share a LogicalFilter.
+        // The optimizer should preserve this sharing (same Arc pointer).
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::Float, FlexTypeEnum::String],
+            100,
+        );
+        let mask = PlannerNode::transform(
+            source.clone(),
+            0,
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) if *i > 50 => FlexType::Integer(1),
+                _ => FlexType::Integer(0),
+            }),
+            FlexTypeEnum::Integer,
+        );
+        let filtered = PlannerNode::logical_filter(
+            PlannerNode::project(source.clone(), vec![0, 1, 2]),
+            mask.clone(),
+        );
+        // score2 = transform(col 0) on the filtered data
+        let score2 = PlannerNode::transform(
+            filtered.clone(),
+            0,
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(i) => FlexType::Integer(*i * 2),
+                _ => FlexType::Undefined,
+            }),
+            FlexTypeEnum::Integer,
+        );
+        // ColumnUnion: [filtered cols 0-2, score2]
+        let cu = PlannerNode::column_union(vec![filtered.clone(), score2]);
+
+        let optimized = optimize(&cu);
+
+        // The optimized plan should be ColumnUnion with 2 inputs.
+        assert!(matches!(optimized.op, LogicalOp::ColumnUnion));
+        assert_eq!(optimized.inputs.len(), 2);
+
+        // Both branches should reference the same LogicalFilter via shared Arc.
+        // Branch 0: LogicalFilter (directly, after identity project elimination)
+        // Branch 1: Transform → LogicalFilter
+        let branch0 = &optimized.inputs[0];
+        let branch1_input = &optimized.inputs[1].inputs[0]; // Transform's input
+
+        assert!(
+            Arc::ptr_eq(branch0, branch1_input),
+            "Optimizer should preserve DAG sharing: both branches must \
+             reference the same LogicalFilter Arc"
+        );
     }
 }
