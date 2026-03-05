@@ -765,6 +765,66 @@ impl SFrameWriter {
     }
 }
 
+/// Assemble SFrame metadata for pre-built segment files.
+///
+/// Writes dir_archive.ini, .sidx, .frame_idx, and objects.bin into
+/// `base_path`, referencing the given segment files. The segment files
+/// must already exist at `{base_path}/{segment_file}`.
+///
+/// This is the complement to building segments with `SegmentWriter`
+/// directly — it creates the metadata that `SFrameReader` needs to
+/// open the SFrame.
+///
+/// # Arguments
+///
+/// * `vfs` — filesystem backend to write metadata files
+/// * `base_path` — directory containing the segment files
+/// * `column_names` — names of the columns in the SFrame
+/// * `column_types` — types of the columns in the SFrame
+/// * `segment_files` — file names of the pre-built segment files (relative to `base_path`)
+/// * `all_segment_sizes` — per-segment, per-column row counts from `SegmentWriter::finish()`
+/// * `total_rows` — total number of rows across all segments
+pub fn assemble_sframe_from_segments(
+    vfs: &dyn VirtualFileSystem,
+    base_path: &str,
+    column_names: &[&str],
+    column_types: &[FlexTypeEnum],
+    segment_files: &[String],
+    all_segment_sizes: &[Vec<u64>],
+    total_rows: u64,
+) -> Result<()> {
+    let hash = generate_hash(base_path);
+    let data_prefix = format!("m_{}", hash);
+
+    vfs.mkdir_p(base_path)?;
+
+    // Write .sidx — references segment_files as-is
+    let sidx_file = format!("{}.sidx", data_prefix);
+    let sidx_path = format!("{}/{}", base_path, sidx_file);
+    write_sidx(vfs, &sidx_path, segment_files, column_types, all_segment_sizes)?;
+
+    // Write .frame_idx
+    let frame_idx_file = format!("{}.frame_idx", data_prefix);
+    let frame_idx_path = format!("{}/{}", base_path, frame_idx_file);
+    write_frame_idx(
+        vfs,
+        &frame_idx_path,
+        column_names,
+        &sidx_file,
+        total_rows,
+        segment_files.len(),
+        &std::collections::HashMap::new(),
+    )?;
+
+    // Write dir_archive.ini
+    write_dir_archive_ini(vfs, base_path, &data_prefix)?;
+
+    // Write empty objects.bin
+    vfs.write_string(&format!("{}/objects.bin", base_path), "")?;
+
+    Ok(())
+}
+
 /// Create a segment file name like "m_xxx.0000".
 fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
     format!("{}.{:04}", data_prefix, segment_idx)
