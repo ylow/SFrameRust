@@ -547,6 +547,31 @@ impl PlannerNode {
         buf
     }
 
+    /// Return a combined Graphviz DOT representation of multiple named plan roots.
+    ///
+    /// Each column gets a labeled output node. Shared subexpressions across
+    /// columns appear as a single node with multiple incoming edges.
+    pub fn explain_multi(plans: &[(&str, &Arc<Self>)]) -> String {
+        use std::collections::HashSet;
+        use std::fmt::Write;
+
+        let mut buf = String::new();
+        let mut visited = HashSet::new();
+        writeln!(buf, "digraph plan {{").unwrap();
+        writeln!(buf, "    rankdir=BT;").unwrap();
+
+        for (i, (name, plan)) in plans.iter().enumerate() {
+            let name_escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+            writeln!(buf, "    output_{} [label=\"Output: {}\" shape=doubleoctagon];", i, name_escaped).unwrap();
+            let root_id = Arc::as_ptr(*plan) as usize;
+            writeln!(buf, "    n{} -> output_{};", root_id, i).unwrap();
+            Self::explain_dot(&mut buf, plan, &mut visited);
+        }
+
+        writeln!(buf, "}}").unwrap();
+        buf
+    }
+
     fn explain_dot(buf: &mut String, node: &Arc<Self>, visited: &mut std::collections::HashSet<usize>) {
         use std::fmt::Write;
 
@@ -961,31 +986,23 @@ pub fn try_build_evaluator(
     }
 }
 
-/// Walk a plan chain to find the leaf source node. Follows single-input linear
-/// ops (Transform, BinaryTransform, Project, GeneralizedTransform). Stops at
-/// Source ops (which are the leaf), or returns `None` for multi-input or
-/// sub-linear ops.
-fn find_leaf_source(plan: &Arc<PlannerNode>) -> Option<Arc<PlannerNode>> {
+/// Walk a plan chain to find the deepest fusible base node. Follows
+/// single-input linear ops (Transform, BinaryTransform, Project,
+/// GeneralizedTransform) and stops at any other node — Source nodes,
+/// multi-input ops (LogicalFilter, Append, Union), or sub-linear ops
+/// (Filter, Reduce). All of these are valid fusion bases.
+fn find_fusible_base(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     match &plan.op {
-        // Source nodes are the leaf.
-        LogicalOp::SFrameSource { .. }
-        | LogicalOp::MaterializedSource { .. }
-        | LogicalOp::Range { .. } => Some(plan.clone()),
-
         // Single-input linear ops: recurse into inputs[0].
         LogicalOp::Project { .. }
         | LogicalOp::Transform { .. }
         | LogicalOp::BinaryTransform { .. }
         | LogicalOp::GeneralizedTransform { .. } => {
-            find_leaf_source(&plan.inputs[0])
+            find_fusible_base(&plan.inputs[0])
         }
 
-        // Everything else is not fusible.
-        LogicalOp::Filter { .. }
-        | LogicalOp::LogicalFilter
-        | LogicalOp::Append
-        | LogicalOp::Union
-        | LogicalOp::Reduce { .. } => None,
+        // Everything else is a valid base (Source, multi-input, sub-linear).
+        _ => plan.clone(),
     }
 }
 
@@ -994,11 +1011,13 @@ fn find_leaf_source(plan: &Arc<PlannerNode>) -> Option<Arc<PlannerNode>> {
 ///
 /// `column_index` is the column index in the corresponding plan's output.
 ///
-/// The current implementation always fuses at the leaf source node. A future
-/// optimization could find the deepest common ancestor to reduce evaluator depth.
+/// Walks each column's linear chain to find the deepest fusible base node,
+/// then checks that all bases are equivalent (same content hash). If so,
+/// builds a single GeneralizedTransform that evaluates all columns from
+/// the shared base.
 ///
-/// Returns `None` if columns can't be fused (no common base, or unfusible ops
-/// in any chain).
+/// Returns `None` if columns have no common base or contain unfusible ops
+/// in the evaluator chain.
 pub fn try_fuse_plans(
     columns: &[(Arc<PlannerNode>, usize, FlexTypeEnum)],
 ) -> Option<Arc<PlannerNode>> {
@@ -1006,23 +1025,22 @@ pub fn try_fuse_plans(
         return None;
     }
 
-    // Step 1: For each column, find the leaf source.
-    let mut leaves: Vec<Arc<PlannerNode>> = Vec::with_capacity(columns.len());
+    // Step 1: For each column, find the deepest fusible base.
+    let mut bases: Vec<Arc<PlannerNode>> = Vec::with_capacity(columns.len());
     for (plan, _, _) in columns {
-        let leaf = find_leaf_source(plan)?;
-        leaves.push(leaf);
+        bases.push(find_fusible_base(plan));
     }
 
-    // Step 2: Check that all leaves have the same content_hash.
-    let base_hash = leaves[0].content_hash();
-    for leaf in &leaves[1..] {
-        if leaf.content_hash() != base_hash {
+    // Step 2: Check that all bases have the same content_hash.
+    let base_hash = bases[0].content_hash();
+    for base in &bases[1..] {
+        if base.content_hash() != base_hash {
             return None;
         }
     }
 
-    // Step 3: Use the first leaf as the base plan (they're equivalent by hash).
-    let base_plan = leaves.into_iter().next().unwrap();
+    // Step 3: Use the first base as the common base plan (they're equivalent by hash).
+    let base_plan = bases.into_iter().next().unwrap();
 
     // Step 4: Build evaluators for each column.
     let mut evaluators: Vec<ColumnEval> = Vec::with_capacity(columns.len());
@@ -1050,14 +1068,10 @@ fn plan_output_types(plan: &Arc<PlannerNode>) -> Vec<FlexTypeEnum> {
             column_indices.iter().map(|&i| input_types[i]).collect()
         }
         LogicalOp::Transform { output_type, .. } => {
-            let mut types = plan_output_types(&plan.inputs[0]);
-            types.push(*output_type);
-            types
+            vec![*output_type]
         }
         LogicalOp::BinaryTransform { output_type, .. } => {
-            let mut types = plan_output_types(&plan.inputs[0]);
-            types.push(*output_type);
-            types
+            vec![*output_type]
         }
         LogicalOp::GeneralizedTransform { output_types, .. } => output_types.clone(),
         LogicalOp::Append | LogicalOp::Union => plan_output_types(&plan.inputs[0]),
@@ -1557,6 +1571,23 @@ mod tests {
         let fused = try_fuse_plans(&columns).unwrap();
         assert!(matches!(fused.op, LogicalOp::GeneralizedTransform { .. }));
         assert_eq!(fused.length(), Some(50));
+    }
+
+    #[test]
+    fn test_plan_output_types_transform() {
+        use sframe_types::flex_type::FlexType;
+        let src = PlannerNode::sframe_source(
+            "t.sf",
+            vec!["a".into(), "b".into()],
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::Float],
+            10,
+        );
+        let xform = PlannerNode::transform(
+            src, 0,
+            Arc::new(|v: &FlexType| v.clone()),
+            FlexTypeEnum::String,
+        );
+        assert_eq!(plan_output_types(&xform), vec![FlexTypeEnum::String]);
     }
 
     #[test]
