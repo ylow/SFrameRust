@@ -16,3 +16,4 @@ rayon = "1.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
