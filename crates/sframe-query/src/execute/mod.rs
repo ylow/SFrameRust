@@ -46,19 +46,10 @@ const BROADCAST_BUFFER: usize = 4;
 
 /// Compile a logical plan node into a BatchStream.
 ///
-/// Tries data-parallel execution first (splitting input rows across
-/// worker threads). Falls back to single-threaded compilation when
-/// the plan isn't parallel-sliceable or the data is too small.
+/// Always compiles single-threaded. Data parallelism is handled by
+/// the caller via `parallel::execute_parallel()`.
 pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
     let node = optimizer::optimize(node);
-
-    // Try data-parallel execution
-    if let Some(total_rows) = parallel::parallel_slice_row_count(&node) {
-        if let Some(stream) = parallel::compile_parallel(&node, total_rows) {
-            return Ok(stream);
-        }
-    }
-
     compile_single_threaded(&node)
 }
 
