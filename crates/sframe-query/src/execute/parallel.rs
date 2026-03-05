@@ -141,9 +141,9 @@ pub fn execute_parallel(
             let file = sframe_io::vfs::VirtualFileSystem::open_write(&*vfs, &seg_path)?;
             let seg_writer = sframe_storage::segment_writer::SegmentWriter::new(file, dtypes.len());
 
-            let stream = super::compile_single_threaded(&plan)?;
+            let mut iter = super::compile_single_threaded(&plan)?;
             let (segment_sizes, row_count) =
-                super::consumer::consume_to_segment(stream, seg_writer, dtypes)?;
+                super::consumer::consume_to_segment(&mut iter, seg_writer, dtypes)?;
 
             Ok((seg_name, segment_sizes, row_count))
         })

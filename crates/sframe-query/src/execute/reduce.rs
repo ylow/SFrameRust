@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use futures::stream::StreamExt;
-
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
@@ -14,8 +12,8 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 use crate::batch::{ColumnData, SFrameRows};
 use crate::planner::{Aggregator, LogicalOp, PlannerNode};
 
+use super::batch_iter::BatchIterator;
 use super::source;
-use super::BatchStream;
 
 /// Extracted parallel reduce plan.
 pub(super) struct ParallelReducePlan {
@@ -188,14 +186,14 @@ pub(super) fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFram
     SFrameRows::new(vec![col])
 }
 
-/// Execute a reduce operation by consuming the entire input stream.
-pub(super) async fn execute_reduce(
-    mut input: BatchStream,
+/// Execute a reduce operation by consuming the entire input BatchIterator.
+pub(super) fn execute_reduce_iter(
+    input: &mut BatchIterator,
     aggregator: Arc<dyn Aggregator>,
 ) -> Result<SFrameRows> {
     let mut agg = aggregator.box_clone();
 
-    while let Some(batch_result) = input.next().await {
+    while let Some(batch_result) = input.next_batch() {
         let batch = batch_result?;
         for i in 0..batch.num_rows() {
             let row = batch.row(i);

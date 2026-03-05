@@ -7,8 +7,6 @@
 //! 4. Sort each partition in-memory.
 //! 5. Write sorted partitions sequentially into a single output SFrame.
 
-use futures::StreamExt;
-
 use sframe_query::algorithms::quantile_sketch::QuantileSketch;
 use sframe_query::algorithms::sort::{compare_flex_type, SortKey, SortOrder};
 use sframe_types::error::{Result, SFrameError};
@@ -62,9 +60,6 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     let mut builder =
         SFrameBuilder::anonymous(sf.column_names().to_vec(), sf.column_types())?;
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-
     for &part_idx in &partition_order {
         let part = &partitions[part_idx];
         let num_rows = part.num_rows().unwrap_or(0);
@@ -76,15 +71,11 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
         let sorted = part.sort_in_memory(sort_keys)?;
 
         // Stream sorted data into the output builder
-        let stream = sorted.compile_stream()?;
-        rt.block_on(async {
-            let mut stream = stream;
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result?;
-                builder.write_batch_chunked(&batch, CHUNK_SIZE)?;
-            }
-            Ok::<(), sframe_types::error::SFrameError>(())
-        })?;
+        let mut stream = sorted.compile_stream()?;
+        while let Some(batch_result) = stream.next_batch() {
+            let batch = batch_result?;
+            builder.write_batch_chunked(&batch, CHUNK_SIZE)?;
+        }
         // `sorted` and `part` dropped here — memory freed before next partition
     }
 
@@ -98,21 +89,14 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
 fn build_sketch(sf: &SFrame, key_column: usize) -> Result<QuantileSketch> {
     let mut sketch = QuantileSketch::new(0.01);
 
-    let stream = sf.compile_stream()?;
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-
-    rt.block_on(async {
-        let mut stream = stream;
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            let col = batch.column(key_column);
-            for i in 0..batch.num_rows() {
-                sketch.insert(col.get(i));
-            }
+    let mut stream = sf.compile_stream()?;
+    while let Some(batch_result) = stream.next_batch() {
+        let batch = batch_result?;
+        let col = batch.column(key_column);
+        for i in 0..batch.num_rows() {
+            sketch.insert(col.get(i));
         }
-        Ok::<(), sframe_types::error::SFrameError>(())
-    })?;
+    }
 
     sketch.finish();
     Ok(sketch)
@@ -145,18 +129,11 @@ fn partition_data(
     }
 
     // Stream input and scatter rows into partitions
-    let stream = sf.compile_stream()?;
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-
-    rt.block_on(async {
-        let mut stream = stream;
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            scatter_batch(&batch, primary_key.column, cut_points, &mut builders)?;
-        }
-        Ok::<(), sframe_types::error::SFrameError>(())
-    })?;
+    let mut stream = sf.compile_stream()?;
+    while let Some(batch_result) = stream.next_batch() {
+        let batch = batch_result?;
+        scatter_batch(&batch, primary_key.column, cut_points, &mut builders)?;
+    }
 
     // Finish all builders
     let mut partitions = Vec::with_capacity(num_partitions);

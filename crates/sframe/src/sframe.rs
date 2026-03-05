@@ -6,7 +6,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use futures::StreamExt;
 use sframe_io::cache_fs::{global_cache_fs, CacheFs};
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::algorithms::aggregators::AggSpec;
@@ -381,33 +380,28 @@ impl SFrame {
 
     /// Compile the plan and stream batches through a bounded channel.
     ///
-    /// A background thread drives the async stream and sends each
-    /// `SFrameRows` batch through the channel. Memory is bounded to
+    /// A background thread compiles and drives the BatchIterator, sending
+    /// each `SFrameRows` batch through the channel. Memory is bounded to
     /// `buffer + 1` batches.
     pub fn batch_channel(
         &self,
         buffer: usize,
     ) -> Result<std::sync::mpsc::Receiver<sframe_types::error::Result<SFrameRows>>> {
-        let stream = self.compile_stream()?;
+        let plan = self.fuse_plan()?;
         let (tx, rx) = std::sync::mpsc::sync_channel(buffer);
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
+            let mut iter = match compile(&plan) {
+                Ok(iter) => iter,
                 Err(e) => {
-                    let _ = tx.send(Err(SFrameError::Format(
-                        format!("Failed to create tokio runtime: {}", e),
-                    )));
+                    let _ = tx.send(Err(e));
                     return;
                 }
             };
-            rt.block_on(async move {
-                let mut stream = stream;
-                while let Some(batch_result) = stream.next().await {
-                    if tx.send(batch_result).is_err() {
-                        break; // receiver dropped
-                    }
+            while let Some(batch_result) = iter.next_batch() {
+                if tx.send(batch_result).is_err() {
+                    break; // receiver dropped
                 }
-            });
+            }
         });
         Ok(rx)
     }
@@ -704,9 +698,7 @@ impl SFrame {
     /// Sort entirely in memory. Used when data fits within the sort memory budget.
     pub(crate) fn sort_in_memory(&self, sort_keys: &[SortKey]) -> Result<SFrame> {
         let stream = self.compile_stream()?;
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-        let (batch, indices) = rt.block_on(sort::sort_indices(stream, sort_keys))?;
+        let (batch, indices) = sort::sort_indices(stream, sort_keys)?;
 
         if batch.num_rows() == 0 {
             return self.from_batch(batch);
@@ -766,9 +758,6 @@ impl SFrame {
         let left_stream = self.compile_stream()?;
         let right_stream = other.compile_stream()?;
 
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| SFrameError::Format(format!("Runtime error: {}", e)))?;
-
         // Build output column names: all left cols + right cols (minus join keys)
         let mut names: Vec<String> = self.column_names.clone();
         let mut output_dtypes: Vec<FlexTypeEnum> = self.column_types();
@@ -784,22 +773,19 @@ impl SFrame {
             }
         }
 
-        let mut join_stream = rt.block_on(join::join(
+        let mut join_stream = join::join(
             left_stream,
             right_stream,
             &JoinOn::multi(pairs),
             how,
-        ))?;
+        )?;
 
         // Consume the stream into a builder
         let mut builder = SFrameBuilder::anonymous(names.clone(), output_dtypes)?;
-        rt.block_on(async {
-            while let Some(batch_result) = join_stream.next().await {
-                let batch = batch_result?;
-                builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
-            }
-            Ok::<(), SFrameError>(())
-        })?;
+        while let Some(batch_result) = join_stream.next_batch() {
+            let batch = batch_result?;
+            builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
+        }
 
         builder.finish()
     }

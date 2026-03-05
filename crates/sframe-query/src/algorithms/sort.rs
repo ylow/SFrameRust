@@ -9,7 +9,6 @@
 //! materialized and sorted in-memory. The EC-Sort path (disk-based) can
 //! be added later for truly out-of-core datasets.
 
-use futures::StreamExt;
 use rayon::prelude::*;
 
 use sframe_types::error::Result;
@@ -53,8 +52,8 @@ impl SortKey {
 /// Materializes the input stream, then sorts using an index-based
 /// permutation (EC-Sort pattern). Only key columns are accessed during
 /// comparison; the permutation is applied to all columns in one pass.
-pub async fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
-    let (batch, indices) = sort_indices(input, keys).await?;
+pub fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
+    let (batch, indices) = sort_indices(input, keys)?;
     batch.take(&indices)
 }
 
@@ -64,13 +63,13 @@ pub async fn sort(input: BatchStream, keys: &[SortKey]) -> Result<SFrameRows> {
 /// Callers can use the indices to write data in sorted order in chunks
 /// (e.g. via `CacheSFrameBuilder::write_indexed_chunked`) to avoid
 /// holding a full sorted copy in memory.
-pub async fn sort_indices(
+pub fn sort_indices(
     mut input: BatchStream,
     keys: &[SortKey],
 ) -> Result<(SFrameRows, Vec<usize>)> {
     // Materialize all batches
     let mut result: Option<SFrameRows> = None;
-    while let Some(batch_result) = input.next().await {
+    while let Some(batch_result) = input.next_batch() {
         let batch = batch_result?;
         match &mut result {
             None => result = Some(batch),
@@ -200,11 +199,20 @@ fn type_rank(v: &FlexType) -> u8 {
 mod tests {
     use super::*;
     use crate::batch::SFrameRows;
-    use futures::stream;
+    use crate::execute::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
     use sframe_types::flex_type::FlexTypeEnum;
 
-    #[tokio::test]
-    async fn test_sort_integers() {
+    fn make_sort_input(batch: SFrameRows) -> BatchStream {
+        BatchIterator::new(move |co: BatchCo| async move {
+            let cmd = co.yield_(BatchResponse::Ready).await;
+            if matches!(cmd, BatchCommand::NextBatch) {
+                co.yield_(BatchResponse::Batch(Ok(batch))).await;
+            }
+        })
+    }
+
+    #[test]
+    fn test_sort_integers() {
         let rows = vec![
             vec![FlexType::Integer(3)],
             vec![FlexType::Integer(1)],
@@ -214,9 +222,9 @@ mod tests {
         ];
         let dtypes = [FlexTypeEnum::Integer];
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).await.unwrap();
+        let result = sort(input, &[SortKey::asc(0)]).unwrap();
 
         let expected = vec![1, 1, 3, 4, 5];
         for (i, &exp) in expected.iter().enumerate() {
@@ -224,8 +232,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_sort_descending() {
+    #[test]
+    fn test_sort_descending() {
         let rows = vec![
             vec![FlexType::Float(1.5)],
             vec![FlexType::Float(3.5)],
@@ -233,9 +241,9 @@ mod tests {
         ];
         let dtypes = [FlexTypeEnum::Float];
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::desc(0)]).await.unwrap();
+        let result = sort(input, &[SortKey::desc(0)]).unwrap();
 
         let expected = vec![3.5, 2.5, 1.5];
         for (i, &exp) in expected.iter().enumerate() {
@@ -246,8 +254,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_sort_strings() {
+    #[test]
+    fn test_sort_strings() {
         let rows = vec![
             vec![FlexType::String("cherry".into())],
             vec![FlexType::String("apple".into())],
@@ -255,17 +263,17 @@ mod tests {
         ];
         let dtypes = [FlexTypeEnum::String];
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).await.unwrap();
+        let result = sort(input, &[SortKey::asc(0)]).unwrap();
 
         assert_eq!(result.row(0), vec![FlexType::String("apple".into())]);
         assert_eq!(result.row(1), vec![FlexType::String("banana".into())]);
         assert_eq!(result.row(2), vec![FlexType::String("cherry".into())]);
     }
 
-    #[tokio::test]
-    async fn test_sort_multi_key() {
+    #[test]
+    fn test_sort_multi_key() {
         let rows = vec![
             vec![FlexType::Integer(2), FlexType::String("b".into())],
             vec![FlexType::Integer(1), FlexType::String("b".into())],
@@ -274,13 +282,12 @@ mod tests {
         ];
         let dtypes = [FlexTypeEnum::Integer, FlexTypeEnum::String];
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = make_sort_input(batch);
 
         let result = sort(
             input,
             &[SortKey::asc(0), SortKey::asc(1)],
         )
-        .await
         .unwrap();
 
         assert_eq!(
@@ -301,8 +308,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_sort_with_undefined() {
+    #[test]
+    fn test_sort_with_undefined() {
         let rows = vec![
             vec![FlexType::Integer(3)],
             vec![FlexType::Undefined],
@@ -311,9 +318,9 @@ mod tests {
         ];
         let dtypes = [FlexTypeEnum::Integer];
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).await.unwrap();
+        let result = sort(input, &[SortKey::asc(0)]).unwrap();
 
         // Undefined sorts last
         assert_eq!(result.row(0), vec![FlexType::Integer(1)]);

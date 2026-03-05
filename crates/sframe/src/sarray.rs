@@ -134,26 +134,21 @@ impl SArray {
         &self,
         buffer: usize,
     ) -> Result<(std::sync::mpsc::Receiver<Result<SFrameRows>>, usize)> {
-        let stream = compile(&self.plan)?;
+        let plan = self.plan.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(buffer);
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
+            let mut iter = match compile(&plan) {
+                Ok(iter) => iter,
                 Err(e) => {
-                    let _ = tx.send(Err(SFrameError::Format(
-                        format!("Failed to create tokio runtime: {}", e),
-                    )));
+                    let _ = tx.send(Err(e));
                     return;
                 }
             };
-            rt.block_on(async move {
-                let mut stream = stream;
-                while let Some(batch_result) = futures::StreamExt::next(&mut stream).await {
-                    if tx.send(batch_result).is_err() {
-                        break; // receiver dropped
-                    }
+            while let Some(batch_result) = iter.next_batch() {
+                if tx.send(batch_result).is_err() {
+                    break; // receiver dropped
                 }
-            });
+            }
         });
         Ok((rx, self.column_index))
     }

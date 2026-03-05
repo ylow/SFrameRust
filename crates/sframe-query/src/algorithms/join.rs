@@ -6,14 +6,11 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use futures::stream;
-use futures::StreamExt;
-
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::{ColumnData, SFrameRows};
-use crate::execute::BatchStream;
+use crate::execute::{BatchCo, BatchCommand, BatchResponse, BatchStream};
 
 /// Join type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,19 +51,19 @@ impl JoinOn {
 
 /// Perform a hash join of two streams.
 ///
-/// Returns a stream of result batches. For small inputs, uses an in-memory
+/// Returns a BatchStream of result batches. For small inputs, uses an in-memory
 /// hash join. For large inputs, will use GRACE hash partitioned join.
 ///
 /// Output schema: all left columns followed by all right columns (except join key columns).
-pub async fn join(
+pub fn join(
     mut left_stream: BatchStream,
     mut right_stream: BatchStream,
     on: &JoinOn,
     join_type: JoinType,
 ) -> Result<BatchStream> {
     // Materialize both sides to estimate sizes
-    let left = materialize_stream(&mut left_stream).await?;
-    let right = materialize_stream(&mut right_stream).await?;
+    let left = materialize_stream(&mut left_stream)?;
+    let right = materialize_stream(&mut right_stream)?;
 
     let left_cells = left.num_rows() * left.num_columns().max(1);
     let right_cells = right.num_rows() * right.num_columns().max(1);
@@ -77,7 +74,12 @@ pub async fn join(
     if smaller_cells <= budget {
         // In-memory fast path
         let result = in_memory_join(left, right, on, join_type)?;
-        Ok(Box::pin(stream::once(async { Ok(result) })))
+        Ok(crate::execute::BatchIterator::new(move |co: BatchCo| async move {
+            let cmd = co.yield_(BatchResponse::Ready).await;
+            if matches!(cmd, BatchCommand::NextBatch) {
+                co.yield_(BatchResponse::Batch(Ok(result))).await;
+            }
+        }))
     } else {
         // GRACE hash join
         grace_hash_join(left, right, on, join_type, budget)
@@ -180,9 +182,9 @@ fn in_memory_join(
     }))
 }
 
-async fn materialize_stream(stream: &mut BatchStream) -> Result<SFrameRows> {
+fn materialize_stream(stream: &mut BatchStream) -> Result<SFrameRows> {
     let mut result: Option<SFrameRows> = None;
-    while let Some(batch_result) = stream.next().await {
+    while let Some(batch_result) = stream.next_batch() {
         let batch = batch_result?;
         match &mut result {
             None => result = Some(batch),
@@ -267,44 +269,46 @@ fn grace_hash_join(
     drop(left);
     drop(right);
 
-    // Stream partitions: for each partition, do in-memory join and yield batches
+    // Process each partition: do in-memory join and yield batches
     let on_owned = on.clone();
-    Ok(Box::pin(stream::unfold(
-        (left_partitions, right_partitions, on_owned, join_type, 0usize),
-        |(left_parts, right_parts, on, jt, idx)| async move {
-            if idx >= left_parts.len() {
-                return None;
+    Ok(crate::execute::BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        for idx in 0..left_partitions.len() {
+            match cmd {
+                BatchCommand::NextBatch => {
+                    let left_part = left_partitions[idx].clone();
+                    let right_part = right_partitions[idx].clone();
+
+                    let result = match (left_part, right_part) {
+                        (Some(lp), Some(rp)) => in_memory_join(lp, rp, &on_owned, join_type),
+                        (Some(lp), None) => {
+                            match join_type {
+                                JoinType::Left | JoinType::Full => {
+                                    in_memory_join(lp, SFrameRows::empty(&[]), &on_owned, join_type)
+                                }
+                                _ => Ok(SFrameRows::empty(&[])),
+                            }
+                        }
+                        (None, Some(rp)) => {
+                            match join_type {
+                                JoinType::Right | JoinType::Full => {
+                                    in_memory_join(SFrameRows::empty(&[]), rp, &on_owned, join_type)
+                                }
+                                _ => Ok(SFrameRows::empty(&[])),
+                            }
+                        }
+                        (None, None) => Ok(SFrameRows::empty(&[])),
+                    };
+
+                    cmd = co.yield_(BatchResponse::Batch(result)).await;
+                }
+                BatchCommand::SkipBatch => {
+                    cmd = co.yield_(BatchResponse::Skipped).await;
+                }
+                BatchCommand::Start => unreachable!(),
             }
-            let left_part = left_parts[idx].clone();
-            let right_part = right_parts[idx].clone();
-            let next_idx = idx + 1;
-
-            let result = match (left_part, right_part) {
-                (Some(lp), Some(rp)) => in_memory_join(lp, rp, &on, jt),
-                (Some(lp), None) => {
-                    // Left rows with no match on right
-                    match jt {
-                        JoinType::Left | JoinType::Full => {
-                            in_memory_join(lp, SFrameRows::empty(&[]), &on, jt)
-                        }
-                        _ => Ok(SFrameRows::empty(&[])),
-                    }
-                }
-                (None, Some(rp)) => {
-                    // Right rows with no match on left
-                    match jt {
-                        JoinType::Right | JoinType::Full => {
-                            in_memory_join(SFrameRows::empty(&[]), rp, &on, jt)
-                        }
-                        _ => Ok(SFrameRows::empty(&[])),
-                    }
-                }
-                (None, None) => Ok(SFrameRows::empty(&[])),
-            };
-
-            Some((result, (left_parts, right_parts, on, jt, next_idx)))
-        },
-    )))
+        }
+    }))
 }
 
 /// Partition rows by hash(key) into N buckets.
@@ -339,17 +343,25 @@ fn partition_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
+    use crate::execute::BatchIterator;
 
     fn make_stream(batch: SFrameRows) -> BatchStream {
-        Box::pin(stream::once(async { Ok(batch) }))
+        BatchIterator::new(move |co: BatchCo| async move {
+            let cmd = co.yield_(BatchResponse::Ready).await;
+            if matches!(cmd, BatchCommand::NextBatch) {
+                co.yield_(BatchResponse::Batch(Ok(batch))).await;
+            }
+        })
     }
 
     /// Consume a join result stream into a single batch for testing.
-    async fn collect_stream(mut stream: BatchStream) -> SFrameRows {
+    fn collect_stream(mut stream: BatchStream) -> SFrameRows {
         let mut result: Option<SFrameRows> = None;
-        while let Some(batch_result) = stream.next().await {
+        while let Some(batch_result) = stream.next_batch() {
             let batch = batch_result.unwrap();
+            if batch.num_rows() == 0 {
+                continue;
+            }
             match &mut result {
                 None => result = Some(batch),
                 Some(existing) => existing.append(&batch).unwrap(),
@@ -358,8 +370,8 @@ mod tests {
         result.unwrap_or_else(|| SFrameRows::empty(&[]))
     }
 
-    #[tokio::test]
-    async fn test_inner_join() {
+    #[test]
+    fn test_inner_join() {
         // Left: id, name
         let left_rows = vec![
             vec![FlexType::Integer(1), FlexType::String("alice".into())],
@@ -390,9 +402,8 @@ mod tests {
             &JoinOn::new(0, 0),
             JoinType::Inner,
         )
-        .await
         .unwrap();
-        let result = collect_stream(result_stream).await;
+        let result = collect_stream(result_stream);
 
         // Should have 2 matched rows (ids 1 and 3)
         assert_eq!(result.num_rows(), 2);
@@ -400,8 +411,8 @@ mod tests {
         assert_eq!(result.num_columns(), 3);
     }
 
-    #[tokio::test]
-    async fn test_left_join() {
+    #[test]
+    fn test_left_join() {
         let left_rows = vec![
             vec![FlexType::Integer(1), FlexType::String("alice".into())],
             vec![FlexType::Integer(2), FlexType::String("bob".into())],
@@ -427,9 +438,8 @@ mod tests {
             &JoinOn::new(0, 0),
             JoinType::Left,
         )
-        .await
         .unwrap();
-        let result = collect_stream(result_stream).await;
+        let result = collect_stream(result_stream);
 
         // Both left rows should appear
         assert_eq!(result.num_rows(), 2);
@@ -446,8 +456,8 @@ mod tests {
         assert!(found_null, "Expected NULL-padded row for id=2");
     }
 
-    #[tokio::test]
-    async fn test_full_join() {
+    #[test]
+    fn test_full_join() {
         let left_rows = vec![
             vec![FlexType::Integer(1), FlexType::String("alice".into())],
         ];
@@ -472,16 +482,15 @@ mod tests {
             &JoinOn::new(0, 0),
             JoinType::Full,
         )
-        .await
         .unwrap();
-        let result = collect_stream(result_stream).await;
+        let result = collect_stream(result_stream);
 
         // Both rows should appear (no match between them)
         assert_eq!(result.num_rows(), 2);
     }
 
-    #[tokio::test]
-    async fn test_multi_column_join() {
+    #[test]
+    fn test_multi_column_join() {
         // Left: dept, region, name
         let left_rows = vec![
             vec![FlexType::String("eng".into()), FlexType::String("us".into()), FlexType::String("alice".into())],
@@ -510,8 +519,8 @@ mod tests {
             make_stream(right),
             &JoinOn::multi(vec![(0, 0), (1, 1)]),
             JoinType::Inner,
-        ).await.unwrap();
-        let result = collect_stream(result_stream).await;
+        ).unwrap();
+        let result = collect_stream(result_stream);
 
         // eng+us → alice, eng+eu → bob. sales+us has no match.
         assert_eq!(result.num_rows(), 2);
@@ -520,8 +529,8 @@ mod tests {
         assert_eq!(result.num_columns(), 4);
     }
 
-    #[tokio::test]
-    async fn test_join_returns_stream() {
+    #[test]
+    fn test_join_returns_stream() {
         // Test that join returns a BatchStream, not SFrameRows
         let left_rows = vec![
             vec![FlexType::Integer(1), FlexType::String("alice".into())],
@@ -545,19 +554,19 @@ mod tests {
             make_stream(right),
             &JoinOn::new(0, 0),
             JoinType::Inner,
-        ).await.unwrap();
+        ).unwrap();
 
         // Consume the stream and collect all rows
         let mut total_rows = 0;
-        while let Some(batch_result) = result_stream.next().await {
+        while let Some(batch_result) = result_stream.next_batch() {
             let batch = batch_result.unwrap();
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, 1);
     }
 
-    #[tokio::test]
-    async fn test_join_large_dataset_partitioned() {
+    #[test]
+    fn test_join_large_dataset_partitioned() {
         // Test with enough data to trigger GRACE partitioning
         // (when join_buffer_num_cells is set low)
         let n = 1000;
@@ -582,10 +591,10 @@ mod tests {
             make_stream(right),
             &JoinOn::new(0, 0),
             JoinType::Inner,
-        ).await.unwrap();
+        ).unwrap();
 
         let mut total_rows = 0;
-        while let Some(batch_result) = result_stream.next().await {
+        while let Some(batch_result) = result_stream.next_batch() {
             let batch = batch_result.unwrap();
             total_rows += batch.num_rows();
         }

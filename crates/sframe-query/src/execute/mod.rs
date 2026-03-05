@@ -1,7 +1,8 @@
 //! Physical execution engine.
 //!
-//! Compiles a logical plan DAG into async streams of `SFrameRows` batches.
-//! Each operator wraps its input stream(s) and produces output batches.
+//! Compiles a logical plan DAG into synchronous generator-based `BatchIterator`
+//! pipelines. Each operator is a genawaiter coroutine that yields `BatchResponse`
+//! values and receives `BatchCommand` via `resume_with`.
 //!
 //! Shared subexpressions (same `Arc<PlannerNode>`) are detected and compiled
 //! once, with a broadcast adapter fanning the output to all consumers.
@@ -22,12 +23,9 @@ mod transform;
 pub use batch_iter::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::stream::{self, Stream, StreamExt};
-
-use sframe_types::error::{Result, SFrameError};
+use sframe_types::error::Result;
 
 use crate::batch::SFrameRows;
 use crate::optimizer;
@@ -35,8 +33,8 @@ use crate::planner::{LogicalOp, OperatorRate, PlannerNode};
 
 use broadcast::BroadcastState;
 
-/// A stream of SFrameRows batches.
-pub type BatchStream = Pin<Box<dyn Stream<Item = Result<SFrameRows>> + Send>>;
+/// A BatchStream is now a type alias for BatchIterator.
+pub type BatchStream = BatchIterator;
 
 pub use consumer::consume_to_segment;
 pub use parallel::{execute_parallel, parallel_slice_row_count};
@@ -48,18 +46,18 @@ const BROADCAST_BUFFER: usize = 4;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Compile a logical plan node into a BatchStream.
+/// Compile a logical plan node into a BatchIterator.
 ///
 /// Always compiles single-threaded. Data parallelism is handled by
 /// the caller via `parallel::execute_parallel()`.
-pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchStream> {
+pub fn compile(node: &Arc<PlannerNode>) -> Result<BatchIterator> {
     let node = optimizer::optimize(node);
     compile_single_threaded(&node)
 }
 
 /// Single-threaded compilation: fan-out detection (broadcast for shared
 /// nodes) and rate-mismatch detection (rebatch at lockstep operators).
-pub(super) fn compile_single_threaded(node: &Arc<PlannerNode>) -> Result<BatchStream> {
+pub(super) fn compile_single_threaded(node: &Arc<PlannerNode>) -> Result<BatchIterator> {
     // Phase 1: count how many times each node appears as an input.
     let mut refcounts: HashMap<usize, usize> = HashMap::new();
     count_refs(node, &mut refcounts);
@@ -155,7 +153,7 @@ fn compile_memoized(
     refcounts: &HashMap<usize, usize>,
     rate_ids: &HashMap<usize, usize>,
     memo: &mut HashMap<usize, BroadcastState>,
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     let id = Arc::as_ptr(node) as usize;
 
     // If this node was already compiled (shared), hand out a subscriber.
@@ -164,19 +162,118 @@ fn compile_memoized(
     }
 
     // Compile the node itself.
-    let stream = compile_node(node, refcounts, rate_ids, memo)?;
+    let iter = compile_node(node, refcounts, rate_ids, memo)?;
 
     // If the node has multiple downstream consumers, wrap in broadcast.
     let consumers = refcounts.get(&id).copied().unwrap_or(1);
     if consumers > 1 {
-        let mut bc = BroadcastState::new(stream, consumers, BROADCAST_BUFFER);
+        let mut bc = BroadcastState::new(iter, consumers, BROADCAST_BUFFER);
         let subscriber = bc.subscribe();
         memo.insert(id, bc);
         return Ok(subscriber);
     }
 
-    Ok(stream)
+    Ok(iter)
 }
+
+// ---------------------------------------------------------------------------
+// Linear operator helper
+// ---------------------------------------------------------------------------
+
+/// Create a BatchIterator that applies a transformation to each batch
+/// from an input, passing through SkipBatch to the input.
+fn linear_operator(
+    mut input: BatchIterator,
+    process: impl Fn(SFrameRows) -> Result<SFrameRows> + 'static,
+) -> BatchIterator {
+    BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        loop {
+            match cmd {
+                BatchCommand::NextBatch => {
+                    match input.next_batch() {
+                        None => return,
+                        Some(Err(e)) => {
+                            cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                        }
+                        Some(Ok(batch)) => {
+                            cmd = co.yield_(BatchResponse::Batch(process(batch))).await;
+                        }
+                    }
+                }
+                BatchCommand::SkipBatch => {
+                    match input.skip_batch() {
+                        None => return,
+                        Some(()) => {
+                            cmd = co.yield_(BatchResponse::Skipped).await;
+                        }
+                    }
+                }
+                BatchCommand::Start => unreachable!(),
+            }
+        }
+    })
+}
+
+/// Create a BatchIterator that filters batches from an input,
+/// skipping empty results.
+fn filter_operator(
+    mut input: BatchIterator,
+    filter_fn: impl Fn(SFrameRows) -> Result<SFrameRows> + 'static,
+) -> BatchIterator {
+    BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        loop {
+            match cmd {
+                BatchCommand::NextBatch => {
+                    loop {
+                        match input.next_batch() {
+                            None => return,
+                            Some(Err(e)) => {
+                                cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                break;
+                            }
+                            Some(Ok(batch)) => {
+                                match filter_fn(batch) {
+                                    Err(e) => {
+                                        cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                        break;
+                                    }
+                                    Ok(filtered) if filtered.num_rows() == 0 => {
+                                        continue; // skip empty batches, pull next
+                                    }
+                                    Ok(filtered) => {
+                                        cmd = co.yield_(BatchResponse::Batch(Ok(filtered))).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                BatchCommand::SkipBatch => {
+                    // Filter cannot propagate SkipBatch — we don't know
+                    // output size without running the predicate. Pull one
+                    // input batch and discard.
+                    match input.next_batch() {
+                        None => return,
+                        Some(Err(e)) => {
+                            cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                        }
+                        Some(Ok(_discarded)) => {
+                            cmd = co.yield_(BatchResponse::Skipped).await;
+                        }
+                    }
+                }
+                BatchCommand::Start => unreachable!(),
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// compile_node: dispatch on LogicalOp
+// ---------------------------------------------------------------------------
 
 /// Compile a single node (dispatches on LogicalOp).
 fn compile_node(
@@ -184,7 +281,7 @@ fn compile_node(
     refcounts: &HashMap<usize, usize>,
     rate_ids: &HashMap<usize, usize>,
     memo: &mut HashMap<usize, BroadcastState>,
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     match &node.op {
         LogicalOp::SFrameSource {
             path,
@@ -198,7 +295,12 @@ fn compile_node(
 
         LogicalOp::MaterializedSource { data } => {
             let data = data.clone();
-            Ok(Box::pin(stream::once(async move { Ok((*data).clone()) })))
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let cmd = co.yield_(BatchResponse::Ready).await;
+                if matches!(cmd, BatchCommand::NextBatch) {
+                    co.yield_(BatchResponse::Batch(Ok((*data).clone()))).await;
+                }
+            }))
         }
 
         LogicalOp::Project { column_indices } => {
@@ -224,15 +326,15 @@ fn compile_node(
             }
             let input = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
             let indices = column_indices.clone();
-            Ok(Box::pin(input.map(move |batch_result| {
-                batch_result.and_then(|batch| batch.select_columns(&indices))
-            })))
+            Ok(linear_operator(input, move |batch| {
+                batch.select_columns(&indices)
+            }))
         }
 
         LogicalOp::LogicalFilter => {
-            let mut data_stream =
+            let mut data_input =
                 compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
-            let mut mask_stream =
+            let mut mask_input =
                 compile_memoized(&node.inputs[1], refcounts, rate_ids, memo)?;
 
             // Rate mismatch → rebatch both sides to a common batch size.
@@ -245,50 +347,66 @@ fn compile_node(
 
             if data_rate != mask_rate {
                 let target = sframe_config::global().source_batch_size;
-                data_stream = rebatch::rebatch(data_stream, target);
-                mask_stream = rebatch::rebatch(mask_stream, target);
+                data_input = rebatch::rebatch(data_input, target);
+                mask_input = rebatch::rebatch(mask_input, target);
             }
 
-            Ok(Box::pin(
-                data_stream
-                    .zip(mask_stream)
-                    .filter_map(|(data_result, mask_result)| async {
-                        match (data_result, mask_result) {
-                            (Err(e), _) | (_, Err(e)) => Some(Err(e)),
-                            (Ok(data), Ok(mask)) => {
-                                match filter::logical_filter_batch(&data, &mask) {
-                                    Err(e) => Some(Err(e)),
-                                    Ok(batch) if batch.num_rows() == 0 => None,
-                                    Ok(batch) => Some(Ok(batch)),
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let mut cmd = co.yield_(BatchResponse::Ready).await;
+                loop {
+                    match cmd {
+                        BatchCommand::NextBatch => {
+                            // Pull from both inputs in lockstep.
+                            loop {
+                                let data_batch = data_input.next_batch();
+                                let mask_batch = mask_input.next_batch();
+
+                                match (data_batch, mask_batch) {
+                                    (None, _) | (_, None) => return,
+                                    (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                                        cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                        break;
+                                    }
+                                    (Some(Ok(data)), Some(Ok(mask))) => {
+                                        match filter::logical_filter_batch(&data, &mask) {
+                                            Err(e) => {
+                                                cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                                break;
+                                            }
+                                            Ok(batch) if batch.num_rows() == 0 => continue,
+                                            Ok(batch) => {
+                                                cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }),
-            ))
+                        BatchCommand::SkipBatch => {
+                            // Skip both inputs.
+                            let data_skip = data_input.skip_batch();
+                            let mask_skip = mask_input.skip_batch();
+                            match (data_skip, mask_skip) {
+                                (None, _) | (_, None) => return,
+                                (Some(()), Some(())) => {
+                                    cmd = co.yield_(BatchResponse::Skipped).await;
+                                }
+                            }
+                        }
+                        BatchCommand::Start => unreachable!(),
+                    }
+                }
+            }))
         }
 
         LogicalOp::Filter { column, predicate } => {
             let input = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
             let col = *column;
             let pred = predicate.clone();
-            Ok(Box::pin(input.filter_map(move |batch_result| {
-                let pred = pred.clone();
-                async move {
-                    match batch_result {
-                        Err(e) => Some(Err(e)),
-                        Ok(batch) => match batch.filter_by_column(col, &*pred) {
-                            Err(e) => Some(Err(e)),
-                            Ok(filtered) => {
-                                if filtered.num_rows() == 0 {
-                                    None // skip empty batches
-                                } else {
-                                    Some(Ok(filtered))
-                                }
-                            }
-                        },
-                    }
-                }
-            })))
+            Ok(filter_operator(input, move |batch| {
+                batch.filter_by_column(col, &*pred)
+            }))
         }
 
         LogicalOp::Transform {
@@ -300,10 +418,9 @@ fn compile_node(
             let col = *input_column;
             let f = func.clone();
             let out_type = *output_type;
-            Ok(Box::pin(input.map(move |batch_result| {
-                batch_result
-                    .and_then(|batch| transform::apply_transform(&batch, col, &*f, out_type))
-            })))
+            Ok(linear_operator(input, move |batch| {
+                transform::apply_transform(&batch, col, &*f, out_type)
+            }))
         }
 
         LogicalOp::BinaryTransform {
@@ -317,11 +434,9 @@ fn compile_node(
             let r_col = *right_column;
             let f = func.clone();
             let out_type = *output_type;
-            Ok(Box::pin(input.map(move |batch_result| {
-                batch_result.and_then(|batch| {
-                    transform::apply_binary_transform(&batch, l_col, r_col, &*f, out_type)
-                })
-            })))
+            Ok(linear_operator(input, move |batch| {
+                transform::apply_binary_transform(&batch, l_col, r_col, &*f, out_type)
+            }))
         }
 
         LogicalOp::GeneralizedTransform {
@@ -331,30 +446,99 @@ fn compile_node(
             let input = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
             let f = func.clone();
             let out_types = output_types.clone();
-            Ok(Box::pin(input.map(move |batch_result| {
-                batch_result.and_then(|batch| {
-                    transform::apply_generalized_transform(&batch, &*f, &out_types)
-                })
-            })))
+            Ok(linear_operator(input, move |batch| {
+                transform::apply_generalized_transform(&batch, &*f, &out_types)
+            }))
         }
 
         LogicalOp::Append => {
-            let left = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
-            let right = compile_memoized(&node.inputs[1], refcounts, rate_ids, memo)?;
-            Ok(Box::pin(left.chain(right)))
+            let mut left = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
+            let mut right = compile_memoized(&node.inputs[1], refcounts, rate_ids, memo)?;
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let mut cmd = co.yield_(BatchResponse::Ready).await;
+                // Drain left first
+                loop {
+                    match cmd {
+                        BatchCommand::NextBatch => {
+                            match left.next_batch() {
+                                Some(result) => {
+                                    cmd = co.yield_(BatchResponse::Batch(result)).await;
+                                }
+                                None => break,
+                            }
+                        }
+                        BatchCommand::SkipBatch => {
+                            match left.skip_batch() {
+                                Some(()) => {
+                                    cmd = co.yield_(BatchResponse::Skipped).await;
+                                }
+                                None => break,
+                            }
+                        }
+                        BatchCommand::Start => unreachable!(),
+                    }
+                }
+                // Then drain right
+                loop {
+                    match cmd {
+                        BatchCommand::NextBatch => {
+                            match right.next_batch() {
+                                None => return,
+                                Some(result) => {
+                                    cmd = co.yield_(BatchResponse::Batch(result)).await;
+                                }
+                            }
+                        }
+                        BatchCommand::SkipBatch => {
+                            match right.skip_batch() {
+                                None => return,
+                                Some(()) => {
+                                    cmd = co.yield_(BatchResponse::Skipped).await;
+                                }
+                            }
+                        }
+                        BatchCommand::Start => unreachable!(),
+                    }
+                }
+            }))
         }
 
         LogicalOp::Union => {
-            let mut combined: BatchStream = Box::pin(stream::empty());
+            let mut inputs: Vec<BatchIterator> = Vec::new();
             for input_node in &node.inputs {
                 let input = compile_memoized(input_node, refcounts, rate_ids, memo)?;
-                combined = Box::pin(combined.chain(input));
+                inputs.push(input);
             }
-            Ok(combined)
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let mut cmd = co.yield_(BatchResponse::Ready).await;
+                for input in inputs.iter_mut() {
+                    loop {
+                        match cmd {
+                            BatchCommand::NextBatch => {
+                                match input.next_batch() {
+                                    Some(result) => {
+                                        cmd = co.yield_(BatchResponse::Batch(result)).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            BatchCommand::SkipBatch => {
+                                match input.skip_batch() {
+                                    Some(()) => {
+                                        cmd = co.yield_(BatchResponse::Skipped).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            BatchCommand::Start => unreachable!(),
+                        }
+                    }
+                }
+            }))
         }
 
         LogicalOp::ColumnUnion => {
-            let mut streams: Vec<BatchStream> = Vec::new();
+            let mut inputs: Vec<BatchIterator> = Vec::new();
             for input_node in &node.inputs {
                 let mut s = compile_memoized(input_node, refcounts, rate_ids, memo)?;
 
@@ -370,10 +554,10 @@ fn compile_node(
                     s = rebatch::rebatch(s, target);
                 }
 
-                streams.push(s);
+                inputs.push(s);
             }
-            // Also rebatch the first stream if any mismatch was detected
-            if streams.len() > 1 {
+            // Also rebatch the first input if any mismatch was detected
+            if inputs.len() > 1 {
                 let first_rate = rate_ids
                     .get(&(Arc::as_ptr(&node.inputs[0]) as usize))
                     .copied();
@@ -382,55 +566,122 @@ fn compile_node(
                 });
                 if any_mismatch {
                     let target = sframe_config::global().source_batch_size;
-                    let first = streams.remove(0);
-                    streams.insert(0, rebatch::rebatch(first, target));
+                    let first = inputs.remove(0);
+                    inputs.insert(0, rebatch::rebatch(first, target));
                 }
             }
-            compile_column_union(streams)
+
+            if inputs.len() == 1 {
+                return Ok(inputs.remove(0));
+            }
+
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let mut cmd = co.yield_(BatchResponse::Ready).await;
+                loop {
+                    match cmd {
+                        BatchCommand::NextBatch => {
+                            // Pull from all inputs in lockstep and hconcat.
+                            let mut batches: Vec<SFrameRows> = Vec::with_capacity(inputs.len());
+                            let mut error = None;
+                            let mut any_none = false;
+
+                            for input in inputs.iter_mut() {
+                                match input.next_batch() {
+                                    None => {
+                                        any_none = true;
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        error = Some(e);
+                                        break;
+                                    }
+                                    Some(Ok(batch)) => {
+                                        batches.push(batch);
+                                    }
+                                }
+                            }
+
+                            if any_none {
+                                return;
+                            }
+                            if let Some(e) = error {
+                                cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                continue;
+                            }
+
+                            // hconcat all batches
+                            let mut combined = batches.remove(0);
+                            let mut concat_error = None;
+                            for batch in batches {
+                                match combined.hconcat(&batch) {
+                                    Ok(merged) => combined = merged,
+                                    Err(e) => {
+                                        concat_error = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(e) = concat_error {
+                                cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                            } else {
+                                cmd = co.yield_(BatchResponse::Batch(Ok(combined))).await;
+                            }
+                        }
+                        BatchCommand::SkipBatch => {
+                            // Skip all inputs.
+                            let mut any_none = false;
+                            for input in inputs.iter_mut() {
+                                if input.skip_batch().is_none() {
+                                    any_none = true;
+                                    break;
+                                }
+                            }
+                            if any_none {
+                                return;
+                            }
+                            cmd = co.yield_(BatchResponse::Skipped).await;
+                        }
+                        BatchCommand::Start => unreachable!(),
+                    }
+                }
+            }))
         }
 
         LogicalOp::Range { start, step, count } => range::compile_range(*start, *step, *count),
 
         LogicalOp::Reduce { aggregator } => {
             if let Some(par_plan) = reduce::try_extract_parallel_reduce_plan(node) {
-                return Ok(Box::pin(stream::once(async move {
-                    reduce::execute_parallel_reduce(&par_plan)
-                })));
+                let result = reduce::execute_parallel_reduce(&par_plan)?;
+                return Ok(BatchIterator::new(move |co: BatchCo| async move {
+                    let cmd = co.yield_(BatchResponse::Ready).await;
+                    if matches!(cmd, BatchCommand::NextBatch) {
+                        co.yield_(BatchResponse::Batch(Ok(result))).await;
+                    }
+                }));
             }
-            let input = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
+            let mut input = compile_memoized(&node.inputs[0], refcounts, rate_ids, memo)?;
             let agg = aggregator.clone();
-            Ok(Box::pin(stream::once(async move {
-                reduce::execute_reduce(input, agg).await
-            })))
+            let result = reduce::execute_reduce_iter(&mut input, agg)?;
+            Ok(BatchIterator::new(move |co: BatchCo| async move {
+                let cmd = co.yield_(BatchResponse::Ready).await;
+                if matches!(cmd, BatchCommand::NextBatch) {
+                    co.yield_(BatchResponse::Batch(Ok(result))).await;
+                }
+            }))
         }
     }
 }
 
-/// Compile a ColumnUnion from pre-compiled input streams.
-fn compile_column_union(mut streams: Vec<BatchStream>) -> Result<BatchStream> {
-    if streams.len() == 1 {
-        return Ok(streams.remove(0));
-    }
-    let first = streams.remove(0);
-    let combined = streams.into_iter().fold(first, |acc, s| {
-        Box::pin(acc.zip(s).map(|(l, r)| match (l, r) {
-            (Ok(lb), Ok(rb)) => lb.hconcat(&rb),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }))
-    });
-    Ok(combined)
-}
-
 // ---------------------------------------------------------------------------
-// Materialization helpers
+// Materialization helpers (synchronous)
 // ---------------------------------------------------------------------------
 
-/// Helper: materialize a stream into a single SFrameRows batch.
-pub async fn materialize(stream: BatchStream) -> Result<SFrameRows> {
-    let mut stream = stream;
+/// Materialize a BatchIterator into a single SFrameRows batch.
+pub fn materialize(iter: &mut BatchIterator) -> Result<SFrameRows> {
     let mut result: Option<SFrameRows> = None;
 
-    while let Some(batch_result) = stream.next().await {
+    while let Some(batch_result) = iter.next_batch() {
         let batch = batch_result?;
         match &mut result {
             None => result = Some(batch),
@@ -441,24 +692,22 @@ pub async fn materialize(stream: BatchStream) -> Result<SFrameRows> {
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Helper: materialize synchronously using a tokio runtime.
-pub fn materialize_sync(stream: BatchStream) -> Result<SFrameRows> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
-    rt.block_on(materialize(stream))
+/// Synchronous alias for [`materialize`] — kept for API compatibility.
+pub fn materialize_sync(mut iter: BatchIterator) -> Result<SFrameRows> {
+    materialize(&mut iter)
 }
 
-/// Materialize at most `limit` rows from a stream, then stop pulling.
+/// Materialize at most `limit` rows from a BatchIterator, then stop pulling.
 ///
 /// This enables efficient `head(n)` operations: only enough batches are
 /// consumed to fill the requested row count. Remaining batches are never
 /// read from the source.
-pub async fn materialize_head(mut stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+pub fn materialize_head(iter: &mut BatchIterator, limit: usize) -> Result<SFrameRows> {
     let mut result: Option<SFrameRows> = None;
     let mut remaining = limit;
 
     while remaining > 0 {
-        match stream.next().await {
+        match iter.next_batch() {
             None => break,
             Some(Err(e)) => return Err(e),
             Some(Ok(batch)) => {
@@ -480,18 +729,16 @@ pub async fn materialize_head(mut stream: BatchStream, limit: usize) -> Result<S
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Synchronous version of [`materialize_head`].
-pub fn materialize_head_sync(stream: BatchStream, limit: usize) -> Result<SFrameRows> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
-    rt.block_on(materialize_head(stream, limit))
+/// Synchronous alias for [`materialize_head`] — kept for API compatibility.
+pub fn materialize_head_sync(mut iter: BatchIterator, limit: usize) -> Result<SFrameRows> {
+    materialize_head(&mut iter, limit)
 }
 
-/// Materialize only the last `limit` rows from a stream.
+/// Materialize only the last `limit` rows from a BatchIterator.
 ///
 /// Streams all batches but keeps a bounded ring buffer of the most recent
 /// rows, so memory stays O(limit) regardless of total stream size.
-pub async fn materialize_tail(mut stream: BatchStream, limit: usize) -> Result<SFrameRows> {
+pub fn materialize_tail(iter: &mut BatchIterator, limit: usize) -> Result<SFrameRows> {
     use std::collections::VecDeque;
 
     if limit == 0 {
@@ -501,7 +748,7 @@ pub async fn materialize_tail(mut stream: BatchStream, limit: usize) -> Result<S
     let mut ring: VecDeque<SFrameRows> = VecDeque::new();
     let mut buffered_rows: usize = 0;
 
-    while let Some(batch_result) = stream.next().await {
+    while let Some(batch_result) = iter.next_batch() {
         let batch = batch_result?;
         let n = batch.num_rows();
         if n == 0 {
@@ -541,29 +788,22 @@ pub async fn materialize_tail(mut stream: BatchStream, limit: usize) -> Result<S
     Ok(result.unwrap_or_else(|| SFrameRows::empty(&[])))
 }
 
-/// Synchronous version of [`materialize_tail`].
-pub fn materialize_tail_sync(stream: BatchStream, limit: usize) -> Result<SFrameRows> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
-    rt.block_on(materialize_tail(stream, limit))
+/// Synchronous alias for [`materialize_tail`] — kept for API compatibility.
+pub fn materialize_tail_sync(mut iter: BatchIterator, limit: usize) -> Result<SFrameRows> {
+    materialize_tail(&mut iter, limit)
 }
 
-/// Consume a stream batch-by-batch synchronously, calling `callback` for
-/// each batch. This avoids collecting the entire stream into memory.
-pub fn for_each_batch_sync<F>(stream: BatchStream, mut callback: F) -> Result<()>
+/// Consume a BatchIterator batch-by-batch, calling `callback` for
+/// each batch. This avoids collecting the entire result into memory.
+pub fn for_each_batch_sync<F>(mut iter: BatchIterator, mut callback: F) -> Result<()>
 where
     F: FnMut(SFrameRows) -> Result<()>,
 {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| SFrameError::Format(format!("Failed to create tokio runtime: {}", e)))?;
-    rt.block_on(async move {
-        let mut stream = stream;
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            callback(batch)?;
-        }
-        Ok(())
-    })
+    while let Some(batch_result) = iter.next_batch() {
+        let batch = batch_result?;
+        callback(batch)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,8 +817,8 @@ mod tests {
         format!("{}/../../samples", manifest)
     }
 
-    #[tokio::test]
-    async fn test_materialized_source() {
+    #[test]
+    fn test_materialized_source() {
         let rows = vec![
             vec![FlexType::Integer(1), FlexType::String("a".into())],
             vec![FlexType::Integer(2), FlexType::String("b".into())],
@@ -587,16 +827,16 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
 
         let node = PlannerNode::materialized(batch);
-        let stream = compile(&node).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.row(0), rows[0]);
         assert_eq!(result.row(1), rows[1]);
     }
 
-    #[tokio::test]
-    async fn test_project() {
+    #[test]
+    fn test_project() {
         let rows = vec![
             vec![
                 FlexType::Integer(1),
@@ -618,8 +858,8 @@ mod tests {
 
         let source = PlannerNode::materialized(batch);
         let projected = PlannerNode::project(source, vec![0, 2]);
-        let stream = compile(&projected).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&projected).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_columns(), 2);
         assert_eq!(
@@ -628,8 +868,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_filter() {
+    #[test]
+    fn test_filter() {
         let rows = vec![
             vec![FlexType::Integer(1)],
             vec![FlexType::Integer(2)],
@@ -645,16 +885,16 @@ mod tests {
             0,
             Arc::new(|v| matches!(v, FlexType::Integer(i) if *i > 2)),
         );
-        let stream = compile(&filtered).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&filtered).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.row(0), vec![FlexType::Integer(3)]);
         assert_eq!(result.row(1), vec![FlexType::Integer(4)]);
     }
 
-    #[tokio::test]
-    async fn test_transform() {
+    #[test]
+    fn test_transform() {
         let rows = vec![
             vec![FlexType::Integer(10)],
             vec![FlexType::Integer(20)],
@@ -672,16 +912,16 @@ mod tests {
             }),
             FlexTypeEnum::Float,
         );
-        let stream = compile(&transformed).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&transformed).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.row(0), vec![FlexType::Float(15.0)]);
         assert_eq!(result.row(1), vec![FlexType::Float(30.0)]);
     }
 
-    #[tokio::test]
-    async fn test_append() {
+    #[test]
+    fn test_append() {
         let rows1 = vec![vec![FlexType::Integer(1)]];
         let rows2 = vec![vec![FlexType::Integer(2)]];
         let dtypes = [FlexTypeEnum::Integer];
@@ -690,19 +930,19 @@ mod tests {
         let src2 = PlannerNode::materialized(SFrameRows::from_rows(&rows2, &dtypes).unwrap());
         let appended = PlannerNode::append(src1, src2);
 
-        let stream = compile(&appended).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&appended).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.row(0), vec![FlexType::Integer(1)]);
         assert_eq!(result.row(1), vec![FlexType::Integer(2)]);
     }
 
-    #[tokio::test]
-    async fn test_range() {
+    #[test]
+    fn test_range() {
         let node = PlannerNode::range(0, 2, 5);
-        let stream = compile(&node).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 5);
         assert_eq!(result.row(0), vec![FlexType::Integer(0)]);
@@ -712,8 +952,8 @@ mod tests {
         assert_eq!(result.row(4), vec![FlexType::Integer(8)]);
     }
 
-    #[tokio::test]
-    async fn test_sframe_source() {
+    #[test]
+    fn test_sframe_source() {
         let path = format!("{}/business.sf", samples_dir());
         let reader = SFrameReader::open(&path).unwrap();
         let col_names = reader.column_names().to_vec();
@@ -726,15 +966,15 @@ mod tests {
         let num_rows = reader.num_rows();
 
         let node = PlannerNode::sframe_source(&path, col_names, col_types, num_rows);
-        let stream = compile(&node).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 11536);
         assert_eq!(result.num_columns(), 12);
     }
 
-    #[tokio::test]
-    async fn test_sframe_source_filter_project() {
+    #[test]
+    fn test_sframe_source_filter_project() {
         let path = format!("{}/business.sf", samples_dir());
         let reader = SFrameReader::open(&path).unwrap();
         let col_names = reader.column_names().to_vec();
@@ -754,8 +994,8 @@ mod tests {
         );
         let projected = PlannerNode::project(filtered, vec![0, 2]);
 
-        let stream = compile(&projected).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&projected).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 3020);
         assert_eq!(result.num_columns(), 2);
@@ -767,11 +1007,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_materialize_head_partial() {
+    #[test]
+    fn test_materialize_head_partial() {
         let node = PlannerNode::range(0, 1, 10);
-        let stream = compile(&node).unwrap();
-        let result = materialize_head(stream, 3).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize_head(&mut iter, 3).unwrap();
 
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.row(0), vec![FlexType::Integer(0)]);
@@ -779,20 +1019,20 @@ mod tests {
         assert_eq!(result.row(2), vec![FlexType::Integer(2)]);
     }
 
-    #[tokio::test]
-    async fn test_materialize_head_exceeds_total() {
+    #[test]
+    fn test_materialize_head_exceeds_total() {
         let node = PlannerNode::range(0, 1, 5);
-        let stream = compile(&node).unwrap();
-        let result = materialize_head(stream, 100).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize_head(&mut iter, 100).unwrap();
 
         assert_eq!(result.num_rows(), 5);
     }
 
-    #[tokio::test]
-    async fn test_materialize_head_zero() {
+    #[test]
+    fn test_materialize_head_zero() {
         let node = PlannerNode::range(0, 1, 10);
-        let stream = compile(&node).unwrap();
-        let result = materialize_head(stream, 0).await.unwrap();
+        let mut iter = compile(&node).unwrap();
+        let result = materialize_head(&mut iter, 0).unwrap();
 
         assert_eq!(result.num_rows(), 0);
     }
@@ -800,10 +1040,10 @@ mod tests {
     #[test]
     fn test_for_each_batch_sync() {
         let node = PlannerNode::range(0, 1, 10);
-        let stream = compile(&node).unwrap();
+        let iter = compile(&node).unwrap();
 
         let mut total_rows = 0usize;
-        for_each_batch_sync(stream, |batch| {
+        for_each_batch_sync(iter, |batch| {
             total_rows += batch.num_rows();
             Ok(())
         })
@@ -812,8 +1052,8 @@ mod tests {
         assert_eq!(total_rows, 10);
     }
 
-    #[tokio::test]
-    async fn test_chained_operations() {
+    #[test]
+    fn test_chained_operations() {
         let source = PlannerNode::range(0, 1, 10);
         let filtered = PlannerNode::filter(
             source,
@@ -829,8 +1069,8 @@ mod tests {
             }),
             FlexTypeEnum::Integer,
         );
-        let stream = compile(&transformed).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&transformed).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 4);
         assert_eq!(result.num_columns(), 1);
@@ -842,8 +1082,8 @@ mod tests {
 
     // --- Fan-out / broadcast tests ---
 
-    #[tokio::test]
-    async fn test_shared_source_broadcast() {
+    #[test]
+    fn test_shared_source_broadcast() {
         // Same materialized source feeds two branches → Append.
         // Both branches should see the same data, source compiled once.
         let rows = vec![
@@ -876,8 +1116,8 @@ mod tests {
         );
         let appended = PlannerNode::append(left, right);
 
-        let stream = compile(&appended).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&appended).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         assert_eq!(result.num_rows(), 6);
         // Left branch: 10, 20, 30
@@ -890,8 +1130,8 @@ mod tests {
         assert_eq!(result.row(5), vec![FlexType::Integer(300)]);
     }
 
-    #[tokio::test]
-    async fn test_logical_filter_shared_source() {
+    #[test]
+    fn test_logical_filter_shared_source() {
         // Shared source → data path (identity) + mask path (transform to bool).
         // LogicalFilter should zip correctly with broadcast alignment.
         let rows = vec![
@@ -915,8 +1155,8 @@ mod tests {
         );
         let filtered = PlannerNode::logical_filter(source, mask);
 
-        let stream = compile(&filtered).unwrap();
-        let result = materialize(stream).await.unwrap();
+        let mut iter = compile(&filtered).unwrap();
+        let result = materialize(&mut iter).unwrap();
 
         // Only even values pass: 2, 4
         assert_eq!(result.num_rows(), 2);
@@ -926,9 +1166,9 @@ mod tests {
 
     // --- Rebatch tests ---
 
-    #[tokio::test]
-    async fn test_rebatch_normalizes_batch_sizes() {
-        // Create a stream with variable batch sizes, rebatch to target=3.
+    #[test]
+    fn test_rebatch_normalizes_batch_sizes() {
+        // Create a BatchIterator with variable batch sizes, rebatch to target=3.
         let b1 = SFrameRows::from_rows(
             &[vec![FlexType::Integer(1)]],
             &[FlexTypeEnum::Integer],
@@ -953,9 +1193,23 @@ mod tests {
         )
         .unwrap();
 
-        let input: BatchStream = Box::pin(stream::iter(vec![Ok(b1), Ok(b2), Ok(b3)]));
-        let rebatched = rebatch::rebatch(input, 3);
-        let result = materialize(rebatched).await.unwrap();
+        let batches = vec![b1, b2, b3];
+        let input = BatchIterator::new(move |co: BatchCo| async move {
+            let mut cmd = co.yield_(BatchResponse::Ready).await;
+            for batch in batches {
+                match cmd {
+                    BatchCommand::NextBatch => {
+                        cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
+                    }
+                    BatchCommand::SkipBatch => {
+                        cmd = co.yield_(BatchResponse::Skipped).await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+        let mut rebatched = rebatch::rebatch(input, 3);
+        let result = materialize(&mut rebatched).unwrap();
 
         // 7 total rows, rebatched to target=3 → batches of 3, 3, 1
         assert_eq!(result.num_rows(), 7);
@@ -967,19 +1221,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_rebatch_batch_boundaries() {
+    #[test]
+    fn test_rebatch_batch_boundaries() {
         // Verify exact batch sizes: 5 rows, target=2 → [2, 2, 1]
         let rows: Vec<Vec<FlexType>> = (0..5).map(|i| vec![FlexType::Integer(i)]).collect();
         let batch =
             SFrameRows::from_rows(&rows, &[FlexTypeEnum::Integer]).unwrap();
-        let input: BatchStream = Box::pin(stream::once(async { Ok(batch) }));
+        let input = BatchIterator::new(move |co: BatchCo| async move {
+            let cmd = co.yield_(BatchResponse::Ready).await;
+            if matches!(cmd, BatchCommand::NextBatch) {
+                co.yield_(BatchResponse::Batch(Ok(batch))).await;
+            }
+        });
 
-        let rebatched = rebatch::rebatch(input, 2);
+        let mut rebatched = rebatch::rebatch(input, 2);
 
         let mut batch_sizes = vec![];
-        let mut rebatched = rebatched;
-        while let Some(Ok(b)) = rebatched.next().await {
+        while let Some(Ok(b)) = rebatched.next_batch() {
             batch_sizes.push(b.num_rows());
         }
         assert_eq!(batch_sizes, vec![2, 2, 1]);

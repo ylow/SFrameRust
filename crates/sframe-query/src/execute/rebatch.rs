@@ -6,66 +6,86 @@
 
 use std::collections::VecDeque;
 
-use futures::stream;
-use futures::StreamExt;
-
 use sframe_types::error::Result;
 
 use crate::batch::SFrameRows;
 
-use super::BatchStream;
+use super::batch_iter::{BatchCommand, BatchCo, BatchIterator, BatchResponse};
 
-/// Internal state for the rebatch stream.
-struct RebatchState {
-    input: BatchStream,
-    /// Queued batches not yet emitted.
-    buffer: VecDeque<SFrameRows>,
-    /// Total rows across all batches in `buffer`.
-    buffer_rows: usize,
-    /// Target output batch size.
-    target_size: usize,
-    /// Whether the input stream is exhausted.
-    input_exhausted: bool,
-}
-
-/// Wrap a stream to emit batches of exactly `target_size` rows
+/// Wrap a BatchIterator to emit batches of exactly `target_size` rows
 /// (except the final batch which may be smaller).
-pub(super) fn rebatch(input: BatchStream, target_size: usize) -> BatchStream {
-    let state = RebatchState {
-        input,
-        buffer: VecDeque::new(),
-        buffer_rows: 0,
-        target_size,
-        input_exhausted: false,
-    };
+pub(super) fn rebatch(mut input: BatchIterator, target_size: usize) -> BatchIterator {
+    BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        let mut buffer: VecDeque<SFrameRows> = VecDeque::new();
+        let mut buffer_rows: usize = 0;
+        let mut input_exhausted = false;
 
-    Box::pin(stream::unfold(state, |mut state| async move {
-        // Fill buffer until we have enough rows or input is exhausted.
-        while state.buffer_rows < state.target_size && !state.input_exhausted {
-            match state.input.next().await {
-                None => {
-                    state.input_exhausted = true;
-                    break;
+        loop {
+            match cmd {
+                BatchCommand::NextBatch => {
+                    // Fill buffer until we have enough rows or input is exhausted.
+                    let mut got_error = false;
+                    while buffer_rows < target_size && !input_exhausted {
+                        match input.next_batch() {
+                            None => {
+                                input_exhausted = true;
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                got_error = true;
+                                break;
+                            }
+                            Some(Ok(batch)) => {
+                                buffer_rows += batch.num_rows();
+                                buffer.push_back(batch);
+                            }
+                        }
+                    }
+
+                    if got_error {
+                        continue; // re-match cmd in outer loop
+                    }
+
+                    if buffer_rows == 0 {
+                        return; // done
+                    }
+
+                    // Emit exactly target_size rows (or all remaining if input exhausted).
+                    let emit_count = buffer_rows.min(target_size);
+                    match drain_rows(&mut buffer, &mut buffer_rows, emit_count) {
+                        Ok(batch) => {
+                            cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
+                        }
+                        Err(e) => {
+                            cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                        }
+                    }
                 }
-                Some(Err(e)) => return Some((Err(e), state)),
-                Some(Ok(batch)) => {
-                    state.buffer_rows += batch.num_rows();
-                    state.buffer.push_back(batch);
+                BatchCommand::SkipBatch => {
+                    // Drain buffer first, then propagate skip to input.
+                    if buffer_rows > 0 {
+                        let drain_count = buffer_rows.min(target_size);
+                        let _ = drain_rows(&mut buffer, &mut buffer_rows, drain_count);
+                        cmd = co.yield_(BatchResponse::Skipped).await;
+                    } else if !input_exhausted {
+                        match input.skip_batch() {
+                            None => {
+                                return;
+                            }
+                            Some(()) => {
+                                cmd = co.yield_(BatchResponse::Skipped).await;
+                            }
+                        }
+                    } else {
+                        return;
+                    }
                 }
+                BatchCommand::Start => unreachable!(),
             }
         }
-
-        if state.buffer_rows == 0 {
-            return None; // done
-        }
-
-        // Emit exactly target_size rows (or all remaining if input exhausted).
-        let emit_count = state.buffer_rows.min(state.target_size);
-        match drain_rows(&mut state.buffer, &mut state.buffer_rows, emit_count) {
-            Ok(batch) => Some((Ok(batch), state)),
-            Err(e) => Some((Err(e), state)),
-        }
-    }))
+    })
 }
 
 /// Drain exactly `count` rows from the front of the buffer.

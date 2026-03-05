@@ -7,9 +7,6 @@
 
 use std::sync::Arc;
 
-use futures::stream;
-
-
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
@@ -20,7 +17,7 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::{ColumnData, SFrameRows};
 
-use super::BatchStream;
+use super::batch_iter::{BatchCommand, BatchCo, BatchIterator, BatchResponse};
 
 /// Resolve a path to the appropriate VFS backend.
 fn resolve_vfs(path: &str) -> Arc<dyn VirtualFileSystem> {
@@ -75,10 +72,10 @@ fn compute_segment_slices(
 }
 
 // ============================================================================
-// Pull-based source stream
+// Pull-based source state
 // ============================================================================
 
-/// State for the pull-based source stream.
+/// State for the pull-based source.
 ///
 /// Holds the VFS, segment slices to read, and the current
 /// `CachedSegmentReader` (lazily opened per segment).
@@ -121,21 +118,30 @@ impl PullSourceState {
         Ok(true)
     }
 
-    /// Read the next chunk. Returns None when all slices are exhausted.
-    fn next_batch(&mut self) -> Option<Result<SFrameRows>> {
+    /// Advance to the next chunk position, ensuring a segment is open.
+    /// Returns Ok(true) if a chunk is available, Ok(false) if done.
+    fn ensure_segment(&mut self) -> Result<bool> {
         loop {
-            // Need to open a new segment?
             if self.reader.is_none() || self.offset >= self.slice_end {
-                // Advance to next slice.
                 if self.reader.is_some() {
                     self.reader = None;
                     self.slice_idx += 1;
                 }
-                match self.open_next_segment() {
-                    Ok(true) => {}
-                    Ok(false) => return None,
-                    Err(e) => return Some(Err(e)),
+                if !self.open_next_segment()? {
+                    return Ok(false);
                 }
+            }
+            return Ok(true);
+        }
+    }
+
+    /// Read the next chunk. Returns None when all slices are exhausted.
+    fn next_batch(&mut self) -> Option<Result<SFrameRows>> {
+        loop {
+            match self.ensure_segment() {
+                Err(e) => return Some(Err(e)),
+                Ok(false) => return None,
+                Ok(true) => {}
             }
 
             let chunk_end = (self.offset + self.chunk_size).min(self.slice_end);
@@ -154,20 +160,34 @@ impl PullSourceState {
             }
         }
     }
+
+    /// Skip the next chunk without decoding data.
+    /// Returns true if a chunk was skipped, false if done.
+    fn skip_batch(&mut self) -> bool {
+        match self.ensure_segment() {
+            Err(_) => false,
+            Ok(false) => false,
+            Ok(true) => {
+                let chunk_end = (self.offset + self.chunk_size).min(self.slice_end);
+                self.offset = chunk_end;
+                true
+            }
+        }
+    }
 }
 
-/// Build a pull-based source stream from segment slices.
+/// Build a pull-based source BatchIterator from segment slices.
 fn make_pull_source(
     vfs: Arc<dyn VirtualFileSystem>,
     column_types: Vec<FlexTypeEnum>,
     cols_to_read: Vec<usize>,
     dtypes: Vec<FlexTypeEnum>,
     slices: Vec<SegmentSlice>,
-) -> BatchStream {
+) -> BatchIterator {
     let batch_size = sframe_config::global().source_batch_size;
     let max_blocks = sframe_config::global().max_blocks_in_cache;
 
-    let state = PullSourceState {
+    let mut state = PullSourceState {
         vfs,
         column_types,
         cols_to_read,
@@ -181,20 +201,39 @@ fn make_pull_source(
         reader: None,
     };
 
-    Box::pin(stream::unfold(state, |mut state| async move {
-        let result = state.next_batch()?;
-        Some((result, state))
-    }))
+    BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        loop {
+            match cmd {
+                BatchCommand::NextBatch => {
+                    match state.next_batch() {
+                        None => return,
+                        Some(result) => {
+                            cmd = co.yield_(BatchResponse::Batch(result)).await;
+                        }
+                    }
+                }
+                BatchCommand::SkipBatch => {
+                    if state.skip_batch() {
+                        cmd = co.yield_(BatchResponse::Skipped).await;
+                    } else {
+                        return;
+                    }
+                }
+                BatchCommand::Start => unreachable!(),
+            }
+        }
+    })
 }
 
 // ============================================================================
 // Public compilation functions
 // ============================================================================
 
-/// Compile an SFrame source as a pull-based stream.
+/// Compile an SFrame source as a pull-based BatchIterator.
 ///
-/// Each `.next()` reads the next chunk directly from a `CachedSegmentReader`.
-/// No background threads or channels — the stream is fully pull-based.
+/// Each `.next_batch()` reads the next chunk directly from a `CachedSegmentReader`.
+/// No background threads or channels — fully pull-based.
 ///
 /// When `begin_row > 0` or `end_row < total`, only overlapping segments
 /// are read, and partial segments use block-level skipping.
@@ -203,7 +242,7 @@ pub(super) fn compile_sframe_source(
     column_types: &[FlexTypeEnum],
     begin_row: u64,
     end_row: u64,
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     let vfs = resolve_vfs(path);
     let meta = SFrameMetadata::open_with_fs(&*vfs, path)?;
     let dtypes: Vec<FlexTypeEnum> = column_types.to_vec();
@@ -239,7 +278,7 @@ pub(super) fn compile_sframe_source_projected(
     begin_row: u64,
     end_row: u64,
     column_indices: &[usize],
-) -> Result<BatchStream> {
+) -> Result<BatchIterator> {
     let vfs = resolve_vfs(path);
     let meta = SFrameMetadata::open_with_fs(&*vfs, path)?;
     let all_col_types: Vec<FlexTypeEnum> = column_types.to_vec();
