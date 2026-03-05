@@ -16,6 +16,7 @@ pub fn optimize(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     let plan = eliminate_trivial_unions(&plan);
     let plan = eliminate_empty_appends(&plan);
     let plan = pushdown_projects(&plan);
+    let plan = eliminate_singleton_column_unions(&plan);
     let plan = push_filter_through_transform(&plan);
     plan
 }
@@ -203,6 +204,25 @@ fn is_empty_source(plan: &PlannerNode) -> bool {
         LogicalOp::MaterializedSource { data } => data.num_rows() == 0,
         _ => false,
     }
+}
+
+/// Eliminate singleton ColumnUnion nodes.
+///
+/// `ColumnUnion([x])` becomes just `x`.
+pub fn eliminate_singleton_column_unions(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
+    let new_inputs: Vec<Arc<PlannerNode>> = plan
+        .inputs
+        .iter()
+        .map(|i| eliminate_singleton_column_unions(i))
+        .collect();
+    let plan = rebuild_with_inputs(plan, new_inputs);
+
+    if let LogicalOp::ColumnUnion = &plan.op {
+        if plan.inputs.len() == 1 {
+            return plan.inputs[0].clone();
+        }
+    }
+    plan
 }
 
 /// Push Filter below Transform when the filter references a column from
@@ -448,6 +468,14 @@ mod tests {
         let appended = PlannerNode::append(empty, source);
         let optimized = eliminate_empty_appends(&appended);
         assert!(matches!(optimized.op, LogicalOp::SFrameSource { .. }));
+    }
+
+    #[test]
+    fn test_eliminate_singleton_column_union() {
+        let src = PlannerNode::range(0, 1, 10);
+        let cu = PlannerNode::column_union(vec![src.clone()]);
+        let optimized = optimize(&cu);
+        assert!(matches!(optimized.op, LogicalOp::Range { .. }));
     }
 
     #[test]
