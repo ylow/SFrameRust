@@ -438,8 +438,22 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
 ///
 /// Returns (column_names, SFrameRows).
 pub fn read_csv(path: &str, options: &CsvOptions) -> Result<(Vec<String>, SFrameRows)> {
-    let content = std::fs::read_to_string(path).map_err(SFrameError::Io)?;
-    read_csv_string(&content, options)
+    let streaming = CsvStreamingParse::open(path, options)?;
+    let names = streaming.column_names.clone();
+    let dtypes = streaming.column_types.clone();
+    if names.is_empty() {
+        return Ok((names, SFrameRows::empty(&dtypes)));
+    }
+    let mut result: Option<SFrameRows> = None;
+    streaming.parse_chunks(|col_vecs| {
+        let batch = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
+        match &mut result {
+            None => result = Some(batch),
+            Some(existing) => existing.append(&batch)?,
+        }
+        Ok(())
+    })?;
+    Ok((names, result.unwrap_or_else(|| SFrameRows::empty(&dtypes))))
 }
 
 /// Parse a CSV string into SFrameRows with inferred types.
