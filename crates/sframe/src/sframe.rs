@@ -1663,23 +1663,8 @@ impl SFrame {
     }
 
     /// Compile the SFrame's plan into a BatchStream.
-    ///
-    /// Uses fuse_plan() to produce a unified plan, then compiles it.
-    /// Falls back to materializing all columns if fusion fails.
     pub(crate) fn compile_stream(&self) -> Result<sframe_query::execute::BatchStream> {
-        if self.columns.is_empty() {
-            let plan = PlannerNode::materialized(SFrameRows::empty(&[]));
-            return compile(&plan);
-        }
-
-        if let Ok(fused) = self.fuse_plan() {
-            return compile(&fused);
-        }
-
-        // Slow path: materialize all columns and wrap as a single batch
-        let batch = self.materialize_batch()?;
-        let plan = PlannerNode::materialized(batch);
-        compile(&plan)
+        compile(&self.fuse_plan()?)
     }
 
     fn column_index(&self, name: &str) -> Result<usize> {
@@ -1690,22 +1675,7 @@ impl SFrame {
     }
 
     fn materialize_batch(&self) -> Result<SFrameRows> {
-        if self.columns.is_empty() {
-            return Ok(SFrameRows::empty(&[]));
-        }
-
-        if let Ok(fused) = self.fuse_plan() {
-            let stream = compile(&fused)?;
-            return materialize_sync(stream);
-        }
-
-        // Slow path: materialize each column independently
-        let mut column_vecs: Vec<Vec<FlexType>> = Vec::new();
-        for col in &self.columns {
-            column_vecs.push(col.to_vec()?);
-        }
-        let dtypes: Vec<FlexTypeEnum> = self.columns.iter().map(|c| c.dtype()).collect();
-        SFrameRows::from_column_vecs(column_vecs, &dtypes)
+        materialize_sync(self.compile_stream()?)
     }
 
     fn from_batch(&self, batch: SFrameRows) -> Result<SFrame> {
