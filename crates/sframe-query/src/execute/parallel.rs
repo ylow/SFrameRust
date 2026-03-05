@@ -87,7 +87,8 @@ fn check_sliceable(
         | LogicalOp::Transform { .. }
         | LogicalOp::BinaryTransform { .. }
         | LogicalOp::GeneralizedTransform { .. }
-        | LogicalOp::LogicalFilter => {
+        | LogicalOp::LogicalFilter
+        | LogicalOp::ColumnUnion => {
             node.inputs
                 .iter()
                 .all(|input| check_sliceable(input, total_rows, source_path))

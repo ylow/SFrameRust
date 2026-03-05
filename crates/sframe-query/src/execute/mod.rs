@@ -350,6 +350,42 @@ fn compile_node(
             Ok(combined)
         }
 
+        LogicalOp::ColumnUnion => {
+            let mut streams: Vec<BatchStream> = Vec::new();
+            for input_node in &node.inputs {
+                let mut s = compile_memoized(input_node, refcounts, rate_ids, memo)?;
+
+                // Rate mismatch → rebatch to a common batch size.
+                let input_rate = rate_ids
+                    .get(&(Arc::as_ptr(input_node) as usize))
+                    .copied();
+                let first_rate = rate_ids
+                    .get(&(Arc::as_ptr(&node.inputs[0]) as usize))
+                    .copied();
+                if input_rate != first_rate {
+                    let target = sframe_config::global().source_batch_size;
+                    s = rebatch::rebatch(s, target);
+                }
+
+                streams.push(s);
+            }
+            // Also rebatch the first stream if any mismatch was detected
+            if streams.len() > 1 {
+                let first_rate = rate_ids
+                    .get(&(Arc::as_ptr(&node.inputs[0]) as usize))
+                    .copied();
+                let any_mismatch = node.inputs[1..].iter().any(|inp| {
+                    rate_ids.get(&(Arc::as_ptr(inp) as usize)).copied() != first_rate
+                });
+                if any_mismatch {
+                    let target = sframe_config::global().source_batch_size;
+                    let first = streams.remove(0);
+                    streams.insert(0, rebatch::rebatch(first, target));
+                }
+            }
+            compile_column_union(streams)
+        }
+
         LogicalOp::Range { start, step, count } => range::compile_range(*start, *step, *count),
 
         LogicalOp::Reduce { aggregator } => {
@@ -365,6 +401,21 @@ fn compile_node(
             })))
         }
     }
+}
+
+/// Compile a ColumnUnion from pre-compiled input streams.
+fn compile_column_union(mut streams: Vec<BatchStream>) -> Result<BatchStream> {
+    if streams.len() == 1 {
+        return Ok(streams.remove(0));
+    }
+    let first = streams.remove(0);
+    let combined = streams.into_iter().fold(first, |acc, s| {
+        Box::pin(acc.zip(s).map(|(l, r)| match (l, r) {
+            (Ok(lb), Ok(rb)) => lb.hconcat(&rb),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }))
+    });
+    Ok(combined)
 }
 
 // ---------------------------------------------------------------------------

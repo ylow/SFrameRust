@@ -569,6 +569,25 @@ impl SFrameRows {
         })
     }
 
+    /// Horizontal concatenation: combine columns from two batches.
+    /// Both batches must have the same number of rows.
+    pub fn hconcat(&self, other: &SFrameRows) -> Result<SFrameRows> {
+        if self.num_rows() != other.num_rows() {
+            return Err(SFrameError::Format(format!(
+                "ColumnUnion: row count mismatch {} vs {}",
+                self.num_rows(),
+                other.num_rows()
+            )));
+        }
+        let mut columns = Vec::with_capacity(self.num_columns() + other.num_columns());
+        columns.extend(self.columns.iter().cloned());
+        columns.extend(other.columns.iter().cloned());
+        Ok(SFrameRows {
+            columns,
+            num_rows: self.num_rows,
+        })
+    }
+
     /// Append another batch (vertically). Columns must have matching types.
     pub fn append(&mut self, other: &SFrameRows) -> Result<()> {
         if self.columns.len() != other.columns.len() {

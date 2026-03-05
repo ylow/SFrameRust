@@ -104,6 +104,10 @@ pub enum LogicalOp {
     /// Union of multiple inputs (same as Append but for >2 inputs).
     Union,
 
+    /// Horizontal concatenation of N inputs with the same row count.
+    /// Output columns are all columns from input 0, then all from input 1, etc.
+    ColumnUnion,
+
     /// Logical filter: two inputs of the same row count. A row from
     /// input 0 (data) is emitted only when the corresponding row in
     /// input 1 (mask, single column) is truthy (non-zero).
@@ -149,6 +153,7 @@ impl LogicalOp {
             LogicalOp::Range { start, step, count } => LogicalOp::Range { start: *start, step: *step, count: *count },
             LogicalOp::Reduce { aggregator } => LogicalOp::Reduce { aggregator: aggregator.clone() },
             LogicalOp::Union => LogicalOp::Union,
+            LogicalOp::ColumnUnion => LogicalOp::ColumnUnion,
             LogicalOp::MaterializedSource { data } => LogicalOp::MaterializedSource { data: data.clone() },
         }
     }
@@ -165,6 +170,7 @@ impl LogicalOp {
             LogicalOp::GeneralizedTransform { .. } => OperatorRate::Linear,
             LogicalOp::Append => OperatorRate::Linear,
             LogicalOp::Union => OperatorRate::Linear,
+            LogicalOp::ColumnUnion => OperatorRate::Linear,
             LogicalOp::Filter { .. } => OperatorRate::SubLinear,
             LogicalOp::LogicalFilter => OperatorRate::SubLinear,
             LogicalOp::Reduce { .. } => OperatorRate::SubLinear,
@@ -174,7 +180,7 @@ impl LogicalOp {
     /// Whether this multi-input operator consumes inputs in lockstep
     /// (same batch boundaries required) vs sequentially.
     pub fn is_lockstep(&self) -> bool {
-        matches!(self, LogicalOp::LogicalFilter)
+        matches!(self, LogicalOp::LogicalFilter | LogicalOp::ColumnUnion)
     }
 }
 
@@ -310,6 +316,11 @@ impl PlannerNode {
                 }
             }
             LogicalOp::Union => {
+                for input in inputs {
+                    input.content_hash.hash(&mut h);
+                }
+            }
+            LogicalOp::ColumnUnion => {
                 for input in inputs {
                     input.content_hash.hash(&mut h);
                 }
@@ -492,6 +503,26 @@ impl PlannerNode {
         ))
     }
 
+    /// Horizontal concatenation of N same-length inputs.
+    ///
+    /// Panics if any input has a known length that differs from the others.
+    pub fn column_union(inputs: Vec<Arc<PlannerNode>>) -> Arc<Self> {
+        let mut known_len: Option<u64> = None;
+        for input in &inputs {
+            if let Some(len) = input.length() {
+                if let Some(prev) = known_len {
+                    assert_eq!(
+                        len, prev,
+                        "ColumnUnion inputs have different lengths: {} vs {}",
+                        prev, len
+                    );
+                }
+                known_len = Some(len);
+            }
+        }
+        Arc::new(Self::new(LogicalOp::ColumnUnion, inputs))
+    }
+
     /// Compute the output row count if statically known.
     ///
     /// Returns `Some(n)` for source nodes and linear operators whose
@@ -524,6 +555,9 @@ impl PlannerNode {
                     total += input.length()?;
                 }
                 Some(total)
+            }
+            LogicalOp::ColumnUnion => {
+                self.inputs.iter().find_map(|i| i.length())
             }
             LogicalOp::Filter { .. } | LogicalOp::LogicalFilter => None,
             LogicalOp::Reduce { .. } => Some(1),
@@ -630,6 +664,7 @@ impl PlannerNode {
             }
             LogicalOp::Reduce { .. } => "Reduce".to_string(),
             LogicalOp::Union => "Union".to_string(),
+            LogicalOp::ColumnUnion => format!("ColumnUnion({} inputs)", self.inputs.len()),
             LogicalOp::MaterializedSource { data } => {
                 format!("MaterializedSource({} rows, {} cols)", data.num_rows(), data.num_columns())
             }
@@ -840,6 +875,13 @@ fn slice_recursive(
                 _ => Ok(PlannerNode::union(new_inputs)),
             }
         }
+        LogicalOp::ColumnUnion => {
+            let mut new_inputs = Vec::with_capacity(plan.inputs.len());
+            for input in &plan.inputs {
+                new_inputs.push(slice_recursive(input, begin, end)?);
+            }
+            Ok(PlannerNode::column_union(new_inputs))
+        }
         _ => Err(SFrameError::Format(
             "Unexpected operator in slice_recursive".to_string()
         )),
@@ -982,6 +1024,7 @@ pub fn try_build_evaluator(
         | LogicalOp::LogicalFilter
         | LogicalOp::Append
         | LogicalOp::Union
+        | LogicalOp::ColumnUnion
         | LogicalOp::Reduce { .. } => None,
     }
 }
@@ -1074,6 +1117,13 @@ fn plan_output_types(plan: &Arc<PlannerNode>) -> Vec<FlexTypeEnum> {
             vec![*output_type]
         }
         LogicalOp::GeneralizedTransform { output_types, .. } => output_types.clone(),
+        LogicalOp::ColumnUnion => {
+            let mut types = Vec::new();
+            for input in &plan.inputs {
+                types.extend(plan_output_types(input));
+            }
+            types
+        }
         LogicalOp::Append | LogicalOp::Union => plan_output_types(&plan.inputs[0]),
         LogicalOp::Filter { .. } | LogicalOp::LogicalFilter => {
             plan_output_types(&plan.inputs[0])
@@ -1588,6 +1638,22 @@ mod tests {
             FlexTypeEnum::String,
         );
         assert_eq!(plan_output_types(&xform), vec![FlexTypeEnum::String]);
+    }
+
+    #[test]
+    fn test_column_union_basic() {
+        let s1 = PlannerNode::range(0, 1, 10);
+        let s2 = PlannerNode::range(100, 1, 10);
+        let cu = PlannerNode::column_union(vec![s1, s2]);
+        assert_eq!(cu.length(), Some(10));
+    }
+
+    #[test]
+    #[should_panic(expected = "different lengths")]
+    fn test_column_union_length_mismatch() {
+        let s1 = PlannerNode::range(0, 1, 10);
+        let s2 = PlannerNode::range(0, 1, 20);
+        PlannerNode::column_union(vec![s1, s2]);
     }
 
     #[test]

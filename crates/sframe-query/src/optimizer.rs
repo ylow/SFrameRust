@@ -240,6 +240,13 @@ fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
             // Filter/LogicalFilter doesn't change column count (uses input 0)
             plan.inputs.first().and_then(|i| count_output_columns(i))
         }
+        LogicalOp::ColumnUnion => {
+            let mut total = 0;
+            for input in &plan.inputs {
+                total += count_output_columns(input)?;
+            }
+            Some(total)
+        }
         LogicalOp::Append | LogicalOp::Union => {
             // Same as first input
             plan.inputs.first().and_then(|i| count_output_columns(i))
