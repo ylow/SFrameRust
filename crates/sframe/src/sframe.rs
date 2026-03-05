@@ -433,23 +433,36 @@ impl SFrame {
 
     /// Return a Graphviz DOT representation of the query plan.
     ///
-    /// Shows each column's plan (or the shared plan if all columns share one),
-    /// both before and after optimizer passes. Shared subexpressions appear
-    /// as a single node with multiple incoming edges.
+    /// Shows both the logical plan (per-column) and the execution plan
+    /// (fused/optimized) that will actually run. Shared subexpressions
+    /// appear as a single node with multiple incoming edges.
     pub fn explain(&self) -> String {
         let mut buf = String::new();
+
+        // --- Logical plan (what the user built) ---
         if let Some(plan) = self.shared_plan() {
             buf.push_str("Logical Plan:\n");
             buf.push_str(&plan.explain());
-            let optimized = optimizer::optimize(plan);
-            buf.push_str("\nOptimized Plan:\n");
+        } else {
+            let named_plans: Vec<(&str, &Arc<PlannerNode>)> = self
+                .column_names
+                .iter()
+                .zip(self.columns.iter())
+                .map(|(name, col)| (name.as_str(), col.plan()))
+                .collect();
+            buf.push_str("Logical Plan:\n");
+            buf.push_str(&PlannerNode::explain_multi(&named_plans));
+        }
+
+        // --- Execution plan (what will actually run) ---
+        if let Some(fused) = self.fuse_plan() {
+            let optimized = optimizer::optimize(&fused);
+            buf.push_str("\nExecution Plan:\n");
             buf.push_str(&optimized.explain());
         } else {
-            for (i, col) in self.columns.iter().enumerate() {
-                buf.push_str(&format!("Column {} (\"{}\") plan:\n", i, self.column_names[i]));
-                buf.push_str(&col.plan().explain());
-            }
+            buf.push_str("\nExecution Plan: columns will be materialized independently\n");
         }
+
         buf
     }
 
@@ -499,6 +512,39 @@ impl SFrame {
                 name
             )));
         }
+
+        if let Some(fused) = self.fuse_plan() {
+            let existing_ncols = self.columns.len();
+            let col_plan = PlannerNode::project(col.plan().clone(), vec![col.column_index()]);
+
+            let existing_len = fused.length();
+            let new_len = col_plan.length();
+            let compatible = match (existing_len, new_len) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+
+            if compatible {
+                let unified = PlannerNode::column_union(vec![fused, col_plan]);
+                let mut columns: Vec<SArray> = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| SArray::from_plan(unified.clone(), c.dtype(), None, i))
+                    .collect();
+                columns.push(SArray::from_plan(
+                    unified.clone(),
+                    col.dtype(),
+                    None,
+                    existing_ncols,
+                ));
+                let mut names = self.column_names.clone();
+                names.push(name.to_string());
+                return Ok(SFrame::new_with_columns(columns, names));
+            }
+        }
+
+        // Fallback: independent plans
         let mut columns = self.columns.clone();
         let mut names = self.column_names.clone();
         columns.push(col);
@@ -528,12 +574,10 @@ impl SFrame {
     ) -> Result<SFrame> {
         let filter_col_idx = self.column_index(column_name)?;
 
-        // Lazy path: build LogicalFilter(source, Transform(pred) → Project → source)
-        if let Some(plan) = self.shared_plan() {
-            let plan_col_idx = self.columns[filter_col_idx].column_index();
-
-            // Right branch: project out the filter column, transform predicate to int
-            let mask_source = PlannerNode::project(plan.clone(), vec![plan_col_idx]);
+        // Lazy path: fuse columns into a single plan, then apply LogicalFilter.
+        if let Some(fused) = self.fuse_plan() {
+            // After fusion, column indices are 0..N in SFrame order.
+            let mask_source = PlannerNode::project(fused.clone(), vec![filter_col_idx]);
             let mask = PlannerNode::transform(
                 mask_source,
                 0, // column 0 after projection
@@ -547,14 +591,14 @@ impl SFrame {
                 FlexTypeEnum::Integer,
             );
 
-            // LogicalFilter: emit rows from source where mask is truthy
-            let filtered_plan = PlannerNode::logical_filter(plan.clone(), mask);
+            let filtered_plan = PlannerNode::logical_filter(fused, mask);
 
             let columns: Vec<SArray> = self
                 .columns
                 .iter()
-                .map(|c| {
-                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, c.column_index())
+                .enumerate()
+                .map(|(i, c)| {
+                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i)
                 })
                 .collect();
 
@@ -579,14 +623,15 @@ impl SFrame {
     /// let filtered = sf.logical_filter(mask)?;
     /// ```
     pub fn logical_filter(&self, mask: SArray) -> Result<SFrame> {
-        if let Some(plan) = self.shared_plan() {
-            let filtered_plan = PlannerNode::logical_filter(plan.clone(), mask.plan().clone());
+        if let Some(fused) = self.fuse_plan() {
+            let filtered_plan = PlannerNode::logical_filter(fused, mask.plan().clone());
 
             let columns: Vec<SArray> = self
                 .columns
                 .iter()
-                .map(|c| {
-                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, c.column_index())
+                .enumerate()
+                .map(|(i, c)| {
+                    SArray::from_plan(filtered_plan.clone(), c.dtype(), None, i)
                 })
                 .collect();
 
@@ -632,17 +677,8 @@ impl SFrame {
             ));
         }
 
-        // Lazy path: build an Append plan node
-        if self.shared_plan().is_some() && other.shared_plan().is_some() {
-            let self_indices: Vec<usize> =
-                self.columns.iter().map(|c| c.column_index()).collect();
-            let other_indices: Vec<usize> =
-                other.columns.iter().map(|c| c.column_index()).collect();
-
-            let left =
-                PlannerNode::project(self.shared_plan().unwrap().clone(), self_indices);
-            let right =
-                PlannerNode::project(other.shared_plan().unwrap().clone(), other_indices);
+        // Lazy path: fuse each side into a single plan, then Append.
+        if let (Some(left), Some(right)) = (self.fuse_plan(), other.fuse_plan()) {
             let appended = PlannerNode::append(left, right);
 
             let columns: Vec<SArray> = self
@@ -842,6 +878,61 @@ impl SFrame {
     /// Replace a column with a new SArray (returns a new SFrame).
     pub fn replace_column(&self, name: &str, col: SArray) -> Result<SFrame> {
         let idx = self.column_index(name)?;
+
+        if let Some(fused) = self.fuse_plan() {
+            let col_plan = PlannerNode::project(col.plan().clone(), vec![col.column_index()]);
+            let existing_len = fused.length();
+            let new_len = col_plan.length();
+            let compatible = match (existing_len, new_len) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+
+            if compatible {
+                let keep_indices: Vec<usize> =
+                    (0..self.columns.len()).filter(|&i| i != idx).collect();
+
+                if keep_indices.is_empty() {
+                    // Only column being replaced
+                    let columns = vec![SArray::from_plan(col_plan, col.dtype(), None, 0)];
+                    return Ok(SFrame::new_with_columns(
+                        columns,
+                        self.column_names.clone(),
+                    ));
+                }
+
+                let kept = PlannerNode::project(fused, keep_indices.clone());
+                let unified = PlannerNode::column_union(vec![kept, col_plan]);
+
+                let new_col_offset = keep_indices.len();
+                let mut columns = Vec::with_capacity(self.columns.len());
+                let mut kept_pos = 0;
+                for i in 0..self.columns.len() {
+                    if i == idx {
+                        columns.push(SArray::from_plan(
+                            unified.clone(),
+                            col.dtype(),
+                            None,
+                            new_col_offset,
+                        ));
+                    } else {
+                        columns.push(SArray::from_plan(
+                            unified.clone(),
+                            self.columns[i].dtype(),
+                            None,
+                            kept_pos,
+                        ));
+                        kept_pos += 1;
+                    }
+                }
+                return Ok(SFrame::new_with_columns(
+                    columns,
+                    self.column_names.clone(),
+                ));
+            }
+        }
+
+        // Fallback: independent plans
         let mut columns = self.columns.clone();
         columns[idx] = col;
         Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
@@ -963,17 +1054,18 @@ impl SFrame {
             )
         };
 
-        if let Some(plan) = self.shared_plan() {
+        if let Some(fused) = self.fuse_plan() {
             let mask = make_mask();
-            let filtered = PlannerNode::logical_filter(plan.clone(), mask);
+            let filtered = PlannerNode::logical_filter(fused, mask);
             let columns: Vec<SArray> = self
                 .columns
                 .iter()
-                .map(|c| SArray::from_plan(filtered.clone(), c.dtype(), None, c.column_index()))
+                .enumerate()
+                .map(|(i, c)| SArray::from_plan(filtered.clone(), c.dtype(), None, i))
                 .collect();
             Ok(SFrame::new_with_columns(columns, self.column_names.clone()))
         } else {
-            // Different plans: materialize and filter in memory.
+            // Unfusible plans: materialize and filter in memory.
             let batch = self.materialize_batch()?;
             let nrows = batch.num_rows();
             let ncols = batch.num_columns();
@@ -1494,32 +1586,43 @@ impl SFrame {
         }
     }
 
+    /// Try to produce a single unified plan for all columns.
+    ///
+    /// Output columns are always 0..N matching the SFrame's column order.
+    /// Returns `None` only if columns have truly incompatible plans (e.g.
+    /// different source tables with no common ancestor).
+    fn fuse_plan(&self) -> Option<Arc<PlannerNode>> {
+        if self.columns.is_empty() {
+            return None;
+        }
+
+        // Fast path: all columns share the same plan Arc — just project.
+        if let Some(plan) = self.shared_plan() {
+            let indices: Vec<usize> =
+                self.columns.iter().map(|c| c.column_index()).collect();
+            return Some(PlannerNode::project(plan.clone(), indices));
+        }
+
+        // Medium path: fuse divergent column plans via content-hash matching.
+        let col_specs: Vec<_> = self
+            .columns
+            .iter()
+            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
+            .collect();
+        try_fuse_plans(&col_specs)
+    }
+
     /// Compile the SFrame's plan into a BatchStream.
     ///
-    /// If all columns share a plan, projects to the needed columns and
-    /// compiles once. Otherwise falls back to materializing all columns
-    /// and wrapping the result.
+    /// Uses fuse_plan() to produce a unified plan, then compiles it.
+    /// Falls back to materializing all columns if fusion fails.
     pub(crate) fn compile_stream(&self) -> Result<sframe_query::execute::BatchStream> {
         if self.columns.is_empty() {
             let plan = PlannerNode::materialized(SFrameRows::empty(&[]));
             return compile(&plan);
         }
 
-        // Fast path: all columns share exact same plan Arc
-        if let Some(plan) = self.shared_plan() {
-            let indices: Vec<usize> =
-                self.columns.iter().map(|c| c.column_index()).collect();
-            let projected = PlannerNode::project(plan.clone(), indices);
-            return compile(&projected);
-        }
-
-        // Medium path: try plan fusion via content hash
-        let col_specs: Vec<_> = self
-            .columns
-            .iter()
-            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
-            .collect();
-        if let Some(fused) = try_fuse_plans(&col_specs) {
+        if let Some(fused) = self.fuse_plan() {
             return compile(&fused);
         }
 
@@ -1541,27 +1644,7 @@ impl SFrame {
             return Ok(SFrameRows::empty(&[]));
         }
 
-        // If all columns share the same plan, materialize once
-        // Otherwise, materialize each column separately and combine
-        let first_plan = self.columns[0].plan();
-        let all_same = self.columns.iter().all(|c| Arc::ptr_eq(c.plan(), first_plan));
-
-        if all_same {
-            let stream = compile(first_plan)?;
-            let batch = materialize_sync(stream)?;
-
-            // Project to just the columns we need
-            let indices: Vec<usize> = self.columns.iter().map(|c| c.column_index()).collect();
-            return batch.select_columns(&indices);
-        }
-
-        // Medium path: try plan fusion via content hash
-        let col_specs: Vec<_> = self
-            .columns
-            .iter()
-            .map(|c| (c.plan().clone(), c.column_index(), c.dtype()))
-            .collect();
-        if let Some(fused) = try_fuse_plans(&col_specs) {
+        if let Some(fused) = self.fuse_plan() {
             let stream = compile(&fused)?;
             return materialize_sync(stream);
         }
