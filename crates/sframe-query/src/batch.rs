@@ -306,6 +306,30 @@ impl ColumnData {
         }
     }
 
+    /// Convert this column to a `Vec<FlexType>`.
+    ///
+    /// Used when feeding column data to `SegmentWriter::write_column_block()`.
+    pub fn to_flex_vec(&self) -> Vec<FlexType> {
+        macro_rules! convert_opt {
+            ($v:expr, $variant:ident) => {
+                $v.iter().map(|val| match val {
+                    Some(x) => FlexType::$variant(x.clone()),
+                    None => FlexType::Undefined,
+                }).collect()
+            };
+        }
+        match self {
+            ColumnData::Integer(v) => convert_opt!(v, Integer),
+            ColumnData::Float(v) => convert_opt!(v, Float),
+            ColumnData::String(v) => convert_opt!(v, String),
+            ColumnData::Vector(v) => convert_opt!(v, Vector),
+            ColumnData::List(v) => convert_opt!(v, List),
+            ColumnData::Dict(v) => convert_opt!(v, Dict),
+            ColumnData::DateTime(v) => convert_opt!(v, DateTime),
+            ColumnData::Flexible(v) => v.clone(),
+        }
+    }
+
     /// Return indices of "truthy" elements (non-zero, non-null).
     ///
     /// Operates directly on typed storage without constructing FlexType values.
@@ -688,5 +712,37 @@ mod tests {
             FlexType::Dict(d) => assert_eq!(d.len(), 1),
             other => panic!("Expected Dict, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_to_flex_vec_integer() {
+        let col = ColumnData::Integer(vec![Some(1), None, Some(3)]);
+        let result = col.to_flex_vec();
+        assert_eq!(result, vec![
+            FlexType::Integer(1),
+            FlexType::Undefined,
+            FlexType::Integer(3),
+        ]);
+    }
+
+    #[test]
+    fn test_to_flex_vec_float() {
+        let col = ColumnData::Float(vec![Some(1.5), None]);
+        let result = col.to_flex_vec();
+        assert_eq!(result, vec![FlexType::Float(1.5), FlexType::Undefined]);
+    }
+
+    #[test]
+    fn test_to_flex_vec_string() {
+        let col = ColumnData::String(vec![Some("hello".into()), None]);
+        let result = col.to_flex_vec();
+        assert_eq!(result, vec![FlexType::String("hello".into()), FlexType::Undefined]);
+    }
+
+    #[test]
+    fn test_to_flex_vec_flexible() {
+        let col = ColumnData::Flexible(vec![FlexType::Integer(1), FlexType::String("x".into())]);
+        let result = col.to_flex_vec();
+        assert_eq!(result, vec![FlexType::Integer(1), FlexType::String("x".into())]);
     }
 }
