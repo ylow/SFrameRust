@@ -356,27 +356,42 @@ fn compile_node(
                 loop {
                     match cmd {
                         BatchCommand::NextBatch => {
-                            // Pull from both inputs in lockstep.
+                            // Pull mask first — if all zeros, skip the data batch.
                             loop {
-                                let data_batch = data_input.next_batch();
                                 let mask_batch = mask_input.next_batch();
-
-                                match (data_batch, mask_batch) {
-                                    (None, _) | (_, None) => return,
-                                    (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                                match mask_batch {
+                                    None => return,
+                                    Some(Err(e)) => {
                                         cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
                                         break;
                                     }
-                                    (Some(Ok(data)), Some(Ok(mask))) => {
-                                        match filter::logical_filter_batch(&data, &mask) {
-                                            Err(e) => {
+                                    Some(Ok(mask)) => {
+                                        if !mask.column(0).any_truthy() {
+                                            // Mask is all zeros — skip the data batch.
+                                            match data_input.skip_batch() {
+                                                None => return,
+                                                Some(()) => continue,
+                                            }
+                                        }
+                                        // Mask has truthy values — pull data.
+                                        match data_input.next_batch() {
+                                            None => return,
+                                            Some(Err(e)) => {
                                                 cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
                                                 break;
                                             }
-                                            Ok(batch) if batch.num_rows() == 0 => continue,
-                                            Ok(batch) => {
-                                                cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
-                                                break;
+                                            Some(Ok(data)) => {
+                                                match filter::logical_filter_batch(&data, &mask) {
+                                                    Err(e) => {
+                                                        cmd = co.yield_(BatchResponse::Batch(Err(e))).await;
+                                                        break;
+                                                    }
+                                                    Ok(batch) if batch.num_rows() == 0 => continue,
+                                                    Ok(batch) => {
+                                                        cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -385,8 +400,8 @@ fn compile_node(
                         }
                         BatchCommand::SkipBatch => {
                             // Skip both inputs.
-                            let data_skip = data_input.skip_batch();
                             let mask_skip = mask_input.skip_batch();
+                            let data_skip = data_input.skip_batch();
                             match (data_skip, mask_skip) {
                                 (None, _) | (_, None) => return,
                                 (Some(()), Some(())) => {

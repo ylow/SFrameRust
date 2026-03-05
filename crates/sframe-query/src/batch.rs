@@ -330,6 +330,27 @@ impl ColumnData {
         }
     }
 
+    /// Return `true` if any element is truthy (non-zero, non-null).
+    ///
+    /// Short-circuits on the first truthy element — O(1) best case.
+    pub fn any_truthy(&self) -> bool {
+        match self {
+            ColumnData::Integer(v) => v.iter().any(|val| matches!(val, Some(x) if *x != 0)),
+            ColumnData::Float(v) => v.iter().any(|val| matches!(val, Some(x) if *x != 0.0)),
+            ColumnData::String(v) => v.iter().any(|val| val.is_some()),
+            ColumnData::Vector(v) => v.iter().any(|val| val.is_some()),
+            ColumnData::List(v) => v.iter().any(|val| val.is_some()),
+            ColumnData::Dict(v) => v.iter().any(|val| val.is_some()),
+            ColumnData::DateTime(v) => v.iter().any(|val| val.is_some()),
+            ColumnData::Flexible(v) => v.iter().any(|val| match val {
+                FlexType::Integer(x) if *x != 0 => true,
+                FlexType::Float(x) if *x != 0.0 => true,
+                FlexType::Undefined | FlexType::Integer(_) | FlexType::Float(_) => false,
+                _ => true,
+            }),
+        }
+    }
+
     /// Return indices of "truthy" elements (non-zero, non-null).
     ///
     /// Operates directly on typed storage without constructing FlexType values.
