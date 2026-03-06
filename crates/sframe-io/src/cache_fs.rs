@@ -211,21 +211,15 @@ impl CacheFs {
         self.root.join(name)
     }
 
-    /// Try to store data in memory. Returns true if successful.
-    fn try_store_in_memory(&self, path: &str, data: Vec<u8>) -> bool {
-        let size = data.len();
-        let per_file_limit = self.cache_capacity_per_file;
-        let total_limit = self.cache_capacity;
-
-        if size > per_file_limit {
+    /// Try to atomically reserve `size` bytes in the in-memory budget.
+    /// Returns true if the reservation succeeded.
+    fn try_reserve_bytes(&self, size: usize) -> bool {
+        if size > self.cache_capacity_per_file {
             return false;
         }
-
-        // Check if adding this would exceed the total budget.
-        // Use a CAS loop to atomically reserve space.
         loop {
             let current = self.total_cached_bytes.load(Ordering::Relaxed);
-            if current + size > total_limit {
+            if current + size > self.cache_capacity {
                 return false;
             }
             match self.total_cached_bytes.compare_exchange_weak(
@@ -234,23 +228,15 @@ impl CacheFs {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => return true,
                 Err(_) => continue,
             }
         }
-
-        let mut mem = self.in_memory.lock().unwrap();
-        mem.insert(path.to_string(), Arc::new(data));
-        true
     }
 
-    /// Write data to disk for the given path.
-    fn write_to_disk(&self, path: &str, data: &[u8]) -> Result<()> {
-        let real_path = self.resolve_path(path);
-        let mut file = BufWriter::new(File::create(&real_path)?);
-        file.write_all(data)?;
-        file.flush()?;
-        Ok(())
+    /// Release `size` bytes from the in-memory budget.
+    fn unreserve_bytes(&self, size: usize) {
+        self.total_cached_bytes.fetch_sub(size, Ordering::Relaxed);
     }
 }
 
@@ -327,22 +313,72 @@ impl ReadableFile for DiskReadableFile {
 // Writable file implementation
 // ---------------------------------------------------------------------------
 
-/// Writable file that buffers in memory, then decides storage tier on flush.
+/// State of a `CacheFsWritableFile`.
+enum CacheWriteState {
+    /// Data is buffered in memory. The buffer's length is tracked in the
+    /// global `total_cached_bytes` counter so that the memory budget is
+    /// enforced incrementally across all concurrent writers.
+    InMemory { buffer: Vec<u8> },
+    /// Data has been spilled to disk. All subsequent writes go here directly.
+    OnDisk { file: BufWriter<File> },
+}
+
+/// Writable file that buffers in memory, spilling to disk incrementally
+/// when either the per-file or global memory limit is exceeded.
 struct CacheFsWritableFile {
     path: String,
-    buffer: Vec<u8>,
     cache_fs: Arc<CacheFs>,
     flushed: bool,
+    state: CacheWriteState,
+}
+
+impl CacheFsWritableFile {
+    /// Spill the in-memory buffer to disk and switch to on-disk mode.
+    /// Pre-decrements `total_cached_bytes` before performing I/O.
+    fn spill_to_disk(&mut self) -> std::io::Result<()> {
+        if let CacheWriteState::InMemory { buffer } = &mut self.state {
+            let data = std::mem::take(buffer);
+            // Release reserved bytes
+            self.cache_fs.unreserve_bytes(data.len());
+            // Write to disk
+            let real_path = self.cache_fs.resolve_path(&self.path);
+            let mut file = BufWriter::new(File::create(&real_path)?);
+            file.write_all(&data)?;
+            self.state = CacheWriteState::OnDisk { file };
+        }
+        Ok(())
+    }
 }
 
 impl Write for CacheFsWritableFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
+        match &mut self.state {
+            CacheWriteState::InMemory { buffer } => {
+                let new_len = buffer.len() + buf.len();
+                // Check if we'd exceed per-file or global limit
+                if self.cache_fs.try_reserve_bytes(buf.len()) {
+                    buffer.extend_from_slice(buf);
+                } else {
+                    // Spill to disk and write there
+                    self.spill_to_disk()?;
+                    if let CacheWriteState::OnDisk { file } = &mut self.state {
+                        file.write_all(buf)?;
+                    }
+                }
+                // Also spill if per-file limit exceeded
+                if new_len > self.cache_fs.cache_capacity_per_file {
+                    self.spill_to_disk()?;
+                }
+                Ok(buf.len())
+            }
+            CacheWriteState::OnDisk { file } => file.write(buf),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // No-op: actual flush happens in flush_all()
+        if let CacheWriteState::OnDisk { file } = &mut self.state {
+            file.flush()?;
+        }
         Ok(())
     }
 }
@@ -354,10 +390,25 @@ impl WritableFile for CacheFsWritableFile {
         }
         self.flushed = true;
 
-        let data = std::mem::take(&mut self.buffer);
-        if !self.cache_fs.try_store_in_memory(&self.path, data.clone()) {
-            // Didn't fit in memory — write to disk
-            self.cache_fs.write_to_disk(&self.path, &data)?;
+        match &mut self.state {
+            CacheWriteState::InMemory { buffer } => {
+                // Finalize: move buffer into the in-memory store.
+                // Bytes are already reserved in total_cached_bytes.
+                let data = std::mem::take(buffer);
+                let size = data.len();
+                let mut mem = self.cache_fs.in_memory.lock().unwrap();
+                mem.insert(self.path.clone(), Arc::new(data));
+                // The reservation transfers to the in_memory map — no
+                // unreserve needed since it's still "in use".
+                drop(mem);
+                // However, the reservation was done incrementally per-write.
+                // The in_memory store is the authoritative owner now, but
+                // total_cached_bytes already accounts for it. Nothing to do.
+                let _ = size;
+            }
+            CacheWriteState::OnDisk { file } => {
+                file.flush()?;
+            }
         }
         Ok(())
     }
@@ -382,9 +433,9 @@ impl CacheFs {
     pub fn open_cache_write(self: &Arc<Self>, path: &str) -> Result<Box<dyn WritableFile>> {
         Ok(Box::new(CacheFsWritableFile {
             path: path.to_string(),
-            buffer: Vec::new(),
             cache_fs: self.clone(),
             flushed: false,
+            state: CacheWriteState::InMemory { buffer: Vec::new() },
         }))
     }
 }
