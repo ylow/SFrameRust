@@ -40,57 +40,34 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     let budget = sframe_config::global().sort_memory_budget;
     let estimated_size = sf.estimate_size();
 
-    // Phase 1: Build quantile sketch of the primary sort key
-    let sketch = build_sketch(sf, primary_key.column)?;
+    // Check if parallel execution is possible
+    let plan = sf.fuse_plan()?;
+    let total_rows = parallel_slice_row_count(&plan);
+
+    // Phase 1: Build quantile sketch (parallel if possible)
+    let sketch = if let Some(total_rows) = total_rows {
+        build_sketch_parallel(&plan, primary_key.column, total_rows)?
+    } else {
+        build_sketch(sf, primary_key.column)?
+    };
 
     if sketch.count() == 0 {
-        // Empty input — return empty SFrame with same schema
         return sf.head(0);
     }
 
-    // Phase 2: Determine number of partitions and cut points
+    // Phase 2: Determine partition cut points
     let num_partitions = (estimated_size / budget).max(2);
     let cut_points = sketch.quantiles(num_partitions);
 
-    // Phase 3: Partition data into P temporary SFrames
-    let partitions = partition_data(sf, primary_key, &cut_points)?;
-
-    // Phase 4+5: Sort each partition in-memory and write to output
-    // Iterate partitions in the correct global order:
-    // ascending primary key → partitions 0..P (low to high)
-    // descending primary key → partitions P-1..0 (high to low)
-    let partition_order: Vec<usize> = if primary_key.order == SortOrder::Descending {
-        (0..partitions.len()).rev().collect()
+    // Phase 3: Partition data (parallel if possible)
+    let partitions = if let Some(total_rows) = total_rows {
+        partition_data_parallel(&plan, sf, primary_key, &cut_points, total_rows)?
     } else {
-        (0..partitions.len()).collect()
+        partition_data(sf, primary_key, &cut_points)?
     };
 
-    let mut builder =
-        SFrameBuilder::anonymous(sf.column_names().to_vec(), sf.column_types())?;
-
-    for &part_idx in &partition_order {
-        let part = &partitions[part_idx];
-        let num_rows = part.num_rows().unwrap_or(0);
-        if num_rows == 0 {
-            continue;
-        }
-
-        // Sort this partition in-memory
-        let sorted = part.sort_in_memory(sort_keys)?;
-
-        // Stream sorted data into the output builder
-        let mut stream = sorted.compile_stream()?;
-        while let Some(batch_result) = stream.next_batch() {
-            let batch = batch_result?;
-            builder.write_batch_chunked(&batch, CHUNK_SIZE)?;
-        }
-        // `sorted` and `part` dropped here — memory freed before next partition
-    }
-
-    // Drop partitions explicitly before finishing
-    drop(partitions);
-
-    builder.finish()
+    // Phase 4+5: Sort partitions in parallel + assemble output
+    sort_partitions_and_assemble(partitions, sort_keys, primary_key, sf)
 }
 
 /// Phase 1: Stream the data and build a quantile sketch of the primary sort key.
@@ -704,6 +681,119 @@ mod tests {
         assert_eq!(rows.len(), 9);
         for i in 0..9 {
             assert_eq!(rows[i], vec![FlexType::Integer(i as i64 + 1)]);
+        }
+    }
+
+    #[test]
+    fn test_external_sort_parallel_path() {
+        let n = 5000i64;
+        let values: Vec<FlexType> = (0..n).rev().map(FlexType::Integer).collect(); // descending
+
+        let sf = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(values, FlexTypeEnum::Integer).unwrap(),
+        )])
+        .unwrap();
+
+        // Save + read to get parallel-sliceable plan
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("par_sort_test.sf");
+        sf.save(path.to_str().unwrap()).unwrap();
+        let sf2 = SFrame::read(path.to_str().unwrap()).unwrap();
+
+        // Verify plan is parallel-sliceable
+        let plan = sf2.fuse_plan().unwrap();
+        assert!(parallel_slice_row_count(&plan).is_some());
+
+        // Sort ascending
+        let sort_keys = vec![SortKey::asc(0)];
+        let sorted = external_sort(&sf2, &sort_keys).unwrap();
+
+        let rows = sorted.iter_rows().unwrap();
+        assert_eq!(rows.len(), n as usize);
+        for i in 0..rows.len() {
+            assert_eq!(rows[i], vec![FlexType::Integer(i as i64)]);
+        }
+    }
+
+    #[test]
+    fn test_external_sort_parallel_descending() {
+        let n = 5000i64;
+        let values: Vec<FlexType> = (0..n).map(FlexType::Integer).collect(); // ascending
+
+        let sf = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(values, FlexTypeEnum::Integer).unwrap(),
+        )])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("par_sort_desc.sf");
+        sf.save(path.to_str().unwrap()).unwrap();
+        let sf2 = SFrame::read(path.to_str().unwrap()).unwrap();
+
+        let sort_keys = vec![SortKey::desc(0)];
+        let sorted = external_sort(&sf2, &sort_keys).unwrap();
+
+        let rows = sorted.iter_rows().unwrap();
+        assert_eq!(rows.len(), n as usize);
+        for i in 0..rows.len() {
+            assert_eq!(rows[i], vec![FlexType::Integer(n - 1 - i as i64)]);
+        }
+    }
+
+    #[test]
+    fn test_external_sort_parallel_multi_key() {
+        let n = 200i64;
+        let mut col_a = Vec::new();
+        let mut col_b = Vec::new();
+        for a in (0..10).rev() {
+            for b in (0..20).rev() {
+                col_a.push(FlexType::Integer(a));
+                col_b.push(FlexType::Integer(b));
+            }
+        }
+
+        let sf = SFrame::from_columns(vec![
+            (
+                "a",
+                SArray::from_vec(col_a, FlexTypeEnum::Integer).unwrap(),
+            ),
+            (
+                "b",
+                SArray::from_vec(col_b, FlexTypeEnum::Integer).unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("par_sort_multi.sf");
+        sf.save(path.to_str().unwrap()).unwrap();
+        let sf2 = SFrame::read(path.to_str().unwrap()).unwrap();
+
+        let sort_keys = vec![SortKey::asc(0), SortKey::desc(1)];
+        let sorted = external_sort(&sf2, &sort_keys).unwrap();
+
+        let rows = sorted.iter_rows().unwrap();
+        assert_eq!(rows.len(), n as usize);
+
+        // Verify: asc on a, desc on b
+        for i in 1..rows.len() {
+            let a_prev = &rows[i - 1][0];
+            let a_curr = &rows[i][0];
+            let b_prev = &rows[i - 1][1];
+            let b_curr = &rows[i][1];
+            let cmp_a = compare_flex_type(a_prev, a_curr);
+            assert!(
+                cmp_a != std::cmp::Ordering::Greater,
+                "row {i}: a not ascending"
+            );
+            if cmp_a == std::cmp::Ordering::Equal {
+                assert!(
+                    compare_flex_type(b_prev, b_curr) != std::cmp::Ordering::Less,
+                    "row {i}: b not descending within same a"
+                );
+            }
         }
     }
 }
