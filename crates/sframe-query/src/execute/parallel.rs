@@ -139,7 +139,7 @@ pub fn execute_parallel(
             let seg_name = format!("seg.{i:04}");
             let seg_path = format!("{base_path}/{seg_name}");
             let file = sframe_io::vfs::VirtualFileSystem::open_write(&*vfs, &seg_path)?;
-            let seg_writer = sframe_storage::segment_writer::SegmentWriter::new(file, dtypes.len());
+            let seg_writer = sframe_storage::segment_writer::BufferedSegmentWriter::new(file, dtypes);
 
             let mut iter = super::compile_single_threaded(&plan)?;
             let (segment_sizes, row_count) =
@@ -170,6 +170,7 @@ pub fn execute_parallel(
         &segment_files,
         &all_segment_sizes,
         total_written,
+        &std::collections::HashMap::new(),
     )?;
 
     Ok(base_path)

@@ -603,6 +603,7 @@ pub fn assemble_sframe_from_segments(
     segment_files: &[String],
     all_segment_sizes: &[Vec<u64>],
     total_rows: u64,
+    metadata: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let hash = generate_hash(base_path);
     let data_prefix = format!("m_{hash}");
@@ -624,7 +625,7 @@ pub fn assemble_sframe_from_segments(
         &sidx_file,
         total_rows,
         segment_files.len(),
-        &std::collections::HashMap::new(),
+        metadata,
     )?;
 
     // Write dir_archive.ini

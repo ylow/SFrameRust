@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use sframe_storage::segment_writer::SegmentWriter;
+use sframe_storage::segment_writer::BufferedSegmentWriter;
 use sframe_types::error::Result;
 use sframe_types::flex_type::FlexTypeEnum;
 
@@ -19,7 +19,7 @@ use super::batch_iter::BatchIterator;
 /// per-column element count vector from `SegmentWriter::finish()`.
 pub fn consume_to_segment<W: Write>(
     iter: &mut BatchIterator,
-    mut seg_writer: SegmentWriter<W>,
+    mut seg_writer: BufferedSegmentWriter<W>,
     dtypes: &[FlexTypeEnum],
 ) -> Result<(Vec<u64>, u64)> {
     let mut total_rows: u64 = 0;
@@ -83,8 +83,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_path = dir.path().join("test.segment");
         let file = std::fs::File::create(&seg_path).unwrap();
-        let seg_writer = SegmentWriter::new(std::io::BufWriter::new(file), 2);
         let dtypes = vec![FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let seg_writer = BufferedSegmentWriter::new(std::io::BufWriter::new(file), &dtypes);
 
         let (segment_sizes, total_rows) =
             consume_to_segment(&mut input, seg_writer, &dtypes).unwrap();
@@ -129,8 +129,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_path = dir.path().join("empty.segment");
         let file = std::fs::File::create(&seg_path).unwrap();
-        let seg_writer = SegmentWriter::new(std::io::BufWriter::new(file), 1);
         let dtypes = vec![FlexTypeEnum::Integer];
+        let seg_writer = BufferedSegmentWriter::new(std::io::BufWriter::new(file), &dtypes);
 
         let (segment_sizes, total_rows) =
             consume_to_segment(&mut input, seg_writer, &dtypes).unwrap();

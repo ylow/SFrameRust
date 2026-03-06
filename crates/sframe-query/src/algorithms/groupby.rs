@@ -361,6 +361,7 @@ fn write_output_to_cache(
         &[seg_name],
         &[segment_sizes],
         total_rows,
+        &std::collections::HashMap::new(),
     )?;
 
     Ok(base_path)

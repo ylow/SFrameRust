@@ -75,6 +75,7 @@ fn test_assemble_from_two_segments() {
         &[seg0_name, seg1_name],
         &[seg0_sizes, seg1_sizes],
         5,
+        &std::collections::HashMap::new(),
     )
     .unwrap();
 
