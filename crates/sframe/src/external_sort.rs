@@ -272,6 +272,53 @@ fn partition_data_parallel(
     Ok(partitions)
 }
 
+/// Phase 4+5 (parallel sort, sequential assembly): Sort each partition
+/// in parallel using rayon, then write sorted partitions to output
+/// in the correct global order.
+fn sort_partitions_and_assemble(
+    partitions: Vec<SFrame>,
+    sort_keys: &[SortKey],
+    primary_key: &SortKey,
+    sf: &SFrame,
+) -> Result<SFrame> {
+    // Determine output order: ascending → 0..P, descending → P-1..0
+    let partition_order: Vec<usize> = if primary_key.order == SortOrder::Descending {
+        (0..partitions.len()).rev().collect()
+    } else {
+        (0..partitions.len()).collect()
+    };
+
+    // Sort all partitions in parallel
+    let sort_keys_owned = sort_keys.to_vec();
+    let sorted: Vec<Option<Result<SFrame>>> = partition_order
+        .par_iter()
+        .map(|&part_idx| {
+            let num_rows = partitions[part_idx].num_rows().unwrap_or(0);
+            if num_rows == 0 {
+                return None;
+            }
+            Some(partitions[part_idx].sort_in_memory(&sort_keys_owned))
+        })
+        .collect();
+
+    // Write sorted partitions to output in order
+    let mut builder =
+        SFrameBuilder::anonymous(sf.column_names().to_vec(), sf.column_types())?;
+
+    for result in sorted {
+        if let Some(sort_result) = result {
+            let sorted_part = sort_result?;
+            let mut stream = sorted_part.compile_stream()?;
+            while let Some(batch_result) = stream.next_batch() {
+                builder.write_batch_chunked(&batch_result?, CHUNK_SIZE)?;
+            }
+        }
+    }
+
+    drop(partitions);
+    builder.finish()
+}
+
 /// Phase 3: Partition data by the primary sort key using the cut points.
 ///
 /// Produces `cut_points.len() + 1` partitions. For ascending sort:
@@ -606,6 +653,57 @@ mod tests {
                 "parallel median off: {v} vs 5000"
             ),
             other => panic!("Expected Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sort_partitions_and_assemble() {
+        // Create 3 partitions with unsorted data within each
+        let p0 = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(
+                vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+        let p1 = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(
+                vec![FlexType::Integer(6), FlexType::Integer(4), FlexType::Integer(5)],
+                FlexTypeEnum::Integer,
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+        let p2 = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(
+                vec![FlexType::Integer(9), FlexType::Integer(7), FlexType::Integer(8)],
+                FlexTypeEnum::Integer,
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+
+        let partitions = vec![p0, p1, p2];
+        let sort_keys = vec![SortKey::asc(0)];
+        // Build a schema SFrame to pass for column names/types
+        let sf_schema = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(Vec::new(), FlexTypeEnum::Integer).unwrap(),
+        )])
+        .unwrap();
+
+        let result =
+            sort_partitions_and_assemble(partitions, &sort_keys, &sort_keys[0], &sf_schema)
+                .unwrap();
+
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows.len(), 9);
+        for i in 0..9 {
+            assert_eq!(rows[i], vec![FlexType::Integer(i as i64 + 1)]);
         }
     }
 }
