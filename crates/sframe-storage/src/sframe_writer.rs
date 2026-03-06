@@ -638,7 +638,7 @@ pub fn assemble_sframe_from_segments(
 }
 
 /// Create a segment file name like "m_xxx.0000".
-fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
+pub fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
     format!("{data_prefix}.{segment_idx:04}")
 }
 
@@ -657,7 +657,7 @@ fn create_buffered_segment_writer_vfs(
 }
 
 /// Generate a deterministic hash prefix from the path.
-fn generate_hash(path: &str) -> String {
+pub fn generate_hash(path: &str) -> String {
     // Simple hash - not cryptographic, just for unique file naming
     let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
     for byte in path.as_bytes() {

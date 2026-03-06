@@ -1497,24 +1497,112 @@ impl SFrame {
 
     /// Save to disk as an SFrame directory.
     ///
-    /// Streams batches directly to the segment writer without collecting
-    /// the entire dataset into memory first.
+    /// When the query plan is parallel-sliceable, writes one segment per
+    /// rayon thread in parallel. Otherwise falls back to sequential streaming.
     pub fn save(&self, path: &str) -> Result<()> {
+        use sframe_query::execute::parallel_slice_row_count;
+
         let col_names: Vec<&str> = self.column_names.iter().map(|s| s.as_str()).collect();
         let dtypes = self.column_types();
-        let mut writer = SFrameStreamWriter::new(path, &col_names, &dtypes)?;
 
-        // Persist metadata
+        let plan = self.fuse_plan()?;
+
+        if let Some(total_rows) = parallel_slice_row_count(&plan) {
+            self.save_parallel(path, &plan, &col_names, &dtypes, total_rows)
+        } else {
+            self.save_sequential(path, &col_names, &dtypes)
+        }
+    }
+
+    fn save_sequential(
+        &self,
+        path: &str,
+        col_names: &[&str],
+        dtypes: &[FlexTypeEnum],
+    ) -> Result<()> {
+        let mut writer = SFrameStreamWriter::new(path, col_names, dtypes)?;
         for (key, value) in &self.metadata {
             writer.set_metadata(key, value);
         }
-
         let stream = self.compile_stream()?;
-        for_each_batch_sync(stream, |batch| {
-            writer.write_batch(&batch)
-        })?;
-
+        for_each_batch_sync(stream, |batch| writer.write_batch(&batch))?;
         writer.finish()
+    }
+
+    fn save_parallel(
+        &self,
+        path: &str,
+        plan: &Arc<PlannerNode>,
+        col_names: &[&str],
+        dtypes: &[FlexTypeEnum],
+        total_rows: u64,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        use sframe_query::execute::consume_to_segment;
+        use sframe_query::planner::clone_plan_with_row_range;
+        use sframe_storage::segment_writer::BufferedSegmentWriter;
+        use sframe_storage::sframe_writer::{
+            assemble_sframe_from_segments, generate_hash, segment_filename,
+        };
+
+        let data_prefix = format!("m_{}", generate_hash(path));
+        let n_workers = rayon::current_num_threads().max(1);
+
+        std::fs::create_dir_all(path).map_err(SFrameError::Io)?;
+
+        // Build per-worker plans with row ranges
+        let worker_plans: Vec<(usize, Arc<PlannerNode>)> = (0..n_workers)
+            .filter_map(|i| {
+                let begin = (i as u64 * total_rows) / n_workers as u64;
+                let end = ((i as u64 + 1) * total_rows) / n_workers as u64;
+                if begin >= end {
+                    return None;
+                }
+                Some((i, clone_plan_with_row_range(plan, begin, end)))
+            })
+            .collect();
+
+        // Each worker writes its own segment file
+        let results: Vec<Result<(String, Vec<u64>, u64)>> = worker_plans
+            .into_par_iter()
+            .map(|(i, worker_plan)| {
+                let seg_file = segment_filename(&data_prefix, i);
+                let seg_path = format!("{path}/{seg_file}");
+                let file = std::fs::File::create(&seg_path).map_err(SFrameError::Io)?;
+                let buf_writer = std::io::BufWriter::new(file);
+                let seg_writer = BufferedSegmentWriter::new(buf_writer, dtypes);
+
+                let mut iter = compile(&worker_plan)?;
+                let (sizes, rows) = consume_to_segment(&mut iter, seg_writer, dtypes)?;
+                Ok((seg_file, sizes, rows))
+            })
+            .collect();
+
+        // Collect results
+        let mut segment_files = Vec::new();
+        let mut all_segment_sizes = Vec::new();
+        let mut total_written = 0u64;
+        for result in results {
+            let (seg_file, sizes, rows) = result?;
+            segment_files.push(seg_file);
+            all_segment_sizes.push(sizes);
+            total_written += rows;
+        }
+
+        // Assemble metadata
+        let vfs = sframe_io::local_fs::LocalFileSystem;
+        assemble_sframe_from_segments(
+            &vfs,
+            path,
+            col_names,
+            dtypes,
+            &segment_files,
+            &all_segment_sizes,
+            total_written,
+            &self.metadata,
+        )?;
+
+        Ok(())
     }
 
     /// Write to CSV file.
