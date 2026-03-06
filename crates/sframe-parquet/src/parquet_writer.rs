@@ -46,9 +46,13 @@ pub fn write_parquet(
     let schema = Arc::new(Schema::new(fields));
 
     // 2. Writer properties: Parquet v2, Snappy compression
+    // Limit row group size to ~1M cells (rows × columns) to bound memory.
+    let num_cols = column_names.len().max(1);
+    let max_row_group_rows = (1_000_000 / num_cols).max(1);
     let props = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
         .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(max_row_group_rows)
         .build();
 
     // 3. Create ArrowWriter
