@@ -3107,4 +3107,44 @@ mod tests {
         assert_eq!(rows[2][1], FlexType::Undefined);
         assert_eq!(rows[2][2], FlexType::String("world".into()));
     }
+
+    #[test]
+    fn test_csv_to_parquet_roundtrip() {
+        // Read business.csv
+        let csv_path = format!("{}/business.csv", samples_dir());
+        let sf = SFrame::from_csv(&csv_path, None).unwrap();
+        let original_rows = sf.num_rows().unwrap();
+        let original_names = sf.column_names().to_vec();
+
+        // Write to Parquet
+        let dir = tempfile::tempdir().unwrap();
+        let parquet_path = dir.path().join("business.parquet");
+        sf.to_parquet(parquet_path.to_str().unwrap()).unwrap();
+
+        // Read back and compare
+        let sf2 = SFrame::from_parquet(parquet_path.to_str().unwrap()).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), original_rows);
+        assert_eq!(sf2.column_names(), &original_names);
+
+        // Spot-check first few rows
+        let head1 = sf.head(5).unwrap();
+        let head2 = sf2.head(5).unwrap();
+        assert_eq!(head1.num_rows().unwrap(), head2.num_rows().unwrap());
+    }
+
+    #[test]
+    fn test_parquet_sharded_roundtrip_with_real_data() {
+        let csv_path = format!("{}/business.csv", samples_dir());
+        let sf = SFrame::from_csv(&csv_path, None).unwrap();
+        let original_rows = sf.num_rows().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("sharded").to_str().unwrap().to_string();
+        sf.to_parquet_sharded(&prefix).unwrap();
+
+        // Read back via glob
+        let pattern = format!("{}_*.parquet", prefix);
+        let sf2 = SFrame::from_parquet(&pattern).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), original_rows);
+    }
 }
