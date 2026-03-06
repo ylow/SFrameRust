@@ -13,6 +13,7 @@ use rayon::prelude::*;
 
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::vfs::VirtualFileSystem;
+use sframe_storage::segment_reader::{CachedSegmentReader, SegmentReader};
 use sframe_storage::segment_writer::SegmentWriter;
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -99,6 +100,130 @@ fn spill_sorted_run(
         num_rows: buffer.num_rows() as u64,
     })
 }
+
+/// Reads sorted rows from a spilled segment in batches.
+///
+/// Buffers `read_ahead` rows at a time for sequential access. Usage pattern:
+/// check `is_exhausted()`, read `current_value(col)`, call `advance()`.
+struct RunCursor {
+    reader: CachedSegmentReader,
+    all_columns: Vec<usize>,
+    total_rows: u64,
+    next_read_row: u64,
+    buffer: Vec<Vec<FlexType>>,
+    cursor: usize,
+    buffer_len: usize,
+    read_ahead: u64,
+}
+
+impl RunCursor {
+    fn open(
+        vfs: &dyn VirtualFileSystem,
+        path: &str,
+        dtypes: &[FlexTypeEnum],
+        total_rows: u64,
+        read_ahead: u64,
+    ) -> Result<Self> {
+        let file = vfs.open_read(path)?;
+        let file_size = file.size()?;
+        let seg_reader = SegmentReader::open(Box::new(file), file_size, dtypes.to_vec())?;
+        let max_blocks = sframe_config::global().max_blocks_in_cache;
+        let reader = CachedSegmentReader::new(seg_reader, max_blocks);
+        let ncols = dtypes.len();
+
+        let mut cursor = RunCursor {
+            reader,
+            all_columns: (0..ncols).collect(),
+            total_rows,
+            next_read_row: 0,
+            buffer: Vec::new(),
+            cursor: 0,
+            buffer_len: 0,
+            read_ahead,
+        };
+        if total_rows > 0 {
+            cursor.refill()?;
+        }
+        Ok(cursor)
+    }
+
+    fn refill(&mut self) -> Result<()> {
+        if self.next_read_row >= self.total_rows {
+            self.buffer.clear();
+            self.buffer_len = 0;
+            return Ok(());
+        }
+        let end = (self.next_read_row + self.read_ahead).min(self.total_rows);
+        self.buffer = self.reader.read_columns_rows(
+            &self.all_columns,
+            self.next_read_row,
+            end,
+        )?;
+        self.cursor = 0;
+        self.buffer_len = if self.buffer.is_empty() { 0 } else { self.buffer[0].len() };
+        self.next_read_row = end;
+        Ok(())
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.cursor >= self.buffer_len && self.next_read_row >= self.total_rows
+    }
+
+    fn current_value(&self, col: usize) -> &FlexType {
+        &self.buffer[col][self.cursor]
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.cursor += 1;
+        if self.cursor >= self.buffer_len && self.next_read_row < self.total_rows {
+            self.refill()?;
+        }
+        Ok(())
+    }
+}
+
+/// Entry for the k-way merge min-heap.
+///
+/// `BinaryHeap` is a max-heap, so `Ord` is reversed to get min-heap behavior.
+struct MergeHeapEntry {
+    run_idx: usize,
+    key_values: Vec<FlexType>,
+    descending: Vec<bool>,
+}
+
+impl Ord for MergeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (i, (a, b)) in self
+            .key_values
+            .iter()
+            .zip(other.key_values.iter())
+            .enumerate()
+        {
+            let mut cmp = compare_flex_type(a, b);
+            if self.descending[i] {
+                cmp = cmp.reverse();
+            }
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp.reverse(); // reverse for min-heap
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl PartialOrd for MergeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MergeHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MergeHeapEntry {}
 
 /// Sort a batch stream by the given keys.
 ///
@@ -430,5 +555,74 @@ mod tests {
         assert_eq!(col1, vec![FlexType::String("a".into()), FlexType::String("b".into()), FlexType::String("c".into())]);
 
         let _ = cache_fs.remove_dir(&base_path);
+    }
+
+    #[test]
+    fn test_run_cursor() {
+        use sframe_io::cache_fs::global_cache_fs;
+        use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
+
+        let rows: Vec<Vec<FlexType>> = (0..10)
+            .map(|i| vec![FlexType::Integer(i)])
+            .collect();
+        let dtypes = [FlexTypeEnum::Integer];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+
+        let cache_fs = global_cache_fs();
+        let vfs: std::sync::Arc<dyn VirtualFileSystem> =
+            std::sync::Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+        let base_path = cache_fs.alloc_dir();
+        VirtualFileSystem::mkdir_p(&*vfs, &base_path).unwrap();
+
+        let info = spill_sorted_run(&batch, &[SortKey::asc(0)], &dtypes, &*vfs, &base_path, 0).unwrap();
+
+        // Create RunCursor with small read-ahead (3 rows)
+        let mut cursor = RunCursor::open(&*vfs, &info.path, &dtypes, info.num_rows, 3).unwrap();
+
+        let mut values = Vec::new();
+        while !cursor.is_exhausted() {
+            values.push(cursor.current_value(0).clone());
+            cursor.advance().unwrap();
+        }
+        assert_eq!(values.len(), 10);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, FlexType::Integer(i as i64));
+        }
+
+        let _ = cache_fs.remove_dir(&base_path);
+    }
+
+    #[test]
+    fn test_merge_heap_entry_ordering() {
+        use std::collections::BinaryHeap;
+
+        let descending = vec![false]; // ascending
+        let entries = vec![
+            MergeHeapEntry {
+                run_idx: 0,
+                key_values: vec![FlexType::Integer(3)],
+                descending: descending.clone(),
+            },
+            MergeHeapEntry {
+                run_idx: 1,
+                key_values: vec![FlexType::Integer(1)],
+                descending: descending.clone(),
+            },
+            MergeHeapEntry {
+                run_idx: 2,
+                key_values: vec![FlexType::Integer(2)],
+                descending: descending.clone(),
+            },
+        ];
+
+        let mut heap = BinaryHeap::new();
+        for e in entries {
+            heap.push(e);
+        }
+
+        // Min-heap: should pop in ascending order 1, 2, 3
+        assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(1));
+        assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(2));
+        assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(3));
     }
 }
