@@ -31,9 +31,9 @@ const DEFAULT_CHUNK_SIZE: usize = 8192;
 
 /// RAII guard for anonymous cache-backed SFrames.
 /// When dropped, removes the cache directory and all its files.
-struct AnonymousStore {
-    path: String,
-    cache_fs: Arc<CacheFs>,
+pub(crate) struct AnonymousStore {
+    pub(crate) path: String,
+    pub(crate) cache_fs: Arc<CacheFs>,
 }
 
 impl Drop for AnonymousStore {
@@ -382,8 +382,9 @@ impl SFrame {
 
         let (column_names, column_types) =
             sframe_parquet::parquet_reader::read_parquet_schema(paths[0].to_str().unwrap())?;
+        let num_rows = sframe_parquet::parquet_reader::count_parquet_rows(paths)?;
 
-        if column_names.is_empty() {
+        if column_names.is_empty() || num_rows == 0 {
             let batch = SFrameRows::empty(&column_types);
             let plan = PlannerNode::materialized(batch);
             let columns: Vec<SArray> = column_types
@@ -394,14 +395,30 @@ impl SFrame {
             return Ok(SFrame::new_with_columns(columns, column_names));
         }
 
-        let mut builder = SFrameBuilder::anonymous(column_names.clone(), column_types.clone())?;
-        let mut iter = sframe_parquet::parquet_reader::read_parquet_batches(paths)?;
-        while let Some(batch_result) = iter.next_batch() {
-            let batch = batch_result?;
-            builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
-        }
+        let source_id = paths[0].to_str().unwrap_or("parquet").to_string();
+        let paths_arc = Arc::new(paths.to_vec());
+        let source_fn: Arc<dyn Fn(u64, u64) -> Result<sframe_query::execute::BatchIterator> + Send + Sync> = {
+            let paths = paths_arc.clone();
+            Arc::new(move |begin, end| {
+                sframe_parquet::parquet_reader::read_parquet_batches_range(&paths, begin, end)
+            })
+        };
 
-        builder.finish()
+        let plan = PlannerNode::parquet_source(
+            column_names.clone(),
+            column_types.clone(),
+            num_rows,
+            &source_id,
+            source_fn,
+        );
+
+        let columns: Vec<SArray> = column_types
+            .iter()
+            .enumerate()
+            .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(num_rows), i))
+            .collect();
+
+        Ok(SFrame::new_with_columns(columns, column_names))
     }
 
     /// Build an SFrame from named columns.

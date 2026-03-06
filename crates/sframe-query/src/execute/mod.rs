@@ -293,6 +293,10 @@ fn compile_node(
             ..
         } => source::compile_sframe_source(path, column_types, *begin_row, *end_row),
 
+        LogicalOp::ParquetSource { begin_row, end_row, source_fn, .. } => {
+            source_fn(*begin_row, *end_row)
+        }
+
         LogicalOp::MaterializedSource { data } => {
             let data = data.clone();
             Ok(BatchIterator::new(move |co: BatchCo| async move {

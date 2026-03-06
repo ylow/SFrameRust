@@ -11,14 +11,19 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
+use sframe_io::cache_fs::global_cache_fs;
+use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::algorithms::quantile_sketch::QuantileSketch;
-use sframe_query::algorithms::sort::{compare_flex_type, SortKey, SortOrder};
+use sframe_query::algorithms::sort::{self, compare_flex_type, SortKey, SortOrder};
 use sframe_query::execute::{compile, parallel_slice_row_count};
 use sframe_query::planner::{clone_plan_with_row_range, PlannerNode};
+use sframe_storage::segment_writer::BufferedSegmentWriter;
+use sframe_storage::sframe_writer::{assemble_sframe_from_segments, generate_hash, segment_filename};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexType;
 
-use crate::sframe::{SFrame, SFrameBuilder};
+use crate::sarray::SArray;
+use crate::sframe::{AnonymousStore, SFrame, SFrameBuilder};
 
 const CHUNK_SIZE: usize = 8192;
 const CHANNEL_BUFFER_DEPTH: usize = 8;
@@ -43,8 +48,15 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     // Check if parallel execution is possible
     let plan = sf.fuse_plan()?;
     let total_rows = parallel_slice_row_count(&plan);
+    let parallel = total_rows.is_some();
+
+    let num_rows = sf.num_rows().unwrap_or(0);
+    eprintln!(
+        "[sframe] external sort: {num_rows} rows, ~{estimated_size} bytes, budget {budget}, parallel={parallel}"
+    );
 
     // Phase 1: Build quantile sketch (parallel if possible)
+    eprintln!("[sframe] sort phase 1/4: building quantile sketch...");
     let sketch = if let Some(total_rows) = total_rows {
         build_sketch_parallel(&plan, primary_key.column, total_rows)?
     } else {
@@ -58,8 +70,10 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     // Phase 2: Determine partition cut points
     let num_partitions = (estimated_size / budget).max(2);
     let cut_points = sketch.quantiles(num_partitions);
+    eprintln!("[sframe] sort phase 2/4: {num_partitions} partitions");
 
     // Phase 3: Partition data (parallel if possible)
+    eprintln!("[sframe] sort phase 3/4: partitioning data...");
     let partitions = if let Some(total_rows) = total_rows {
         partition_data_parallel(&plan, sf, primary_key, &cut_points, total_rows)?
     } else {
@@ -67,6 +81,7 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     };
 
     // Phase 4+5: Sort partitions in parallel + assemble output
+    eprintln!("[sframe] sort phase 4/4: sorting {num_partitions} partitions and assembling output...");
     sort_partitions_and_assemble(partitions, sort_keys, primary_key, sf)
 }
 
@@ -249,15 +264,25 @@ fn partition_data_parallel(
     Ok(partitions)
 }
 
-/// Phase 4+5 (parallel sort, sequential assembly): Sort each partition
-/// in parallel using rayon, then write sorted partitions to output
-/// in the correct global order.
+/// Phase 4+5 (parallel sort, direct segment assembly): Sort each partition
+/// in parallel using rayon, writing each directly to a segment file.
+/// Then assemble the output SFrame from those segments — no final copy pass.
 fn sort_partitions_and_assemble(
     partitions: Vec<SFrame>,
     sort_keys: &[SortKey],
     primary_key: &SortKey,
     sf: &SFrame,
 ) -> Result<SFrame> {
+    let column_names = sf.column_names().to_vec();
+    let dtypes = sf.column_types();
+
+    // Allocate a single output directory on CacheFs
+    let cache_fs = global_cache_fs();
+    let base_path = cache_fs.alloc_dir();
+    let vfs: Arc<dyn VirtualFileSystem> = Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+    VirtualFileSystem::mkdir_p(&*vfs, &base_path)?;
+    let data_prefix = format!("m_{}", generate_hash(&base_path));
+
     // Determine output order: ascending → 0..P, descending → P-1..0
     let partition_order: Vec<usize> = if primary_key.order == SortOrder::Descending {
         (0..partitions.len()).rev().collect()
@@ -265,33 +290,103 @@ fn sort_partitions_and_assemble(
         (0..partitions.len()).collect()
     };
 
-    // Sort all partitions in parallel
+    // Sort each partition in parallel, writing directly to segment files
     let sort_keys_owned = sort_keys.to_vec();
-    let sorted: Vec<Option<Result<SFrame>>> = partition_order
+    let results: Vec<Option<Result<(String, Vec<u64>, u64)>>> = partition_order
         .par_iter()
-        .map(|&part_idx| {
+        .enumerate()
+        .map(|(seg_idx, &part_idx)| {
             let num_rows = partitions[part_idx].num_rows().unwrap_or(0);
             if num_rows == 0 {
                 return None;
             }
-            Some(partitions[part_idx].sort_in_memory(&sort_keys_owned))
+            Some((|| -> Result<(String, Vec<u64>, u64)> {
+                // Materialize and sort
+                let stream = partitions[part_idx].compile_stream()?;
+                let (batch, indices) = sort::sort_indices(stream, &sort_keys_owned)?;
+                if batch.num_rows() == 0 {
+                    // Write an empty segment
+                    let seg_file = segment_filename(&data_prefix, seg_idx);
+                    let seg_path = format!("{base_path}/{seg_file}");
+                    let file = vfs.open_write(&seg_path)?;
+                    let seg_writer = BufferedSegmentWriter::new(file, &dtypes);
+                    let sizes = seg_writer.finish()?;
+                    return Ok((seg_file, sizes, 0));
+                }
+
+                // Write sorted data directly to segment file
+                let seg_file = segment_filename(&data_prefix, seg_idx);
+                let seg_path = format!("{base_path}/{seg_file}");
+                let file = vfs.open_write(&seg_path)?;
+                let mut seg_writer = BufferedSegmentWriter::new(file, &dtypes);
+
+                for chunk in indices.chunks(CHUNK_SIZE) {
+                    for (col_idx, col) in batch.columns().iter().enumerate() {
+                        let values: Vec<FlexType> = chunk.iter().map(|&i| col.get(i)).collect();
+                        seg_writer.write_column_block(col_idx, &values, dtypes[col_idx])?;
+                    }
+                }
+
+                let sizes = seg_writer.finish()?;
+                let row_count = indices.len() as u64;
+                Ok((seg_file, sizes, row_count))
+            })())
         })
         .collect();
 
-    // Write sorted partitions to output in order
-    let mut builder =
-        SFrameBuilder::anonymous(sf.column_names().to_vec(), sf.column_types())?;
+    drop(partitions);
 
-    for sort_result in sorted.into_iter().flatten() {
-        let sorted_part = sort_result?;
-        let mut stream = sorted_part.compile_stream()?;
-        while let Some(batch_result) = stream.next_batch() {
-            builder.write_batch_chunked(&batch_result?, CHUNK_SIZE)?;
+    // Collect results, skipping empty partitions
+    let mut segment_files = Vec::new();
+    let mut all_segment_sizes = Vec::new();
+    let mut total_rows = 0u64;
+    for result in results.into_iter().flatten() {
+        let (seg_file, sizes, rows) = result?;
+        if rows > 0 {
+            segment_files.push(seg_file);
+            all_segment_sizes.push(sizes);
+            total_rows += rows;
         }
     }
 
-    drop(partitions);
-    builder.finish()
+    if total_rows == 0 {
+        cache_fs.remove_dir(&base_path).ok();
+        return sf.head(0);
+    }
+
+    // Assemble SFrame metadata from segments — no data copy
+    let col_name_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+    assemble_sframe_from_segments(
+        &*vfs,
+        &base_path,
+        &col_name_refs,
+        &dtypes,
+        &segment_files,
+        &all_segment_sizes,
+        total_rows,
+        &std::collections::HashMap::new(),
+    )?;
+
+    // Construct SFrame directly from the cache directory
+    let store: Arc<dyn Send + Sync> = Arc::new(AnonymousStore {
+        path: base_path.clone(),
+        cache_fs: cache_fs.clone(),
+    });
+    let plan = PlannerNode::sframe_source_cached(
+        &base_path,
+        column_names.clone(),
+        dtypes.clone(),
+        total_rows,
+        store,
+    );
+
+    let columns: Vec<SArray> = dtypes
+        .iter()
+        .enumerate()
+        .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(total_rows), i))
+        .collect();
+
+    Ok(SFrame::new_with_columns(columns, column_names))
 }
 
 /// Phase 3: Partition data by the primary sort key using the cut points.

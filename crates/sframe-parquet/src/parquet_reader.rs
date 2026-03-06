@@ -134,6 +134,136 @@ pub fn read_parquet_batches(paths: &[PathBuf]) -> Result<BatchIterator> {
 }
 
 // ---------------------------------------------------------------------------
+// Batch reading with row range
+// ---------------------------------------------------------------------------
+
+/// Create a `BatchIterator` that reads only rows `[begin_row, end_row)` from
+/// the given Parquet files.
+///
+/// Uses per-file row counts from metadata to skip entire files that don't
+/// overlap the range, and `with_offset`/`with_limit` on the reader builder
+/// to efficiently read partial files.
+pub fn read_parquet_batches_range(
+    paths: &[PathBuf],
+    begin_row: u64,
+    end_row: u64,
+) -> Result<BatchIterator> {
+    if paths.is_empty() {
+        return Err(SFrameError::Format(
+            "No parquet files provided".to_string(),
+        ));
+    }
+
+    // Pre-compute per-file row counts from metadata.
+    let mut file_row_counts = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = File::open(path).map_err(SFrameError::Io)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| SFrameError::Format(format!("Parquet error: {e}")))?;
+        let rows: u64 = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows() as u64)
+            .sum();
+        file_row_counts.push(rows);
+    }
+
+    // Build list of (path, offset_within_file, rows_to_read).
+    let mut file_slices: Vec<(PathBuf, usize, usize)> = Vec::new();
+    let mut cumulative = 0u64;
+    for (i, &file_rows) in file_row_counts.iter().enumerate() {
+        let file_start = cumulative;
+        let file_end = cumulative + file_rows;
+        cumulative = file_end;
+
+        if file_end <= begin_row || file_start >= end_row {
+            continue;
+        }
+
+        let local_begin = begin_row.saturating_sub(file_start);
+        let local_end = (end_row - file_start).min(file_rows);
+        file_slices.push((
+            paths[i].clone(),
+            local_begin as usize,
+            (local_end - local_begin) as usize,
+        ));
+    }
+
+    Ok(BatchIterator::new(move |co: BatchCo| async move {
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+        if !matches!(cmd, BatchCommand::NextBatch | BatchCommand::SkipBatch) {
+            return;
+        }
+
+        for (path, offset, limit) in &file_slices {
+            let file = match File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    co.yield_(BatchResponse::Batch(Err(SFrameError::Io(e))))
+                        .await;
+                    return;
+                }
+            };
+            let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+                Ok(b) => b,
+                Err(e) => {
+                    co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
+                        format!("Parquet error: {e}"),
+                    ))))
+                    .await;
+                    return;
+                }
+            };
+            let reader = match builder
+                .with_offset(*offset)
+                .with_limit(*limit)
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
+                        format!("Parquet error: {e}"),
+                    ))))
+                    .await;
+                    return;
+                }
+            };
+
+            for record_batch_result in reader {
+                let record_batch = match record_batch_result {
+                    Ok(rb) => rb,
+                    Err(e) => {
+                        co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
+                            format!("Parquet error: {e}"),
+                        ))))
+                        .await;
+                        return;
+                    }
+                };
+
+                match cmd {
+                    BatchCommand::NextBatch => {
+                        let sframe_rows = match record_batch_to_sframe_rows(&record_batch) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                co.yield_(BatchResponse::Batch(Err(e))).await;
+                                return;
+                            }
+                        };
+                        cmd = co.yield_(BatchResponse::Batch(Ok(sframe_rows))).await;
+                    }
+                    BatchCommand::SkipBatch => {
+                        cmd = co.yield_(BatchResponse::Skipped).await;
+                    }
+                    _ => return,
+                }
+            }
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Glob expansion
 // ---------------------------------------------------------------------------
 

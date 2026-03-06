@@ -366,6 +366,7 @@ fn push_filter_through_transform_impl(plan: &Arc<PlannerNode>, cache: &mut PassC
 fn count_output_columns(plan: &PlannerNode) -> Option<usize> {
     match &plan.op {
         LogicalOp::SFrameSource { column_names, .. } => Some(column_names.len()),
+        LogicalOp::ParquetSource { column_names, .. } => Some(column_names.len()),
         LogicalOp::MaterializedSource { data } => Some(data.num_columns()),
         LogicalOp::Project { column_indices } => Some(column_indices.len()),
         LogicalOp::Range { .. } => Some(1),

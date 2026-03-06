@@ -74,6 +74,34 @@ fn check_sliceable(
             true
         }
 
+        LogicalOp::ParquetSource {
+            source_id,
+            num_rows,
+            begin_row,
+            end_row,
+            ..
+        } => {
+            if *begin_row != 0 || *end_row != *num_rows {
+                return false;
+            }
+
+            match source_path {
+                None => {
+                    *source_path = Some(source_id.clone());
+                    *total_rows = Some(*num_rows);
+                }
+                Some(existing) => {
+                    if existing != source_id {
+                        return false;
+                    }
+                    if *total_rows != Some(*num_rows) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+
         // These operators cannot be sliced
         LogicalOp::Reduce { .. }
         | LogicalOp::Append

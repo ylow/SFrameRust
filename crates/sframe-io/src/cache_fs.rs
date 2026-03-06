@@ -30,7 +30,9 @@ static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Global CacheFs instance shared across the process.
 static GLOBAL_CACHE_FS: LazyLock<Arc<CacheFs>> = LazyLock::new(|| {
-    Arc::new(CacheFs::new().expect("Failed to create global CacheFs"))
+    let fs = Arc::new(CacheFs::new().expect("Failed to create global CacheFs"));
+    eprintln!("[sframe] cache dir: {}", fs.root().display());
+    fs
 });
 
 /// Get the global CacheFs instance.

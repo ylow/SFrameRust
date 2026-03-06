@@ -12,6 +12,7 @@ use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
+use crate::execute::BatchIterator;
 
 /// Binary function operating on two FlexType values.
 type BinaryFlexFn = Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>;
@@ -123,6 +124,23 @@ pub enum LogicalOp {
     MaterializedSource {
         data: Arc<SFrameRows>,
     },
+
+    /// Read from Parquet file(s) lazily via a factory closure.
+    ///
+    /// The factory captures file paths and creates a `BatchIterator`
+    /// for the given `[begin_row, end_row)` range. This avoids requiring
+    /// a parquet dependency in `sframe-query`.
+    ParquetSource {
+        column_names: Vec<String>,
+        column_types: Vec<FlexTypeEnum>,
+        num_rows: u64,
+        begin_row: u64,
+        end_row: u64,
+        /// Identifier for parallel-slicing equivalence checks.
+        source_id: String,
+        /// Factory: `(begin_row, end_row) -> BatchIterator`.
+        source_fn: Arc<dyn Fn(u64, u64) -> Result<BatchIterator> + Send + Sync>,
+    },
 }
 
 impl LogicalOp {
@@ -161,6 +179,17 @@ impl LogicalOp {
             LogicalOp::Union => LogicalOp::Union,
             LogicalOp::ColumnUnion => LogicalOp::ColumnUnion,
             LogicalOp::MaterializedSource { data } => LogicalOp::MaterializedSource { data: data.clone() },
+            LogicalOp::ParquetSource { column_names, column_types, num_rows, begin_row, end_row, source_id, source_fn } => {
+                LogicalOp::ParquetSource {
+                    column_names: column_names.clone(),
+                    column_types: column_types.clone(),
+                    num_rows: *num_rows,
+                    begin_row: *begin_row,
+                    end_row: *end_row,
+                    source_id: source_id.clone(),
+                    source_fn: source_fn.clone(),
+                }
+            }
         }
     }
 
@@ -169,6 +198,7 @@ impl LogicalOp {
         match self {
             LogicalOp::SFrameSource { .. } => OperatorRate::Source,
             LogicalOp::MaterializedSource { .. } => OperatorRate::Source,
+            LogicalOp::ParquetSource { .. } => OperatorRate::Source,
             LogicalOp::Range { .. } => OperatorRate::Source,
             LogicalOp::Project { .. } => OperatorRate::Linear,
             LogicalOp::Transform { .. } => OperatorRate::Linear,
@@ -265,6 +295,13 @@ impl PlannerNode {
                 // Data is not cheaply hashable; use unique id
                 id.hash(&mut h);
             }
+            LogicalOp::ParquetSource { source_id, column_names, column_types, begin_row, end_row, .. } => {
+                source_id.hash(&mut h);
+                column_names.hash(&mut h);
+                column_types.hash(&mut h);
+                begin_row.hash(&mut h);
+                end_row.hash(&mut h);
+            }
             LogicalOp::Range { start, step, count } => {
                 start.hash(&mut h);
                 step.hash(&mut h);
@@ -359,6 +396,31 @@ impl PlannerNode {
                 begin_row: 0,
                 end_row: num_rows,
                 _keep_alive: None,
+            },
+            vec![],
+        ))
+    }
+
+    /// Create a lazy source node backed by Parquet file(s).
+    ///
+    /// The `source_fn` factory is called at execution time with `(begin_row, end_row)`
+    /// to produce a `BatchIterator` that reads from the Parquet files.
+    pub fn parquet_source(
+        column_names: Vec<String>,
+        column_types: Vec<FlexTypeEnum>,
+        num_rows: u64,
+        source_id: &str,
+        source_fn: Arc<dyn Fn(u64, u64) -> Result<BatchIterator> + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(PlannerNode::new(
+            LogicalOp::ParquetSource {
+                column_names,
+                column_types,
+                num_rows,
+                begin_row: 0,
+                end_row: num_rows,
+                source_id: source_id.to_string(),
+                source_fn,
             },
             vec![],
         ))
@@ -539,6 +601,9 @@ impl PlannerNode {
             LogicalOp::SFrameSource { begin_row, end_row, .. } => {
                 Some(end_row - begin_row)
             }
+            LogicalOp::ParquetSource { begin_row, end_row, .. } => {
+                Some(end_row - begin_row)
+            }
             LogicalOp::MaterializedSource { data } => {
                 Some(data.num_rows() as u64)
             }
@@ -673,6 +738,18 @@ impl PlannerNode {
             LogicalOp::MaterializedSource { data } => {
                 format!("MaterializedSource({} rows, {} cols)", data.num_rows(), data.num_columns())
             }
+            LogicalOp::ParquetSource { source_id, column_names, column_types, num_rows, begin_row, end_row, .. } => {
+                let cols: Vec<String> = column_names
+                    .iter()
+                    .zip(column_types.iter())
+                    .map(|(n, t)| format!("{n}:{t:?}"))
+                    .collect();
+                if *begin_row == 0 && *end_row == *num_rows {
+                    format!("ParquetSource({}, {} rows, [{}])", source_id, num_rows, cols.join(", "))
+                } else {
+                    format!("ParquetSource({}, rows {}-{} of {}, [{}])", source_id, begin_row, end_row, num_rows, cols.join(", "))
+                }
+            }
         }
     }
 }
@@ -722,6 +799,22 @@ pub fn clone_plan_with_row_range(
                 begin_row,
                 end_row,
                 _keep_alive: _keep_alive.clone(),
+            },
+            LogicalOp::ParquetSource {
+                column_names,
+                column_types,
+                num_rows,
+                source_id,
+                source_fn,
+                ..
+            } => LogicalOp::ParquetSource {
+                column_names: column_names.clone(),
+                column_types: column_types.clone(),
+                num_rows: *num_rows,
+                begin_row,
+                end_row,
+                source_id: source_id.clone(),
+                source_fn: source_fn.clone(),
             },
             other => other.clone_op(),
         };
@@ -919,6 +1012,7 @@ fn plan_output_types(plan: &Arc<PlannerNode>) -> Vec<FlexTypeEnum> {
             plan_output_types(&plan.inputs[0])
         }
         LogicalOp::Reduce { .. } => plan_output_types(&plan.inputs[0]),
+        LogicalOp::ParquetSource { column_types, .. } => column_types.clone(),
     }
 }
 
