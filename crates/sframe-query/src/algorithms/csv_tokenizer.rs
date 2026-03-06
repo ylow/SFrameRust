@@ -559,8 +559,8 @@ pub fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
             }
 
             // Check for delimiter (only at top level)
-            if bracket_depth == 0 && brace_depth == 0 && !delim_chars.is_empty() {
-                if i + delim_chars.len() <= chars.len()
+            if bracket_depth == 0 && brace_depth == 0 && !delim_chars.is_empty()
+                && i + delim_chars.len() <= chars.len()
                     && chars[i..i + delim_chars.len()] == delim_chars[..]
                 {
                     fields.push(finish_field(&current, config));
@@ -576,7 +576,6 @@ pub fn split_fields(line: &str, config: &CsvConfig) -> Vec<String> {
                     }
                     continue;
                 }
-            }
         }
 
         current.push(ch);

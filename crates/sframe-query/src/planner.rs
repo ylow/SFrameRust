@@ -13,6 +13,12 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
 
+/// Binary function operating on two FlexType values.
+type BinaryFlexFn = Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>;
+
+/// Row-level function mapping an entire row to one or more output values.
+type RowTransformFn = Arc<dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync>;
+
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Classification of an operator's output rate relative to its input(s).
@@ -76,13 +82,13 @@ pub enum LogicalOp {
     BinaryTransform {
         left_column: usize,
         right_column: usize,
-        func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
+        func: BinaryFlexFn,
         output_type: FlexTypeEnum,
     },
 
     /// Apply a function to the entire row, producing one or more new columns.
     GeneralizedTransform {
-        func: Arc<dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync>,
+        func: RowTransformFn,
         output_types: Vec<FlexTypeEnum>,
     },
 
@@ -432,7 +438,7 @@ impl PlannerNode {
         input: Arc<PlannerNode>,
         left_column: usize,
         right_column: usize,
-        func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
+        func: BinaryFlexFn,
         output_type: FlexTypeEnum,
     ) -> Arc<Self> {
         Arc::new(PlannerNode::new(
@@ -449,7 +455,7 @@ impl PlannerNode {
     /// Generalized transform producing multiple output columns.
     pub fn generalized_transform(
         input: Arc<PlannerNode>,
-        func: Arc<dyn Fn(&[FlexType]) -> Vec<FlexType> + Send + Sync>,
+        func: RowTransformFn,
         output_types: Vec<FlexTypeEnum>,
     ) -> Arc<Self> {
         Arc::new(PlannerNode::new(
@@ -513,8 +519,7 @@ impl PlannerNode {
                 if let Some(prev) = known_len {
                     assert_eq!(
                         len, prev,
-                        "ColumnUnion inputs have different lengths: {} vs {}",
-                        prev, len
+                        "ColumnUnion inputs have different lengths: {prev} vs {len}"
                     );
                 }
                 known_len = Some(len);
@@ -596,9 +601,9 @@ impl PlannerNode {
 
         for (i, (name, plan)) in plans.iter().enumerate() {
             let name_escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-            writeln!(buf, "    output_{} [label=\"Output: {}\" shape=doubleoctagon];", i, name_escaped).unwrap();
+            writeln!(buf, "    output_{i} [label=\"Output: {name_escaped}\" shape=doubleoctagon];").unwrap();
             let root_id = Arc::as_ptr(*plan) as usize;
-            writeln!(buf, "    n{} -> output_{};", root_id, i).unwrap();
+            writeln!(buf, "    n{root_id} -> output_{i};").unwrap();
             Self::explain_dot(&mut buf, plan, &mut visited);
         }
 
@@ -618,12 +623,12 @@ impl PlannerNode {
         let label = node.op_label();
         // Escape quotes for DOT
         let label = label.replace('\\', "\\\\").replace('"', "\\\"");
-        writeln!(buf, "    n{} [label=\"{}\"];", id, label).unwrap();
+        writeln!(buf, "    n{id} [label=\"{label}\"];").unwrap();
 
         // Emit edges and recurse
         for input in &node.inputs {
             let child_id = Arc::as_ptr(input) as usize;
-            writeln!(buf, "    n{} -> n{};", child_id, id).unwrap();
+            writeln!(buf, "    n{child_id} -> n{id};").unwrap();
             Self::explain_dot(buf, input, visited);
         }
     }
@@ -634,7 +639,7 @@ impl PlannerNode {
                 let cols: Vec<String> = column_names
                     .iter()
                     .zip(column_types.iter())
-                    .map(|(n, t)| format!("{}:{:?}", n, t))
+                    .map(|(n, t)| format!("{n}:{t:?}"))
                     .collect();
                 if *begin_row == 0 && *end_row == *num_rows {
                     format!("SFrameSource({}, {} rows, [{}])", path, num_rows, cols.join(", "))
@@ -643,24 +648,24 @@ impl PlannerNode {
                 }
             }
             LogicalOp::Project { column_indices } => {
-                format!("Project({:?})", column_indices)
+                format!("Project({column_indices:?})")
             }
             LogicalOp::Filter { column, .. } => {
-                format!("Filter(col={})", column)
+                format!("Filter(col={column})")
             }
             LogicalOp::Transform { input_column, output_type, .. } => {
-                format!("Transform(col={}, out={:?})", input_column, output_type)
+                format!("Transform(col={input_column}, out={output_type:?})")
             }
             LogicalOp::BinaryTransform { left_column, right_column, output_type, .. } => {
-                format!("BinaryTransform(cols=[{}, {}], out={:?})", left_column, right_column, output_type)
+                format!("BinaryTransform(cols=[{left_column}, {right_column}], out={output_type:?})")
             }
             LogicalOp::GeneralizedTransform { output_types, .. } => {
-                format!("GeneralizedTransform(out={:?})", output_types)
+                format!("GeneralizedTransform(out={output_types:?})")
             }
             LogicalOp::LogicalFilter => "LogicalFilter".to_string(),
             LogicalOp::Append => "Append".to_string(),
             LogicalOp::Range { start, step, count } => {
-                format!("Range(start={}, step={}, count={})", start, step, count)
+                format!("Range(start={start}, step={step}, count={count})")
             }
             LogicalOp::Reduce { .. } => "Reduce".to_string(),
             LogicalOp::Union => "Union".to_string(),
@@ -743,8 +748,7 @@ pub fn slice_plan(
 ) -> Result<Arc<PlannerNode>> {
     if begin > end {
         return Err(SFrameError::Format(format!(
-            "Invalid slice range: begin ({}) > end ({})",
-            begin, end
+            "Invalid slice range: begin ({begin}) > end ({end})"
         )));
     }
     if begin == end {
@@ -757,8 +761,7 @@ pub fn slice_plan(
     })?;
     if end > len {
         return Err(SFrameError::Format(format!(
-            "Slice end ({}) exceeds plan length ({})",
-            end, len
+            "Slice end ({end}) exceeds plan length ({len})"
         )));
     }
     slice_recursive(plan, begin, end)
@@ -859,7 +862,7 @@ fn slice_recursive(
                     continue;
                 }
 
-                let local_begin = if begin > input_begin { begin - input_begin } else { 0 };
+                let local_begin = begin.saturating_sub(input_begin);
                 let local_end = if end < input_end { end - input_begin } else { len };
 
                 new_inputs.push(slice_recursive(&plan.inputs[i], local_begin, local_end)?);

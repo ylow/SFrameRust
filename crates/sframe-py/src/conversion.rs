@@ -109,7 +109,7 @@ pub fn py_str_to_dtype(s: &str) -> PyResult<FlexTypeEnum> {
         "dict" => Ok(FlexTypeEnum::Dict),
         "datetime" => Ok(FlexTypeEnum::DateTime),
         "undefined" => Ok(FlexTypeEnum::Undefined),
-        _ => Err(PyValueError::new_err(format!("Unknown dtype: '{}'", s))),
+        _ => Err(PyValueError::new_err(format!("Unknown dtype: '{s}'"))),
     }
 }
 

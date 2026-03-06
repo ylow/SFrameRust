@@ -966,6 +966,12 @@ pub struct FrequencyCountAggregator {
     counts: std::collections::HashMap<String, u64>,
 }
 
+impl Default for FrequencyCountAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrequencyCountAggregator {
     pub fn new() -> Self {
         FrequencyCountAggregator { counts: std::collections::HashMap::new() }
@@ -976,7 +982,7 @@ impl Aggregator for FrequencyCountAggregator {
     fn add(&mut self, values: &[FlexType]) {
         if let Some(v) = values.first() {
             if !matches!(v, FlexType::Undefined) {
-                let key = format!("{}", v);
+                let key = format!("{v}");
                 *self.counts.entry(key).or_insert(0) += 1;
             }
         }
@@ -1033,6 +1039,12 @@ pub struct ZipListAggregator {
     values: Vec<FlexType>,
 }
 
+impl Default for ZipListAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZipListAggregator {
     pub fn new() -> Self {
         ZipListAggregator { values: Vec::new() }
@@ -1086,6 +1098,12 @@ impl Aggregator for ZipListAggregator {
 #[derive(Clone)]
 pub struct VectorSumAggregator {
     sum: Option<Vec<f64>>,
+}
+
+impl Default for VectorSumAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VectorSumAggregator {
@@ -1171,6 +1189,12 @@ impl Aggregator for VectorSumAggregator {
 pub struct VectorAvgAggregator {
     sum: Option<Vec<f64>>,
     count: u64,
+}
+
+impl Default for VectorAvgAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VectorAvgAggregator {
@@ -1715,7 +1739,7 @@ mod tests {
         agg.add(&[FlexType::Float(2.5)]);
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1727,7 +1751,7 @@ mod tests {
         agg.add(&[FlexType::Float(6.0)]);
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1753,7 +1777,7 @@ mod tests {
         }
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1765,7 +1789,7 @@ mod tests {
         }
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 2.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1794,7 +1818,7 @@ mod tests {
                 assert_eq!(l[1], FlexType::String("b".into()));
                 assert_eq!(l[2], FlexType::String("c".into()));
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -1836,7 +1860,7 @@ mod tests {
         }
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 3.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1850,7 +1874,7 @@ mod tests {
         // idx = round((8-1) * 0.25) = round(1.75) = 2 → value 3.0
         match agg.finalize() {
             FlexType::Float(v) => assert!((v - 3.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 

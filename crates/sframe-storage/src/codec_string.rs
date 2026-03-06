@@ -38,8 +38,7 @@ fn decode_strings_dict(cursor: &mut Cursor<&[u8]>, num_elements: usize) -> Resul
     let dict_len = decode_varint(cursor)? as usize;
     if dict_len > 64 {
         return Err(SFrameError::Format(format!(
-            "Dictionary size {} exceeds maximum of 64",
-            dict_len
+            "Dictionary size {dict_len} exceeds maximum of 64"
         )));
     }
 
@@ -50,7 +49,7 @@ fn decode_strings_dict(cursor: &mut Cursor<&[u8]>, num_elements: usize) -> Resul
         let mut buf = vec![0u8; str_len];
         cursor.read_exact(&mut buf)?;
         let s = String::from_utf8(buf)
-            .map_err(|e| SFrameError::Format(format!("Invalid UTF-8 in dict: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Invalid UTF-8 in dict: {e}")))?;
         dict.push(s);
     }
 
@@ -86,9 +85,9 @@ fn decode_strings_direct(cursor: &mut Cursor<&[u8]>, num_elements: usize) -> Res
         let mut buf = vec![0u8; len];
         cursor
             .read_exact(&mut buf)
-            .map_err(|e| SFrameError::Format(format!("Failed to read string bytes: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Failed to read string bytes: {e}")))?;
         let s = String::from_utf8(buf)
-            .map_err(|e| SFrameError::Format(format!("Invalid UTF-8 in string: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Invalid UTF-8 in string: {e}")))?;
         result.push(s);
     }
 
@@ -181,7 +180,7 @@ mod tests {
     #[test]
     fn test_encode_decode_strings_direct() {
         // Create >64 unique strings to force direct encoding
-        let strings: Vec<String> = (0..100).map(|i| format!("str_{}", i)).collect();
+        let strings: Vec<String> = (0..100).map(|i| format!("str_{i}")).collect();
         let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
         let mut buf = Vec::new();
         encode_strings(&mut buf, &refs).unwrap();

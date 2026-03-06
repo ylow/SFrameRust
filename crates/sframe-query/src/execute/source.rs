@@ -121,18 +121,16 @@ impl PullSourceState {
     /// Advance to the next chunk position, ensuring a segment is open.
     /// Returns Ok(true) if a chunk is available, Ok(false) if done.
     fn ensure_segment(&mut self) -> Result<bool> {
-        loop {
-            if self.reader.is_none() || self.offset >= self.slice_end {
-                if self.reader.is_some() {
-                    self.reader = None;
-                    self.slice_idx += 1;
-                }
-                if !self.open_next_segment()? {
-                    return Ok(false);
-                }
+        if self.reader.is_none() || self.offset >= self.slice_end {
+            if self.reader.is_some() {
+                self.reader = None;
+                self.slice_idx += 1;
             }
-            return Ok(true);
+            if !self.open_next_segment()? {
+                return Ok(false);
+            }
         }
+        Ok(true)
     }
 
     /// Read the next chunk. Returns None when all slices are exhausted.
@@ -252,7 +250,7 @@ pub(super) fn compile_sframe_source(
         .group_index
         .segment_files
         .iter()
-        .map(|f| format!("{}/{}", path, f))
+        .map(|f| format!("{path}/{f}"))
         .collect();
 
     let segment_sizes: Vec<u64> = meta
@@ -290,7 +288,7 @@ pub(super) fn compile_sframe_source_projected(
         .group_index
         .segment_files
         .iter()
-        .map(|f| format!("{}/{}", path, f))
+        .map(|f| format!("{path}/{f}"))
         .collect();
 
     let segment_sizes: Vec<u64> = meta

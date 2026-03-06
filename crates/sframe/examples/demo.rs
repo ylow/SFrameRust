@@ -27,12 +27,12 @@ fn main() {
     println!("Loaded {} rows x {} columns", sf.num_rows().unwrap(), sf.num_columns());
     println!("\nSchema:");
     for (name, dtype) in sf.schema() {
-        println!("  {:<20} {:?}", name, dtype);
+        println!("  {name:<20} {dtype:?}");
     }
 
     println!("\nFirst 5 rows:");
     let head = sf.head(5).unwrap();
-    println!("{}", head);
+    println!("{head}");
 
     // ── 2. Column Access ──────────────────────────────────────────────
     section("2. Column Access — SArray basics");
@@ -80,7 +80,7 @@ fn main() {
         .unwrap();
     println!("Top 5 by review_count:");
     let top5 = sorted.head(5).unwrap();
-    println!("{}", top5);
+    println!("{top5}");
 
     // Multi-key sort
     let multi_sorted = sf
@@ -114,7 +114,7 @@ fn main() {
     let sf_with_class = sf.add_column("popularity", rc_class).unwrap();
     println!("\nSchema after add_column:");
     for (name, dtype) in sf_with_class.schema() {
-        println!("  {:<20} {:?}", name, dtype);
+        println!("  {name:<20} {dtype:?}");
     }
 
     // ── 7. GroupBy ────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ fn main() {
     .unwrap();
 
     println!("State lookup table:");
-    println!("{}", state_names);
+    println!("{state_names}");
 
     let enriched = by_state
         .join(&state_names, "state", "state", sframe_query::algorithms::join::JoinType::Left)
@@ -212,7 +212,7 @@ fn main() {
 
     let top_reviewed = sf.topk("review_count", 5, false).unwrap();
     println!("\nTop 5 by review_count:");
-    println!("{}", top_reviewed);
+    println!("{top_reviewed}");
 
     // ── 10. Missing Values ────────────────────────────────────────────
     section("10. Missing Values");
@@ -250,7 +250,7 @@ fn main() {
         .iter()
         .filter(|v| matches!(v, FlexType::Integer(1)))
         .count() as i64;
-    println!("Businesses with 'Grill' in name: {}", grill_count);
+    println!("Businesses with 'Grill' in name: {grill_count}");
 
     let pizza_biz = sf
         .filter("name", Arc::new(|v| {
@@ -330,7 +330,7 @@ fn main() {
 
 fn section(title: &str) {
     println!("\n{}", "=".repeat(60));
-    println!("  {}", title);
+    println!("  {title}");
     println!("{}\n", "=".repeat(60));
 }
 
@@ -338,5 +338,5 @@ fn col_idx(sf: &SFrame, name: &str) -> usize {
     sf.column_names()
         .iter()
         .position(|n| n == name)
-        .unwrap_or_else(|| panic!("column '{}' not found", name))
+        .unwrap_or_else(|| panic!("column '{name}' not found"))
 }

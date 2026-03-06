@@ -24,7 +24,7 @@ fn main() {
     // Print schema
     println!("Schema:");
     for (name, dtype) in sf.schema() {
-        println!("  {:<20} {}", name, dtype);
+        println!("  {name:<20} {dtype}");
     }
     println!();
 
@@ -80,7 +80,7 @@ fn main() {
         .sort(&[("num_businesses", SortOrder::Descending)])
         .expect("sort failed");
     println!("Business stats by state:");
-    println!("{}\n", by_state);
+    println!("{by_state}\n");
 
     // ── 5. Add a derived column: stars * review_count ───────────────
     let stars_arr = sf.column("stars").unwrap().clone();

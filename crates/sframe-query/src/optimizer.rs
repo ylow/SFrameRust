@@ -22,8 +22,8 @@ pub fn optimize(plan: &Arc<PlannerNode>) -> Arc<PlannerNode> {
     let plan = eliminate_empty_appends(&plan);
     let plan = pushdown_projects(&plan);
     let plan = eliminate_singleton_column_unions(&plan);
-    let plan = push_filter_through_transform(&plan);
-    plan
+    
+    push_filter_through_transform(&plan)
 }
 
 /// Fuse adjacent Project nodes: `Project(b) → Project(a) → input`

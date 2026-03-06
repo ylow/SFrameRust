@@ -48,44 +48,31 @@ fn assert_flex_eq(actual: &FlexType, expected: &FlexType, row: usize, col: usize
     match (actual, expected) {
         (FlexType::Undefined, FlexType::Undefined) => {}
         (FlexType::Integer(a), FlexType::Integer(b)) => {
-            assert_eq!(a, b, "row={} col={}: Integer mismatch", row, col);
+            assert_eq!(a, b, "row={row} col={col}: Integer mismatch");
         }
         (FlexType::Float(a), FlexType::Float(b)) => {
             assert!(
                 (a - b).abs() < 1e-5,
-                "row={} col={}: Float mismatch: {} vs {}",
-                row,
-                col,
-                a,
-                b
+                "row={row} col={col}: Float mismatch: {a} vs {b}"
             );
         }
         (FlexType::String(a), FlexType::String(b)) => {
             assert_eq!(
                 a.as_ref(),
                 b.as_ref(),
-                "row={} col={}: String mismatch",
-                row,
-                col
+                "row={row} col={col}: String mismatch"
             );
         }
         (FlexType::Vector(a), FlexType::Vector(b)) => {
             assert_eq!(
                 a.len(),
                 b.len(),
-                "row={} col={}: Vector length mismatch",
-                row,
-                col
+                "row={row} col={col}: Vector length mismatch"
             );
             for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
                 assert!(
                     (va - vb).abs() < 1e-5,
-                    "row={} col={} elem={}: Vector element mismatch: {} vs {}",
-                    row,
-                    col,
-                    i,
-                    va,
-                    vb
+                    "row={row} col={col} elem={i}: Vector element mismatch: {va} vs {vb}"
                 );
             }
         }
@@ -93,9 +80,7 @@ fn assert_flex_eq(actual: &FlexType, expected: &FlexType, row: usize, col: usize
             assert_eq!(
                 a.len(),
                 b.len(),
-                "row={} col={}: List length mismatch",
-                row,
-                col
+                "row={row} col={col}: List length mismatch"
             );
             for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
                 assert_flex_eq(va, vb, row, col);
@@ -120,8 +105,7 @@ fn assert_flex_eq(actual: &FlexType, expected: &FlexType, row: usize, col: usize
         }
         _ => {
             panic!(
-                "row={} col={}: type mismatch: got {:?}, expected {:?}",
-                row, col, actual, expected
+                "row={row} col={col}: type mismatch: got {actual:?}, expected {expected:?}"
             );
         }
     }
@@ -157,8 +141,7 @@ fn validate(test: &CsvTest) {
     for (i, (expected_name, expected_type)) in test.types.iter().enumerate() {
         assert_eq!(
             col_names[i], *expected_name,
-            "Column {} name mismatch",
-            i
+            "Column {i} name mismatch"
         );
         // When expected type is Undefined, we accept whatever was inferred
         if *expected_type != FlexTypeEnum::Undefined {
@@ -340,7 +323,7 @@ fn esc(s: &str) -> String {
     let inner = s
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    format!("\"{}\"", inner)
+    format!("\"{inner}\"")
 }
 
 /// Basic CSV with all fields quoted.

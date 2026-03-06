@@ -164,8 +164,8 @@ fn in_memory_join(
 
     // For RIGHT or FULL join: emit unmatched right rows
     if join_type == JoinType::Right || join_type == JoinType::Full {
-        for right_idx in 0..right_rows {
-            if !right_matched[right_idx] {
+        for (right_idx, &matched) in right_matched.iter().enumerate().take(right_rows) {
+            if !matched {
                 emit_right_only(
                     &mut output_cols,
                     &left,
@@ -205,9 +205,9 @@ fn emit_row(
     let left_ncols = left.num_columns();
 
     // Left columns
-    for col in 0..left_ncols {
+    for (col, out_col) in output_cols.iter_mut().enumerate().take(left_ncols) {
         let val = left.column(col).get(left_idx);
-        output_cols[col].push(&val)?;
+        out_col.push(&val)?;
     }
 
     // Right columns (excluding join key)
@@ -232,8 +232,8 @@ fn emit_right_only(
     let left_ncols = left.num_columns();
 
     // NULL-pad left columns
-    for col in 0..left_ncols {
-        output_cols[col].push(&FlexType::Undefined)?;
+    for out_col in output_cols.iter_mut().take(left_ncols) {
+        out_col.push(&FlexType::Undefined)?;
     }
 
     // Right columns (excluding join key)
@@ -571,7 +571,7 @@ mod tests {
         // (when join_buffer_num_cells is set low)
         let n = 1000;
         let left_rows: Vec<Vec<FlexType>> = (0..n)
-            .map(|i| vec![FlexType::Integer(i), FlexType::String(format!("left_{}", i).into())])
+            .map(|i| vec![FlexType::Integer(i), FlexType::String(format!("left_{i}").into())])
             .collect();
         let left = SFrameRows::from_rows(
             &left_rows,

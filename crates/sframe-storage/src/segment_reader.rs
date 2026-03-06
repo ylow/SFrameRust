@@ -91,7 +91,7 @@ impl SegmentReader {
         if block_info.is_lz4_compressed() {
             let decompressed_size = block_info.block_size as usize;
             let decompressed = lz4_flex::decompress(raw, decompressed_size).map_err(|e| {
-                SFrameError::Format(format!("LZ4 decompression failed: {}", e))
+                SFrameError::Format(format!("LZ4 decompression failed: {e}"))
             })?;
             Ok(decompressed)
         } else {
@@ -427,7 +427,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     fn open_business_sf() -> SFrameReader {
@@ -445,20 +445,17 @@ mod tests {
         let cached = make_cached_reader(64);
         for col in 0..cached.num_columns() {
             let cum = &cached.cumulative_rows[col];
-            assert_eq!(cum[0], 0, "cumulative_rows[{}][0] should be 0", col);
+            assert_eq!(cum[0], 0, "cumulative_rows[{col}][0] should be 0");
             assert_eq!(
                 *cum.last().unwrap(),
                 cached.column_len(col),
-                "cumulative_rows[{}] last element should match column_len",
-                col
+                "cumulative_rows[{col}] last element should match column_len"
             );
             // Cumulative rows should be monotonically non-decreasing.
             for i in 1..cum.len() {
                 assert!(
                     cum[i] >= cum[i - 1],
-                    "cumulative_rows[{}] not monotonic at index {}",
-                    col,
-                    i
+                    "cumulative_rows[{col}] not monotonic at index {i}"
                 );
             }
             // Length should be num_blocks + 1.
@@ -515,11 +512,10 @@ mod tests {
             assert_eq!(
                 result.len(),
                 reference_columns[col].len(),
-                "Column {} length mismatch",
-                col
+                "Column {col} length mismatch"
             );
             for (i, (a, b)) in result.iter().zip(reference_columns[col].iter()).enumerate() {
-                assert_eq!(a, b, "Column {} mismatch at row {}", col, i);
+                assert_eq!(a, b, "Column {col} mismatch at row {i}");
             }
         }
     }
@@ -660,8 +656,7 @@ mod tests {
         let blk = cached.find_block_containing_row(col, 50);
         assert!(
             matches!(cached.cache[col][blk], CacheSlot::Decoded { .. }),
-            "Block {} should be in Decoded state after backward access",
-            blk
+            "Block {blk} should be in Decoded state after backward access"
         );
     }
 
@@ -723,8 +718,7 @@ mod tests {
             assert_eq!(
                 multi[col],
                 &full[begin as usize..end as usize],
-                "Multi-column read mismatch for column {}",
-                col
+                "Multi-column read mismatch for column {col}"
             );
         }
     }
@@ -783,11 +777,10 @@ mod tests {
             assert_eq!(
                 chunked.len(),
                 full.len(),
-                "Chunked read length mismatch for column {}",
-                col
+                "Chunked read length mismatch for column {col}"
             );
             for (i, (a, b)) in chunked.iter().zip(full.iter()).enumerate() {
-                assert_eq!(a, b, "Column {} chunked mismatch at row {}", col, i);
+                assert_eq!(a, b, "Column {col} chunked mismatch at row {i}");
             }
         }
     }

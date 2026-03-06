@@ -79,7 +79,7 @@ impl<W: Write> SegmentWriter<W> {
         self.bytes_written += on_disk_len;
 
         // 4K alignment padding
-        let padded = ((self.bytes_written + BLOCK_ALIGNMENT - 1) / BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
+        let padded = self.bytes_written.div_ceil(BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
         let padding = padded - self.bytes_written;
         if padding > 0 {
             let zeros = vec![0u8; padding as usize];
@@ -126,7 +126,7 @@ impl<W: Write> SegmentWriter<W> {
         self.bytes_written += on_disk_len;
 
         // 4K alignment padding
-        let padded = ((self.bytes_written + BLOCK_ALIGNMENT - 1) / BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
+        let padded = self.bytes_written.div_ceil(BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT;
         let padding = padded - self.bytes_written;
         if padding > 0 {
             let zeros = vec![0u8; padding as usize];

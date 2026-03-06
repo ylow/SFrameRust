@@ -54,7 +54,7 @@ pub fn write_parquet(
     // 3. Create ArrowWriter
     let file = File::create(path).map_err(SFrameError::Io)?;
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))
-        .map_err(|e| SFrameError::Format(format!("Parquet writer error: {}", e)))?;
+        .map_err(|e| SFrameError::Format(format!("Parquet writer error: {e}")))?;
 
     // 4. Consume BatchIterator, convert each batch, write
     while let Some(batch_result) = iter.next_batch() {
@@ -62,13 +62,13 @@ pub fn write_parquet(
         let record_batch = sframe_rows_to_record_batch(&sframe_rows, column_names, column_types)?;
         writer
             .write(&record_batch)
-            .map_err(|e| SFrameError::Format(format!("Parquet write error: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Parquet write error: {e}")))?;
     }
 
     // 5. Close writer
     writer
         .close()
-        .map_err(|e| SFrameError::Format(format!("Parquet close error: {}", e)))?;
+        .map_err(|e| SFrameError::Format(format!("Parquet close error: {e}")))?;
 
     Ok(())
 }
@@ -89,7 +89,7 @@ pub fn write_parquet_shard(
     shard_index: usize,
     total_shards: usize,
 ) -> Result<()> {
-    let filename = format!("{}_{}_of_{}.parquet", prefix, shard_index, total_shards);
+    let filename = format!("{prefix}_{shard_index}_of_{total_shards}.parquet");
     let path = Path::new(&filename);
     write_parquet(iter, column_names, column_types, path)
 }
@@ -114,11 +114,8 @@ mod tests {
     fn single_batch_iter(rows: SFrameRows) -> BatchIterator {
         BatchIterator::new(move |co: BatchCo| async move {
             let cmd = co.yield_(BatchResponse::Ready).await;
-            match cmd {
-                BatchCommand::NextBatch => {
-                    co.yield_(BatchResponse::Batch(Ok(rows))).await;
-                }
-                _ => {}
+            if let BatchCommand::NextBatch = cmd {
+                co.yield_(BatchResponse::Batch(Ok(rows))).await;
             }
         })
     }
@@ -324,11 +321,10 @@ mod tests {
         write_parquet_shard(single_batch_iter(rows), &names, &types, &prefix, 0, 3).unwrap();
 
         // Check the file was created with the expected name
-        let expected_path = format!("{}_0_of_3.parquet", prefix);
+        let expected_path = format!("{prefix}_0_of_3.parquet");
         assert!(
             Path::new(&expected_path).exists(),
-            "Expected file at {}",
-            expected_path
+            "Expected file at {expected_path}"
         );
 
         // Read back and verify content
@@ -357,8 +353,8 @@ mod tests {
         write_parquet_shard(single_batch_iter(rows1), &names, &types, &prefix, 1, 2).unwrap();
 
         // Both files should exist
-        let path0 = PathBuf::from(format!("{}_0_of_2.parquet", prefix));
-        let path1 = PathBuf::from(format!("{}_1_of_2.parquet", prefix));
+        let path0 = PathBuf::from(format!("{prefix}_0_of_2.parquet"));
+        let path1 = PathBuf::from(format!("{prefix}_1_of_2.parquet"));
         assert!(path0.exists());
         assert!(path1.exists());
 

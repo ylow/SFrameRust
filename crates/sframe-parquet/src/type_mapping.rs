@@ -60,8 +60,7 @@ pub fn arrow_type_to_sframe(dt: &DataType) -> Result<FlexTypeEnum> {
         DataType::Struct(_) | DataType::Map(_, _) => Ok(FlexTypeEnum::Dict),
 
         other => Err(SFrameError::Type(format!(
-            "Unsupported Arrow type: {:?}",
-            other
+            "Unsupported Arrow type: {other:?}"
         ))),
     }
 }
@@ -127,8 +126,7 @@ fn convert_to_integer(array: &dyn Array) -> Result<ColumnData> {
                     let v = arr.value(i);
                     if v > i64::MAX as u64 {
                         return Err(SFrameError::Type(format!(
-                            "UInt64 value {} exceeds i64::MAX",
-                            v
+                            "UInt64 value {v} exceeds i64::MAX"
                         )));
                     }
                     out.push(Some(v as i64));
@@ -152,8 +150,7 @@ fn convert_to_integer(array: &dyn Array) -> Result<ColumnData> {
             Ok(ColumnData::Integer(out))
         }
         other => Err(SFrameError::Type(format!(
-            "Cannot convert {:?} to Integer",
-            other
+            "Cannot convert {other:?} to Integer"
         ))),
     }
 }
@@ -206,8 +203,7 @@ fn convert_to_float(array: &dyn Array) -> Result<ColumnData> {
             Ok(ColumnData::Float(out))
         }
         other => Err(SFrameError::Type(format!(
-            "Cannot convert {:?} to Float",
-            other
+            "Cannot convert {other:?} to Float"
         ))),
     }
 }
@@ -391,8 +387,7 @@ fn convert_to_datetime(array: &dyn Array) -> Result<ColumnData> {
             Ok(ColumnData::DateTime(out))
         }
         other => Err(SFrameError::Type(format!(
-            "Cannot convert {:?} to DateTime",
-            other
+            "Cannot convert {other:?} to DateTime"
         ))),
     }
 }
@@ -543,17 +538,13 @@ pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
     match col {
         ColumnData::Integer(v) => {
             let arr = Int64Array::from(
-                v.iter()
-                    .map(|opt| *opt)
-                    .collect::<Vec<Option<i64>>>(),
+                v.to_vec(),
             );
             Ok(Arc::new(arr) as ArrayRef)
         }
         ColumnData::Float(v) => {
             let arr = Float64Array::from(
-                v.iter()
-                    .map(|opt| *opt)
-                    .collect::<Vec<Option<f64>>>(),
+                v.to_vec(),
             );
             Ok(Arc::new(arr) as ArrayRef)
         }
@@ -614,7 +605,7 @@ pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
                 Arc::new(value_array),
                 Some(null_buffer),
             )
-            .map_err(|e| SFrameError::Format(format!("Failed to create ListArray: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Failed to create ListArray: {e}")))?;
 
             Ok(Arc::new(list_array) as ArrayRef)
         }
@@ -733,7 +724,7 @@ pub fn sframe_rows_to_record_batch(
 
     let schema = Arc::new(arrow::datatypes::Schema::new(fields));
     RecordBatch::try_new(schema, arrays)
-        .map_err(|e| SFrameError::Format(format!("Failed to create RecordBatch: {}", e)))
+        .map_err(|e| SFrameError::Format(format!("Failed to create RecordBatch: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +924,7 @@ mod tests {
         let result = arrow_array_to_column(&arr, FlexTypeEnum::Integer);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("exceeds i64::MAX"), "Error was: {}", err);
+        assert!(err.contains("exceeds i64::MAX"), "Error was: {err}");
     }
 
     #[test]

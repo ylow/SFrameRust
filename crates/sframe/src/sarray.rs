@@ -17,6 +17,12 @@ use sframe_query::planner::{Aggregator, PlannerNode};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
+/// Binary function operating on two FlexType values.
+type BinaryFlexFn = Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>;
+
+/// Binary predicate on two FlexType values.
+type BinaryFlexPred = Arc<dyn Fn(&FlexType, &FlexType) -> bool + Send + Sync>;
+
 /// A lazy columnar array. Operations build a plan DAG; execution happens on
 /// `materialize()`, `head()`, `to_vec()`, or `Display`.
 #[derive(Clone)]
@@ -72,6 +78,11 @@ impl SArray {
     /// Return the length if cheaply available (no materialization).
     pub(crate) fn known_len(&self) -> Option<u64> {
         self.len.or_else(|| self.plan.length())
+    }
+
+    /// Returns `true` if the array is known to be empty (may require materialization).
+    pub fn is_empty(&self) -> Result<bool> {
+        self.len().map(|l| l == 0)
     }
 
     /// Known length (may require materialization if unknown).
@@ -445,7 +456,7 @@ impl SArray {
     fn binary_op(
         &self,
         other: &SArray,
-        func: Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
+        func: BinaryFlexFn,
         _op_name: &str,
     ) -> Result<SArray> {
         let output_type = infer_binary_output_type(self.dtype, other.dtype, &func);
@@ -490,7 +501,7 @@ impl SArray {
     fn comparison_op(
         &self,
         other: &SArray,
-        pred: Arc<dyn Fn(&FlexType, &FlexType) -> bool + Send + Sync>,
+        pred: BinaryFlexPred,
     ) -> Result<SArray> {
         self.binary_op(
             other,
@@ -547,8 +558,7 @@ impl SArray {
         let len = self.len()?;
         if begin > end || end > len {
             return Err(SFrameError::Format(format!(
-                "Slice [{}, {}) out of range for length {}",
-                begin, end, len
+                "Slice [{begin}, {end}) out of range for length {len}"
             )));
         }
         let all = self.to_vec()?;
@@ -711,7 +721,7 @@ impl SArray {
 
                     // Numeric → String
                     (FlexType::Integer(i), FlexTypeEnum::String) => FlexType::String(i.to_string().into()),
-                    (FlexType::Float(f), FlexTypeEnum::String) => FlexType::String(format!("{}", f).into()),
+                    (FlexType::Float(f), FlexTypeEnum::String) => FlexType::String(format!("{f}").into()),
 
                     // String → Numeric (parse)
                     (FlexType::String(s), FlexTypeEnum::Integer) => {
@@ -740,7 +750,7 @@ impl SArray {
                     }
 
                     // Anything → String (format)
-                    (_, FlexTypeEnum::String) => FlexType::String(format!("{}", v).into()),
+                    (_, FlexTypeEnum::String) => FlexType::String(format!("{v}").into()),
 
                     // Undefined stays Undefined
                     (FlexType::Undefined, _) => FlexType::Undefined,
@@ -1178,7 +1188,7 @@ impl SArray {
         let mut result = Vec::with_capacity(n);
 
         for i in 0..n {
-            let start = if i >= before { i - before } else { 0 };
+            let start = i.saturating_sub(before);
             let end = (i + after + 1).min(n);
             let window: Vec<FlexType> = values[start..end]
                 .iter()
@@ -1255,7 +1265,7 @@ fn result_type_for_arith(left: FlexTypeEnum, right: FlexTypeEnum) -> FlexTypeEnu
 fn infer_binary_output_type(
     left_dtype: FlexTypeEnum,
     right_dtype: FlexTypeEnum,
-    _func: &Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>,
+    _func: &BinaryFlexFn,
 ) -> FlexTypeEnum {
     result_type_for_arith(left_dtype, right_dtype)
 }
@@ -1264,7 +1274,7 @@ impl std::fmt::Display for SArray {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let values = match self.head(10) {
             Ok(v) => v,
-            Err(e) => return write!(f, "[SArray error: {}]", e),
+            Err(e) => return write!(f, "[SArray error: {e}]"),
         };
         let len = self.len
             .or_else(|| self.plan.length())
@@ -1272,14 +1282,14 @@ impl std::fmt::Display for SArray {
             .unwrap_or("?".to_string());
 
         writeln!(f, "dtype: {}", self.dtype)?;
-        writeln!(f, "Rows: {}", len)?;
+        writeln!(f, "Rows: {len}")?;
         writeln!(f, "[")?;
         for (i, v) in values.iter().enumerate() {
             if i >= 5 && values.len() > 5 {
                 writeln!(f, "  ...")?;
                 break;
             }
-            writeln!(f, "  {},", v)?;
+            writeln!(f, "  {v},")?;
         }
         write!(f, "]")
     }
@@ -1308,7 +1318,7 @@ mod tests {
     #[test]
     fn test_head() {
         let sa = SArray::from_vec(
-            (0..100).map(|i| FlexType::Integer(i)).collect(),
+            (0..100).map(FlexType::Integer).collect(),
             FlexTypeEnum::Integer,
         )
         .unwrap();
@@ -1372,7 +1382,7 @@ mod tests {
         )
         .unwrap();
 
-        let s = format!("{}", sa);
+        let s = format!("{sa}");
         assert!(s.contains("dtype: integer"));
         assert!(s.contains("Rows: 2"));
     }
@@ -1446,7 +1456,7 @@ mod tests {
         let vals = c.to_vec().unwrap();
         match &vals[0] {
             FlexType::Float(v) => assert!((v - 5.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1542,7 +1552,7 @@ mod tests {
         let vals = c.to_vec().unwrap();
         match &vals[0] {
             FlexType::Float(v) => assert!((v - 11.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1551,7 +1561,7 @@ mod tests {
     #[test]
     fn test_tail() {
         let sa = SArray::from_vec(
-            (0..10).map(|i| FlexType::Integer(i)).collect(),
+            (0..10).map(FlexType::Integer).collect(),
             FlexTypeEnum::Integer,
         )
         .unwrap();
@@ -1681,7 +1691,7 @@ mod tests {
 
         match sa.mean().unwrap() {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -1696,7 +1706,7 @@ mod tests {
         // Population variance = 4.0
         match sa.variance(0).unwrap() {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -2112,9 +2122,8 @@ mod tests {
         let est = sa.approx_count_distinct().unwrap();
         // HLL with p=12 should be within ~5% for 100 distinct values
         assert!(
-            est >= 85 && est <= 115,
-            "Expected ~100 distinct, got {}",
-            est
+            (85..=115).contains(&est),
+            "Expected ~100 distinct, got {est}"
         );
     }
 
@@ -2129,7 +2138,7 @@ mod tests {
             values.push(FlexType::String("warm".into()));
         }
         for i in 0..50 {
-            values.push(FlexType::String(format!("rare_{}", i).into()));
+            values.push(FlexType::String(format!("rare_{i}").into()));
         }
         let sa = SArray::from_vec(values, FlexTypeEnum::String).unwrap();
         let top = sa.frequent_items(3).unwrap();
@@ -2146,18 +2155,18 @@ mod tests {
 
     #[test]
     fn test_sarray_slice() {
-        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..100).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let sliced = sa.slice(10, 20).unwrap();
         assert_eq!(sliced.len().unwrap(), 10);
         let result = sliced.to_vec().unwrap();
-        let expected: Vec<FlexType> = (10..20).map(|i| FlexType::Integer(i)).collect();
+        let expected: Vec<FlexType> = (10..20).map(FlexType::Integer).collect();
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_sarray_slice_with_transform() {
-        let vals: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..50).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let doubled = sa.add_scalar(FlexType::Integer(100));
         let sliced = doubled.slice(5, 10).unwrap();
@@ -2168,7 +2177,7 @@ mod tests {
 
     #[test]
     fn test_sarray_try_slice_rejects_filtered() {
-        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..100).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let filtered = sa.filter(Arc::new(|_| true));
         // try_slice fails on non-linear plans
@@ -2176,13 +2185,13 @@ mod tests {
         // slice falls back to materialization
         let sliced = filtered.slice(0, 10).unwrap();
         let result = sliced.to_vec().unwrap();
-        let expected: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        let expected: Vec<FlexType> = (0..10).map(FlexType::Integer).collect();
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_sarray_len_uses_plan_length() {
-        let vals: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..50).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let transformed = sa.add_scalar(FlexType::Integer(1));
         // len() should still work via plan.length() without materializing
@@ -2191,7 +2200,7 @@ mod tests {
 
     #[test]
     fn test_sarray_slice_out_of_bounds() {
-        let vals: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..10).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         assert!(sa.slice(0, 11).is_err());
         assert!(sa.slice(5, 3).is_err());
@@ -2199,8 +2208,8 @@ mod tests {
 
     #[test]
     fn test_sarray_slice_appended() {
-        let a: Vec<FlexType> = (0..30).map(|i| FlexType::Integer(i)).collect();
-        let b: Vec<FlexType> = (30..50).map(|i| FlexType::Integer(i)).collect();
+        let a: Vec<FlexType> = (0..30).map(FlexType::Integer).collect();
+        let b: Vec<FlexType> = (30..50).map(FlexType::Integer).collect();
         let sa_a = SArray::from_vec(a, FlexTypeEnum::Integer).unwrap();
         let sa_b = SArray::from_vec(b, FlexTypeEnum::Integer).unwrap();
         let appended = sa_a.append(&sa_b).unwrap();
@@ -2209,7 +2218,7 @@ mod tests {
         // Slice across the boundary
         let sliced = appended.slice(25, 35).unwrap();
         let result = sliced.to_vec().unwrap();
-        let expected: Vec<FlexType> = (25..35).map(|i| FlexType::Integer(i)).collect();
+        let expected: Vec<FlexType> = (25..35).map(FlexType::Integer).collect();
         assert_eq!(result, expected);
     }
 }

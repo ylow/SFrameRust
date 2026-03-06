@@ -258,7 +258,7 @@ mod tests {
         let sf = SFrame::from_columns(vec![(
             "x",
             SArray::from_vec(
-                (0..n).map(|i| FlexType::Integer(i)).collect(),
+                (0..n).map(FlexType::Integer).collect(),
                 FlexTypeEnum::Integer,
             )
             .unwrap(),

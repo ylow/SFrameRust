@@ -29,8 +29,7 @@ impl HyperLogLog {
     pub fn new(precision: u8) -> Self {
         assert!(
             (4..=18).contains(&precision),
-            "HyperLogLog precision must be in [4, 18], got {}",
-            precision
+            "HyperLogLog precision must be in [4, 18], got {precision}"
         );
         let m = 1usize << precision;
         HyperLogLog {
@@ -149,7 +148,7 @@ mod tests {
         }
         // Should estimate ~1 despite 1000 insertions (same value)
         let est = hll.estimate();
-        assert!(est <= 3, "Expected ~1 for duplicates, got {}", est);
+        assert!(est <= 3, "Expected ~1 for duplicates, got {est}");
     }
 
     #[test]
@@ -175,7 +174,7 @@ mod tests {
     fn test_string_values() {
         let mut hll = HyperLogLog::new(12);
         for i in 0..5000 {
-            hll.insert(&FlexType::String(format!("item_{}", i).into()));
+            hll.insert(&FlexType::String(format!("item_{i}").into()));
         }
         let est = hll.estimate();
         let error = (est as f64 - 5000.0).abs() / 5000.0;
@@ -217,6 +216,6 @@ mod tests {
         hll.insert(&FlexType::String("three".into()));
         hll.insert(&FlexType::Undefined);
         let est = hll.estimate();
-        assert!(est >= 2 && est <= 8, "Estimate {} out of range for 4 distinct values", est);
+        assert!((2..=8).contains(&est), "Estimate {est} out of range for 4 distinct values");
     }
 }

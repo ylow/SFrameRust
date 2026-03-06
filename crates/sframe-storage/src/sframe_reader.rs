@@ -27,7 +27,7 @@ impl SFrameMetadata {
 
     /// Open only the metadata using a specific VFS backend.
     pub fn open_with_fs(fs: &dyn VirtualFileSystem, base_path: &str) -> Result<Self> {
-        let archive_path = format!("{}/dir_archive.ini", base_path);
+        let archive_path = format!("{base_path}/dir_archive.ini");
         let archive_content = fs.read_to_string(&archive_path)?;
         let archive = DirArchive::parse(&archive_content)?;
 
@@ -40,11 +40,11 @@ impl SFrameMetadata {
 
         let data_prefix = archive.data_prefix()?;
 
-        let frame_idx_path = format!("{}/{}.frame_idx", base_path, data_prefix);
+        let frame_idx_path = format!("{base_path}/{data_prefix}.frame_idx");
         let frame_idx_content = fs.read_to_string(&frame_idx_path)?;
         let frame_index = FrameIndex::parse(&frame_idx_content)?;
 
-        let sidx_path = format!("{}/{}.sidx", base_path, data_prefix);
+        let sidx_path = format!("{base_path}/{data_prefix}.sidx");
         let sidx_content = fs.read_to_string(&sidx_path)?;
         let group_index = GroupIndex::parse(&sidx_content)?;
 
@@ -80,7 +80,7 @@ impl SFrameReader {
         // Open segment files
         let mut segment_readers = Vec::with_capacity(meta.group_index.nsegments);
         for seg_file in &meta.group_index.segment_files {
-            let seg_path = format!("{}/{}", base_path, seg_file);
+            let seg_path = format!("{base_path}/{seg_file}");
             let file = fs.open_read(&seg_path)?;
             let file_size = file.size()?;
 
@@ -107,7 +107,7 @@ impl SFrameReader {
             .iter()
             .position(|n| n == name)
             .ok_or_else(|| {
-                SFrameError::Format(format!("Column '{}' not found", name))
+                SFrameError::Format(format!("Column '{name}' not found"))
             })?;
 
         self.read_column(col_idx)
@@ -185,7 +185,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]
@@ -207,9 +207,9 @@ mod tests {
         for (i, val) in open_col.iter().enumerate() {
             match val {
                 FlexType::Integer(v) => {
-                    assert!(*v == 0 || *v == 1, "Row {} open value: {}", i, v);
+                    assert!(*v == 0 || *v == 1, "Row {i} open value: {v}");
                 }
-                _ => panic!("Row {} expected Integer, got {:?}", i, val),
+                _ => panic!("Row {i} expected Integer, got {val:?}"),
             }
         }
     }
@@ -223,7 +223,7 @@ mod tests {
         // First value should be reasonable latitude
         match &lat_col[0] {
             FlexType::Float(v) => {
-                assert!(*v > -90.0 && *v < 90.0, "Unreasonable latitude: {}", v);
+                assert!(*v > -90.0 && *v < 90.0, "Unreasonable latitude: {v}");
             }
             _ => panic!("Expected Float for latitude"),
         }
@@ -244,7 +244,7 @@ mod tests {
                         non_empty += 1;
                     }
                 }
-                _ => panic!("Row {} expected Vector, got {:?}", i, val),
+                _ => panic!("Row {i} expected Vector, got {val:?}"),
             }
         }
         assert!(non_empty > 0, "Expected at least some non-empty vectors");
@@ -260,9 +260,9 @@ mod tests {
         for (i, val) in city_col.iter().take(10).enumerate() {
             match val {
                 FlexType::String(s) => {
-                    assert!(!s.is_empty(), "Row {} city is empty", i);
+                    assert!(!s.is_empty(), "Row {i} city is empty");
                 }
-                _ => panic!("Row {} expected String, got {:?}", i, val),
+                _ => panic!("Row {i} expected String, got {val:?}"),
             }
         }
     }
@@ -289,7 +289,7 @@ mod tests {
 
         assert_eq!(block_concat.len(), full_column.len());
         for (i, (a, b)) in full_column.iter().zip(block_concat.iter()).enumerate() {
-            assert_eq!(a, b, "Mismatch at row {} for column {}", i, col);
+            assert_eq!(a, b, "Mismatch at row {i} for column {col}");
         }
     }
 }

@@ -70,15 +70,15 @@ pub fn write_sframe(
 
     // Generate a unique hash prefix for file names
     let hash = generate_hash(base_path);
-    let data_prefix = format!("m_{}", hash);
+    let data_prefix = format!("m_{hash}");
 
     // Create directory
     std::fs::create_dir_all(base_path)
-        .map_err(|e| SFrameError::Io(e))?;
+        .map_err(SFrameError::Io)?;
 
     // Write segment file
-    let segment_file = format!("{}.0000", data_prefix);
-    let segment_path = format!("{}/{}", base_path, segment_file);
+    let segment_file = format!("{data_prefix}.0000");
+    let segment_path = format!("{base_path}/{segment_file}");
     let segment_sizes = write_segment(
         &segment_path,
         num_columns,
@@ -87,8 +87,8 @@ pub fn write_sframe(
     )?;
 
     // Write .sidx (JSON)
-    let sidx_file = format!("{}.sidx", data_prefix);
-    let sidx_path = format!("{}/{}", base_path, sidx_file);
+    let sidx_file = format!("{data_prefix}.sidx");
+    let sidx_path = format!("{base_path}/{sidx_file}");
     write_sidx_to_fs(
         &sidx_path,
         &[segment_file],
@@ -97,8 +97,8 @@ pub fn write_sframe(
     )?;
 
     // Write .frame_idx (INI)
-    let frame_idx_file = format!("{}.frame_idx", data_prefix);
-    let frame_idx_path = format!("{}/{}", base_path, frame_idx_file);
+    let frame_idx_file = format!("{data_prefix}.frame_idx");
+    let frame_idx_path = format!("{base_path}/{frame_idx_file}");
     write_frame_idx_to_fs(
         &frame_idx_path,
         column_names,
@@ -112,8 +112,8 @@ pub fn write_sframe(
     write_dir_archive_ini_to_fs(base_path, &data_prefix)?;
 
     // Write empty objects.bin (legacy)
-    std::fs::write(format!("{}/objects.bin", base_path), b"")
-        .map_err(|e| SFrameError::Io(e))?;
+    std::fs::write(format!("{base_path}/objects.bin"), b"")
+        .map_err(SFrameError::Io)?;
 
     Ok(())
 }
@@ -129,7 +129,7 @@ fn write_segment(
     column_types: &[FlexTypeEnum],
     rows: &[Vec<FlexType>],
 ) -> Result<Vec<u64>> {
-    let file = std::fs::File::create(path).map_err(|e| SFrameError::Io(e))?;
+    let file = std::fs::File::create(path).map_err(SFrameError::Io)?;
     let buf_writer = BufWriter::new(file);
     let mut seg_writer = SegmentWriter::new(buf_writer, num_columns);
 
@@ -143,8 +143,7 @@ fn write_segment(
     for col in 0..num_columns {
         let bpv = estimate_bytes_per_value(column_types[col]).max(1);
         let mut rows_per_block = (TARGET_BLOCK_SIZE / bpv)
-            .max(MIN_ROWS_PER_BLOCK)
-            .min(MAX_ROWS_PER_BLOCK);
+            .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
 
         let mut total_encoded_bytes: u64 = 0;
         let mut total_encoded_values: u64 = 0;
@@ -169,8 +168,7 @@ fn write_segment(
             if avg_bpv > 0.0 {
                 rows_per_block = (TARGET_BLOCK_SIZE as f64 / avg_bpv) as usize;
                 rows_per_block = rows_per_block
-                    .max(MIN_ROWS_PER_BLOCK)
-                    .min(MAX_ROWS_PER_BLOCK);
+                    .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
             }
 
             row_offset = block_end;
@@ -206,7 +204,7 @@ fn build_sidx_content(
 
     let mut seg_files_map = Map::new();
     for (i, seg_file) in segment_files.iter().enumerate() {
-        seg_files_map.insert(format!("{:04}", i), Value::String(seg_file.clone()));
+        seg_files_map.insert(format!("{i:04}"), Value::String(seg_file.clone()));
     }
 
     let mut columns = Vec::new();
@@ -214,7 +212,7 @@ fn build_sidx_content(
         let mut seg_sizes_map = Map::new();
         for (seg_idx, sizes) in all_segment_sizes.iter().enumerate() {
             seg_sizes_map.insert(
-                format!("{:04}", seg_idx),
+                format!("{seg_idx:04}"),
                 Value::String(sizes[col_idx].to_string()),
             );
         }
@@ -239,7 +237,7 @@ fn build_sidx_content(
     });
 
     serde_json::to_string_pretty(&sidx)
-        .map_err(|e| SFrameError::Format(format!("JSON serialization error: {}", e)))
+        .map_err(|e| SFrameError::Format(format!("JSON serialization error: {e}")))
 }
 
 /// Build the .frame_idx INI content string.
@@ -254,23 +252,23 @@ fn build_frame_idx_content(
 
     content.push_str("[sframe]\n");
     content.push_str("version=2\n");
-    content.push_str(&format!("num_segments={}\n", num_segments));
+    content.push_str(&format!("num_segments={num_segments}\n"));
     content.push_str(&format!("num_columns={}\n", column_names.len()));
-    content.push_str(&format!("nrows={}\n", nrows));
+    content.push_str(&format!("nrows={nrows}\n"));
 
     content.push_str("\n[column_names]\n");
     for (i, name) in column_names.iter().enumerate() {
-        content.push_str(&format!("{}={}\n", i, name));
+        content.push_str(&format!("{i}={name}\n"));
     }
 
     content.push_str("\n[column_files]\n");
     for i in 0..column_names.len() {
-        content.push_str(&format!("{}={}:{}\n", i, sidx_file, i));
+        content.push_str(&format!("{i}={sidx_file}:{i}\n"));
     }
 
     content.push_str("\n[metadata]\n");
     for (key, value) in metadata {
-        content.push_str(&format!("{}={}\n", key, value));
+        content.push_str(&format!("{key}={value}\n"));
     }
 
     content
@@ -289,8 +287,7 @@ fn build_dir_archive_ini_content(data_prefix: &str) -> String {
          [prefixes]\n\
          0000=dir_archive.ini\n\
          0001=objects.bin\n\
-         0002={}\n",
-        data_prefix
+         0002={data_prefix}\n"
     )
 }
 
@@ -327,7 +324,7 @@ fn write_dir_archive_ini(
     data_prefix: &str,
 ) -> Result<()> {
     let content = build_dir_archive_ini_content(data_prefix);
-    vfs.write_string(&format!("{}/dir_archive.ini", base_path), &content)
+    vfs.write_string(&format!("{base_path}/dir_archive.ini"), &content)
 }
 
 // Legacy std::fs versions used by write_sframe standalone function.
@@ -358,7 +355,7 @@ fn write_frame_idx_to_fs(
 
 fn write_dir_archive_ini_to_fs(base_path: &str, data_prefix: &str) -> Result<()> {
     let content = build_dir_archive_ini_content(data_prefix);
-    std::fs::write(format!("{}/dir_archive.ini", base_path), content)
+    std::fs::write(format!("{base_path}/dir_archive.ini"), content)
         .map_err(SFrameError::Io)?;
     Ok(())
 }
@@ -472,7 +469,7 @@ impl SFrameWriter {
         }
 
         let hash = generate_hash(base_path);
-        let data_prefix = format!("m_{}", hash);
+        let data_prefix = format!("m_{hash}");
 
         vfs.mkdir_p(base_path)?;
 
@@ -481,8 +478,7 @@ impl SFrameWriter {
             .map(|&dtype| {
                 let bpv = estimate_bytes_per_value(dtype).max(1);
                 (TARGET_BLOCK_SIZE / bpv)
-                    .max(MIN_ROWS_PER_BLOCK)
-                    .min(MAX_ROWS_PER_BLOCK)
+                    .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
                     .min(rows_per_segment as usize)
             })
             .collect();
@@ -655,9 +651,9 @@ impl SFrameWriter {
         for &(col_idx, _, size) in &block_specs {
             drained_per_col[col_idx] += size;
         }
-        for col_idx in 0..self.num_columns {
-            if drained_per_col[col_idx] > 0 {
-                self.column_buffers[col_idx].drain(..drained_per_col[col_idx]);
+        for (col_idx, &drained) in drained_per_col.iter().enumerate().take(self.num_columns) {
+            if drained > 0 {
+                self.column_buffers[col_idx].drain(..drained);
             }
         }
 
@@ -674,8 +670,7 @@ impl SFrameWriter {
         if avg_bpv > 0.0 {
             let new_rpb = (TARGET_BLOCK_SIZE as f64 / avg_bpv) as usize;
             self.per_column_rows_per_block[col_idx] = new_rpb
-                .max(MIN_ROWS_PER_BLOCK)
-                .min(MAX_ROWS_PER_BLOCK)
+                .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
                 .min(self.rows_per_segment as usize);
         }
     }
@@ -794,18 +789,18 @@ pub fn assemble_sframe_from_segments(
     total_rows: u64,
 ) -> Result<()> {
     let hash = generate_hash(base_path);
-    let data_prefix = format!("m_{}", hash);
+    let data_prefix = format!("m_{hash}");
 
     vfs.mkdir_p(base_path)?;
 
     // Write .sidx — references segment_files as-is
-    let sidx_file = format!("{}.sidx", data_prefix);
-    let sidx_path = format!("{}/{}", base_path, sidx_file);
+    let sidx_file = format!("{data_prefix}.sidx");
+    let sidx_path = format!("{base_path}/{sidx_file}");
     write_sidx(vfs, &sidx_path, segment_files, column_types, all_segment_sizes)?;
 
     // Write .frame_idx
-    let frame_idx_file = format!("{}.frame_idx", data_prefix);
-    let frame_idx_path = format!("{}/{}", base_path, frame_idx_file);
+    let frame_idx_file = format!("{data_prefix}.frame_idx");
+    let frame_idx_path = format!("{base_path}/{frame_idx_file}");
     write_frame_idx(
         vfs,
         &frame_idx_path,
@@ -820,14 +815,14 @@ pub fn assemble_sframe_from_segments(
     write_dir_archive_ini(vfs, base_path, &data_prefix)?;
 
     // Write empty objects.bin
-    vfs.write_string(&format!("{}/objects.bin", base_path), "")?;
+    vfs.write_string(&format!("{base_path}/objects.bin"), "")?;
 
     Ok(())
 }
 
 /// Create a segment file name like "m_xxx.0000".
 fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
-    format!("{}.{:04}", data_prefix, segment_idx)
+    format!("{data_prefix}.{segment_idx:04}")
 }
 
 /// Create a new SegmentWriter via VFS for the given segment index.
@@ -839,7 +834,7 @@ fn create_segment_writer_vfs(
     num_columns: usize,
 ) -> Result<SegmentWriter<Box<dyn WritableFile>>> {
     let segment_file = segment_filename(data_prefix, segment_idx);
-    let segment_path = format!("{}/{}", base_path, segment_file);
+    let segment_path = format!("{base_path}/{segment_file}");
     let file = vfs.open_write(&segment_path)?;
     Ok(SegmentWriter::new(file, num_columns))
 }
@@ -852,5 +847,5 @@ fn generate_hash(path: &str) -> String {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100000001b3); // FNV prime
     }
-    format!("{:016x}", hash)
+    format!("{hash:016x}")
 }

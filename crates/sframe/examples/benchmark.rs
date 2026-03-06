@@ -27,8 +27,8 @@ fn num_rows() -> usize {
 
 fn main() {
     let n = num_rows();
-    let sf_path = format!("bench.sf");
-    let csv_path = format!("bench.csv");
+    let sf_path = "bench.sf".to_string();
+    let csv_path = "bench.csv".to_string();
 
     // Force-initialize the global cache so the spill directory is created.
     let cache_dir = sframe_io::cache_fs::global_cache_fs()
@@ -44,8 +44,8 @@ fn main() {
     println!("{}", "-".repeat(66));
     println!("  Rows:      {:>12}", format_num(n));
     println!("  Cols:      {:>12}", 5);
-    println!("  Threads:   {:>12}", n_threads);
-    println!("  Cache dir: {}", cache_dir);
+    println!("  Threads:   {n_threads:>12}");
+    println!("  Cache dir: {cache_dir}");
     println!("{}", "-".repeat(66));
     println!("  {:<38} {:>10} {:>12}", "Operation", "Time", "Rows/sec");
     println!("{}", "-".repeat(66));
@@ -84,7 +84,7 @@ fn main() {
     println!();
     println!("  Filter query plan:");
     for line in filtered.explain().lines() {
-        println!("    {}", line);
+        println!("    {line}");
     }
     println!();
     let t = Instant::now();
@@ -102,7 +102,7 @@ fn main() {
     println!();
     println!("  Filter 2 query plan:");
     for line in filtered.explain().lines() {
-        println!("    {}", line);
+        println!("    {line}");
     }
     println!();
     let t = Instant::now();
@@ -146,12 +146,12 @@ fn main() {
         )
         .unwrap();
     let group_n = grouped.num_rows().unwrap();
-    report(&format!("GroupBy category -> {} groups", group_n), n, t);
+    report(&format!("GroupBy category -> {group_n} groups"), n, t);
 
     // ── Join ──────────────────────────────────────────────────────────
     // Build a small lookup table to join against
     let categories: Vec<FlexType> = (0..100)
-        .map(|i| FlexType::String(format!("cat_{:03}", i).into()))
+        .map(|i| FlexType::String(format!("cat_{i:03}").into()))
         .collect();
     let weights: Vec<FlexType> = (0..100)
         .map(|i| FlexType::Float(1.0 + (i as f64) * 0.1))
@@ -188,7 +188,7 @@ fn main() {
     let t = Instant::now();
     let uniq = sf.column("category").unwrap().unique().unwrap();
     let uniq_n = uniq.len().unwrap();
-    report(&format!("Unique(category) -> {} values", uniq_n), n, t);
+    report(&format!("Unique(category) -> {uniq_n} values"), n, t);
 
     // ── Chained Pipeline ──────────────────────────────────────────────
     let t = Instant::now();
@@ -210,7 +210,7 @@ fn main() {
         .unwrap();
     let pipe_n = pipeline.num_rows().unwrap();
     report(
-        &format!("Pipeline: filter+groupby+sort -> {} rows", pipe_n),
+        &format!("Pipeline: filter+groupby+sort -> {pipe_n} rows"),
         n,
         t,
     );
@@ -297,7 +297,7 @@ fn report(label: &str, rows: usize, start: Instant) {
     };
 
     let time_str = if secs >= 1.0 {
-        format!("{:.2}s", secs)
+        format!("{secs:.2}s")
     } else {
         format!("{:.0}ms", secs * 1000.0)
     };
@@ -334,7 +334,7 @@ fn col_idx(sf: &SFrame, name: &str) -> usize {
     sf.column_names()
         .iter()
         .position(|n| n == name)
-        .unwrap_or_else(|| panic!("column '{}' not found", name))
+        .unwrap_or_else(|| panic!("column '{name}' not found"))
 }
 
 // ── Deterministic pseudo-random (no rand dependency) ──────────────────

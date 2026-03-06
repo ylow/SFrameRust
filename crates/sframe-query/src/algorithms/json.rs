@@ -40,13 +40,13 @@ pub fn flex_to_json(val: &FlexType) -> JsonValue {
             JsonValue::Array(arr)
         }
         FlexType::List(l) => {
-            let arr: Vec<JsonValue> = l.iter().map(|v| flex_to_json(v)).collect();
+            let arr: Vec<JsonValue> = l.iter().map(flex_to_json).collect();
             JsonValue::Array(arr)
         }
         FlexType::Dict(d) => {
             let mut map = serde_json::Map::new();
             for (k, v) in d.iter() {
-                let key = format!("{}", k);
+                let key = format!("{k}");
                 map.insert(key, flex_to_json(v));
             }
             JsonValue::Object(map)
@@ -109,12 +109,12 @@ pub fn write_json_string(batch: &SFrameRows, column_names: &[String]) -> Result<
 
     for row in 0..nrows {
         let mut map = serde_json::Map::new();
-        for col in 0..ncols {
+        for (col, col_name) in column_names.iter().enumerate().take(ncols) {
             let val = batch.column(col).get(row);
-            map.insert(column_names[col].clone(), flex_to_json(&val));
+            map.insert(col_name.clone(), flex_to_json(&val));
         }
         let json = serde_json::to_string(&JsonValue::Object(map))
-            .map_err(|e| SFrameError::Format(format!("JSON serialization error: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("JSON serialization error: {e}")))?;
         output.push_str(&json);
         output.push('\n');
     }
@@ -185,7 +185,7 @@ fn build_json_schema<R: BufRead>(reader: R) -> Result<JsonSchema> {
         }
 
         let json: JsonValue = serde_json::from_str(trimmed)
-            .map_err(|e| SFrameError::Format(format!("JSON parse error: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("JSON parse error: {e}")))?;
 
         if let JsonValue::Object(map) = json {
             let mut row = HashMap::new();
@@ -280,7 +280,7 @@ mod tests {
                 (FlexType::Integer(a), FlexType::Integer(b)) => assert_eq!(a, b),
                 (FlexType::Float(a), FlexType::Float(b)) => assert!((a - b).abs() < 1e-10),
                 (FlexType::String(a), FlexType::String(b)) => assert_eq!(&**a, &**b),
-                _ => panic!("Roundtrip failed for {:?} → {:?}", val, back),
+                _ => panic!("Roundtrip failed for {val:?} → {back:?}"),
             }
         }
     }

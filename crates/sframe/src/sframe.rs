@@ -368,7 +368,7 @@ impl SFrame {
     /// same schema.
     pub fn from_parquet_files(paths: &[&str]) -> Result<Self> {
         let path_bufs: Vec<std::path::PathBuf> =
-            paths.iter().map(|p| std::path::PathBuf::from(p)).collect();
+            paths.iter().map(std::path::PathBuf::from).collect();
         Self::from_parquet_files_inner(&path_bufs)
     }
 
@@ -557,8 +557,7 @@ impl SFrame {
     pub fn add_column(&self, name: &str, col: SArray) -> Result<SFrame> {
         if self.column_names.contains(&name.to_string()) {
             return Err(SFrameError::Format(format!(
-                "Column '{}' already exists",
-                name
+                "Column '{name}' already exists"
             )));
         }
 
@@ -708,7 +707,7 @@ impl SFrame {
         if n == 0 {
             let dtypes = self.column_types();
             let batch = SFrameRows::empty(&dtypes);
-            return self.from_batch(batch);
+            return self.build_from_batch(batch);
         }
         // Try slicing for O(n) reads instead of streaming.
         if let Some(len) = self.known_len() {
@@ -719,7 +718,7 @@ impl SFrame {
         }
         let stream = self.compile_stream()?;
         let batch = materialize_head_sync(stream, n)?;
-        self.from_batch(batch)
+        self.build_from_batch(batch)
     }
 
     /// Sort by one or more columns.
@@ -756,7 +755,7 @@ impl SFrame {
         let (batch, indices) = sort::sort_indices(stream, sort_keys)?;
 
         if batch.num_rows() == 0 {
-            return self.from_batch(batch);
+            return self.build_from_batch(batch);
         }
 
         let mut builder =
@@ -819,7 +818,7 @@ impl SFrame {
         for (i, name) in other.column_names.iter().enumerate() {
             if !right_key_indices.contains(&i) {
                 let out_name = if names.contains(name) {
-                    format!("{}.1", name)
+                    format!("{name}.1")
                 } else {
                     name.clone()
                 };
@@ -984,8 +983,7 @@ impl SFrame {
             if let Some(existing_idx) = new_names.iter().position(|n| n == new_name) {
                 if existing_idx != idx {
                     return Err(SFrameError::Format(format!(
-                        "Column '{}' already exists",
-                        new_name
+                        "Column '{new_name}' already exists"
                     )));
                 }
             }
@@ -1011,7 +1009,7 @@ impl SFrame {
     ///
     /// - `column_name`: if `Some`, only check that column; if `None`, check all columns.
     /// - `how`: `"any"` drops rows where any specified column is Undefined,
-    ///          `"all"` drops rows where all specified columns are Undefined.
+    ///   `"all"` drops rows where all specified columns are Undefined.
     pub fn dropna(&self, column_name: Option<&str>, how: &str) -> Result<SFrame> {
         let batch = self.materialize_batch()?;
         let nrows = batch.num_rows();
@@ -1039,15 +1037,15 @@ impl SFrame {
         let mut col_vecs: Vec<Vec<FlexType>> = vec![Vec::new(); ncols];
         for (row, &kept) in keep.iter().enumerate() {
             if kept {
-                for col in 0..ncols {
-                    col_vecs[col].push(batch.column(col).get(row).clone());
+                for (col, col_vec) in col_vecs.iter_mut().enumerate().take(ncols) {
+                    col_vec.push(batch.column(col).get(row).clone());
                 }
             }
         }
 
         let dtypes = self.column_types();
         let result = SFrameRows::from_column_vecs(col_vecs, &dtypes)?;
-        self.from_batch(result)
+        self.build_from_batch(result)
     }
 
     /// Fill missing values in a column.
@@ -1243,8 +1241,8 @@ impl SFrame {
 
                 // Add unpacked columns
                 for key in &all_keys {
-                    let key_str = format!("{}", key);
-                    new_names.push(format!("{}.{}", pfx, key_str));
+                    let key_str = format!("{key}");
+                    new_names.push(format!("{pfx}.{key_str}"));
 
                     let mut col = Vec::with_capacity(nrows);
                     let mut inferred_type = FlexTypeEnum::String;
@@ -1302,7 +1300,7 @@ impl SFrame {
 
                 // Add unpacked columns
                 for pos in 0..max_len {
-                    new_names.push(format!("{}.{}", pfx, pos));
+                    new_names.push(format!("{pfx}.{pos}"));
                     let mut col = Vec::with_capacity(nrows);
                     let mut inferred_type = FlexTypeEnum::String;
                     for row in 0..nrows {
@@ -1328,8 +1326,7 @@ impl SFrame {
                 write_to_cache(result, new_names)
             }
             _ => Err(SFrameError::Format(format!(
-                "Cannot unpack column '{}' of type {:?}; expected Dict or List",
-                column_name, col_dtype
+                "Cannot unpack column '{column_name}' of type {col_dtype:?}; expected Dict or List"
             ))),
         }
     }
@@ -1390,20 +1387,20 @@ impl SFrame {
 
                     if elements.is_empty() {
                         // Keep row with Undefined for the stacked column
-                        for c in 0..ncols {
+                        for (c, col_vec) in col_vecs.iter_mut().enumerate().take(ncols) {
                             if c == col_idx {
-                                col_vecs[c].push(FlexType::Undefined);
+                                col_vec.push(FlexType::Undefined);
                             } else {
-                                col_vecs[c].push(batch.column(c).get(row).clone());
+                                col_vec.push(batch.column(c).get(row).clone());
                             }
                         }
                     } else {
                         for elem in elements {
-                            for c in 0..ncols {
+                            for (c, col_vec) in col_vecs.iter_mut().enumerate().take(ncols) {
                                 if c == col_idx {
-                                    col_vecs[c].push(elem.clone());
+                                    col_vec.push(elem.clone());
                                 } else {
-                                    col_vecs[c].push(batch.column(c).get(row).clone());
+                                    col_vec.push(batch.column(c).get(row).clone());
                                 }
                             }
                         }
@@ -1414,8 +1411,7 @@ impl SFrame {
                 write_to_cache(result, new_names)
             }
             _ => Err(SFrameError::Format(format!(
-                "Cannot stack column '{}' of type {:?}; expected List or Vector",
-                column_name, col_dtype
+                "Cannot stack column '{column_name}' of type {col_dtype:?}; expected List or Vector"
             ))),
         }
     }
@@ -1439,7 +1435,7 @@ impl SFrame {
         if n == 0 {
             let dtypes = self.column_types();
             let batch = SFrameRows::empty(&dtypes);
-            return self.from_batch(batch);
+            return self.build_from_batch(batch);
         }
         // Try slicing for O(n) reads instead of streaming all rows.
         if let Some(len) = self.known_len() {
@@ -1450,7 +1446,7 @@ impl SFrame {
         }
         let stream = self.compile_stream()?;
         let batch = materialize_tail_sync(stream, n)?;
-        self.from_batch(batch)
+        self.build_from_batch(batch)
     }
 
     /// Lazily slice this SFrame to rows `[begin, end)`.
@@ -1482,8 +1478,7 @@ impl SFrame {
         let len = self.num_rows()?;
         if begin > end || end > len {
             return Err(SFrameError::Format(format!(
-                "Slice [{}, {}) out of range for length {}",
-                begin, end, len
+                "Slice [{begin}, {end}) out of range for length {len}"
             )));
         }
         // Stream head(end), then take the tail portion.
@@ -1491,13 +1486,13 @@ impl SFrame {
         let batch = materialize_head_sync(stream, end as usize)?;
         let indices: Vec<usize> = (begin as usize..end as usize).collect();
         let sliced = batch.take(&indices)?;
-        self.from_batch(sliced)
+        self.build_from_batch(sliced)
     }
 
     /// Materialize all lazy computations.
     pub fn materialize(&self) -> Result<SFrame> {
         let batch = self.materialize_batch()?;
-        self.from_batch(batch)
+        self.build_from_batch(batch)
     }
 
     /// Save to disk as an SFrame directory.
@@ -1729,14 +1724,14 @@ impl SFrame {
         self.column_names
             .iter()
             .position(|n| n == name)
-            .ok_or_else(|| SFrameError::Format(format!("Column '{}' not found", name)))
+            .ok_or_else(|| SFrameError::Format(format!("Column '{name}' not found")))
     }
 
     fn materialize_batch(&self) -> Result<SFrameRows> {
         materialize_sync(self.compile_stream()?)
     }
 
-    fn from_batch(&self, batch: SFrameRows) -> Result<SFrame> {
+    fn build_from_batch(&self, batch: SFrameRows) -> Result<SFrame> {
         write_to_cache(batch, self.column_names.clone())
     }
 }
@@ -1748,16 +1743,16 @@ impl std::fmt::Display for SFrame {
         // Try slicing first to avoid reading the entire dataset.
         // Falls back to compile_stream + materialize_head if slicing isn't possible.
         let batch = match self.try_slice(0, (max_display as u64).min(self.known_len().unwrap_or(max_display as u64))) {
-            Ok(sliced) => match sliced.compile_stream().and_then(|s| materialize_sync(s)) {
+            Ok(sliced) => match sliced.compile_stream().and_then(materialize_sync) {
                 Ok(b) => b,
-                Err(e) => return write!(f, "[SFrame error: {}]", e),
+                Err(e) => return write!(f, "[SFrame error: {e}]"),
             },
             Err(_) => match self
                 .compile_stream()
                 .and_then(|s| materialize_head_sync(s, max_display))
             {
                 Ok(b) => b,
-                Err(e) => return write!(f, "[SFrame error: {}]", e),
+                Err(e) => return write!(f, "[SFrame error: {e}]"),
             },
         };
 
@@ -1777,16 +1772,16 @@ impl std::fmt::Display for SFrame {
         let mut cell_strings: Vec<Vec<String>> = Vec::new();
         for row_idx in 0..display_rows {
             let mut row_strs = Vec::new();
-            for col_idx in 0..ncols {
+            for (col_idx, col_width) in col_widths.iter_mut().enumerate().take(ncols) {
                 let val = batch.column(col_idx).get(row_idx);
-                let s = format!("{}", val);
+                let s = format!("{val}");
                 let truncated = if s.len() > 30 {
                     format!("{}...", &s[..27])
                 } else {
                     s
                 };
-                if truncated.len() > col_widths[col_idx] {
-                    col_widths[col_idx] = truncated.len();
+                if truncated.len() > *col_width {
+                    *col_width = truncated.len();
                 }
                 row_strs.push(truncated);
             }
@@ -1807,28 +1802,28 @@ impl std::fmt::Display for SFrame {
             + "+";
 
         // Header
-        writeln!(f, "{}", sep)?;
+        writeln!(f, "{sep}")?;
         let header: String = self
             .column_names
             .iter()
             .zip(col_widths.iter())
-            .map(|(name, &w)| format!("| {:width$} ", name, width = w))
+            .map(|(name, &w)| format!("| {name:w$} "))
             .collect::<Vec<_>>()
             .join("")
             + "|";
-        writeln!(f, "{}", header)?;
-        writeln!(f, "{}", sep)?;
+        writeln!(f, "{header}")?;
+        writeln!(f, "{sep}")?;
 
         // Data rows
         for row_strs in &cell_strings {
             let row: String = row_strs
                 .iter()
                 .zip(col_widths.iter())
-                .map(|(s, &w)| format!("| {:width$} ", s, width = w))
+                .map(|(s, &w)| format!("| {s:w$} "))
                 .collect::<Vec<_>>()
                 .join("")
                 + "|";
-            writeln!(f, "{}", row)?;
+            writeln!(f, "{row}")?;
         }
 
         // Show "..." if there are (or might be) more rows than displayed.
@@ -1843,16 +1838,16 @@ impl std::fmt::Display for SFrame {
                 .collect::<Vec<_>>()
                 .join("")
                 + "|";
-            writeln!(f, "{}", dots)?;
+            writeln!(f, "{dots}")?;
         }
 
-        writeln!(f, "{}", sep)?;
+        writeln!(f, "{sep}")?;
         let len_str = match known_len {
             Some(n) => n.to_string(),
             None if !has_more => display_rows.to_string(),
             None => "?".to_string(),
         };
-        write!(f, "[{} rows x {} columns]", len_str, ncols)
+        write!(f, "[{len_str} rows x {ncols} columns]")
     }
 }
 
@@ -1924,7 +1919,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]
@@ -2062,7 +2057,7 @@ mod tests {
             ).unwrap()),
         ]).unwrap();
 
-        let s = format!("{}", sf);
+        let s = format!("{sf}");
         assert!(s.contains("x"));
         assert!(s.contains("y"));
         assert!(s.contains("hello"));
@@ -2476,7 +2471,7 @@ mod tests {
         let n = 15_000;
         let values: Vec<FlexType> = (0..n)
             .rev()
-            .map(|i| FlexType::Integer(i))
+            .map(FlexType::Integer)
             .collect();
         let sa = SArray::from_vec(values, FlexTypeEnum::Integer).unwrap();
         let sf = SFrame::from_columns(vec![("val", sa)]).unwrap();
@@ -2536,18 +2531,18 @@ mod tests {
         let n = 500i64;
         let left = SFrame::from_columns(vec![
             ("id", SArray::from_vec(
-                (0..n).map(|i| FlexType::Integer(i)).collect(),
+                (0..n).map(FlexType::Integer).collect(),
                 FlexTypeEnum::Integer,
             ).unwrap()),
             ("name", SArray::from_vec(
-                (0..n).map(|i| FlexType::String(format!("left_{}", i).into())).collect(),
+                (0..n).map(|i| FlexType::String(format!("left_{i}").into())).collect(),
                 FlexTypeEnum::String,
             ).unwrap()),
         ]).unwrap();
 
         let right = SFrame::from_columns(vec![
             ("id", SArray::from_vec(
-                (0..n).step_by(2).map(|i| FlexType::Integer(i)).collect(),
+                (0..n).step_by(2).map(FlexType::Integer).collect(),
                 FlexTypeEnum::Integer,
             ).unwrap()),
             ("score", SArray::from_vec(
@@ -2588,20 +2583,20 @@ mod tests {
 
     #[test]
     fn test_sframe_slice() {
-        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..100).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
         let sliced = sf.slice(10, 20).unwrap();
         assert_eq!(sliced.num_rows().unwrap(), 10);
         let col = sliced.column("x").unwrap();
         let result = col.to_vec().unwrap();
-        let expected: Vec<FlexType> = (10..20).map(|i| FlexType::Integer(i)).collect();
+        let expected: Vec<FlexType> = (10..20).map(FlexType::Integer).collect();
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_sframe_slice_multi_column() {
-        let ints: Vec<FlexType> = (0..50).map(|i| FlexType::Integer(i)).collect();
+        let ints: Vec<FlexType> = (0..50).map(FlexType::Integer).collect();
         let floats: Vec<FlexType> = (0..50).map(|i| FlexType::Float(i as f64 * 0.5)).collect();
         let sf = SFrame::from_columns(vec![
             ("i", SArray::from_vec(ints, FlexTypeEnum::Integer).unwrap()),
@@ -2614,7 +2609,7 @@ mod tests {
 
     #[test]
     fn test_sframe_slice_out_of_bounds() {
-        let vals: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..10).map(FlexType::Integer).collect();
         let sf = SFrame::from_columns(vec![
             ("x", SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap()),
         ]).unwrap();
@@ -2623,7 +2618,7 @@ mod tests {
 
     #[test]
     fn test_sframe_slice_preserves_laziness() {
-        let vals: Vec<FlexType> = (0..100).map(|i| FlexType::Integer(i)).collect();
+        let vals: Vec<FlexType> = (0..100).map(FlexType::Integer).collect();
         let sa = SArray::from_vec(vals, FlexTypeEnum::Integer).unwrap();
         let sf = SFrame::from_columns(vec![("x", sa)]).unwrap();
         let added = sf.add_column(
@@ -2633,7 +2628,7 @@ mod tests {
         let sliced = added.slice(90, 100).unwrap();
         assert_eq!(sliced.num_rows().unwrap(), 10);
         let x = sliced.column("x").unwrap().to_vec().unwrap();
-        let expected: Vec<FlexType> = (90..100).map(|i| FlexType::Integer(i)).collect();
+        let expected: Vec<FlexType> = (90..100).map(FlexType::Integer).collect();
         assert_eq!(x, expected);
     }
 
@@ -2659,8 +2654,7 @@ mod tests {
         let explanation = sf2.explain();
         assert!(
             !explanation.contains("materialized independently"),
-            "fuse_plan should succeed after add_column, but got:\n{}",
-            explanation,
+            "fuse_plan should succeed after add_column, but got:\n{explanation}",
         );
 
         // Filter on score > 75.0
@@ -2680,11 +2674,9 @@ mod tests {
             if let (FlexType::Float(a), FlexType::Float(b)) = (s, s2) {
                 assert!(
                     (b - a * 2.0).abs() < 1e-10,
-                    "score2 should be 2x score, got score={} score2={}",
-                    a,
-                    b,
+                    "score2 should be 2x score, got score={a} score2={b}",
                 );
-                assert!(*a > 75.0, "filter should have removed scores <= 75, got {}", a);
+                assert!(*a > 75.0, "filter should have removed scores <= 75, got {a}");
             }
         }
     }
@@ -2715,15 +2707,13 @@ mod tests {
         let explanation = result.explain();
         assert!(
             !explanation.contains("materialized independently"),
-            "fuse_plan should succeed after filter + add_column, but got:\n{}",
-            explanation,
+            "fuse_plan should succeed after filter + add_column, but got:\n{explanation}",
         );
 
         // Verify ColumnUnion appears in the explanation
         assert!(
             explanation.contains("ColumnUnion"),
-            "Expected ColumnUnion in explanation:\n{}",
-            explanation,
+            "Expected ColumnUnion in explanation:\n{explanation}",
         );
 
         // Verify data correctness
@@ -2735,11 +2725,9 @@ mod tests {
             if let (FlexType::Float(a), FlexType::Float(b)) = (s, s2) {
                 assert!(
                     (b - a * 2.0).abs() < 1e-10,
-                    "score2 should be 2x score, got score={} score2={}",
-                    a,
-                    b,
+                    "score2 should be 2x score, got score={a} score2={b}",
                 );
-                assert!(*a > 75.0, "filter should have removed scores <= 75, got {}", a);
+                assert!(*a > 75.0, "filter should have removed scores <= 75, got {a}");
             }
         }
     }
@@ -2761,15 +2749,14 @@ mod tests {
         let explanation = sf2.explain();
         assert!(
             !explanation.contains("materialized independently"),
-            "fuse_plan should succeed after replace_column, but got:\n{}",
-            explanation,
+            "fuse_plan should succeed after replace_column, but got:\n{explanation}",
         );
 
         // Verify the replaced column has negated values
         let vals = sf2.column("score").unwrap().to_vec().unwrap();
         for v in &vals {
             if let FlexType::Float(f) = v {
-                assert!(*f <= 0.0, "scores should be negated: {}", f);
+                assert!(*f <= 0.0, "scores should be negated: {f}");
             }
         }
 
@@ -2785,7 +2772,7 @@ mod tests {
         assert!(!filtered_scores.is_empty(), "should have some filtered rows");
         for v in &filtered_scores {
             if let FlexType::Float(f) = v {
-                assert!(*f < -75.0, "filter should keep only scores < -75, got {}", f);
+                assert!(*f < -75.0, "filter should keep only scores < -75, got {f}");
             }
         }
 
@@ -2962,15 +2949,14 @@ mod tests {
         sf.to_parquet_sharded(&prefix).unwrap();
 
         // Since from_columns is not sliceable, should produce a single shard
-        let shard_path = format!("{}_0_of_1.parquet", prefix);
+        let shard_path = format!("{prefix}_0_of_1.parquet");
         assert!(
             std::path::Path::new(&shard_path).exists(),
-            "Expected shard file at {}",
-            shard_path
+            "Expected shard file at {shard_path}"
         );
 
         // Read back via glob
-        let pattern = format!("{}_*.parquet", prefix);
+        let pattern = format!("{prefix}_*.parquet");
         let sf2 = SFrame::from_parquet(&pattern).unwrap();
         assert_eq!(sf2.num_rows().unwrap(), 3);
 
@@ -2991,7 +2977,7 @@ mod tests {
             (
                 "id",
                 SArray::from_vec(
-                    (0..100).map(|i| FlexType::Integer(i)).collect(),
+                    (0..100).map(FlexType::Integer).collect(),
                     FlexTypeEnum::Integer,
                 )
                 .unwrap(),
@@ -3017,7 +3003,7 @@ mod tests {
         sf_disk.to_parquet_sharded(&prefix).unwrap();
 
         // Should produce multiple shards (at least 1)
-        let pattern = format!("{}_*.parquet", prefix);
+        let pattern = format!("{prefix}_*.parquet");
         let shard_files = sframe_parquet::parquet_reader::resolve_parquet_paths(&pattern).unwrap();
         assert!(
             !shard_files.is_empty(),
@@ -3046,7 +3032,7 @@ mod tests {
         // Verify id-value pairs are consistent
         for row in &rows {
             if let (FlexType::Integer(id), FlexType::Float(val)) = (&row[0], &row[1]) {
-                assert_eq!(*val, *id as f64 * 0.5, "id={} val={}", id, val);
+                assert_eq!(*val, *id as f64 * 0.5, "id={id} val={val}");
             }
         }
     }
@@ -3143,7 +3129,7 @@ mod tests {
         sf.to_parquet_sharded(&prefix).unwrap();
 
         // Read back via glob
-        let pattern = format!("{}_*.parquet", prefix);
+        let pattern = format!("{prefix}_*.parquet");
         let sf2 = SFrame::from_parquet(&pattern).unwrap();
         assert_eq!(sf2.num_rows().unwrap(), original_rows);
     }

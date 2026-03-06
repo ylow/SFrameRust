@@ -10,7 +10,7 @@ use sframe_types::flex_type::FlexType;
 
 fn samples_dir() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    format!("{}/../../samples", manifest)
+    format!("{manifest}/../../samples")
 }
 
 /// Parse the categories column "[4 5 6]" → Vec<f64>.
@@ -65,31 +65,24 @@ fn assert_flex_matches_csv(
         FlexType::Integer(v) => {
             let expected: i64 = csv_val.parse().unwrap_or_else(|_| {
                 panic!(
-                    "Column '{}' id '{}': CSV value '{}' not an integer",
-                    col_name, row_id, csv_val
+                    "Column '{col_name}' id '{row_id}': CSV value '{csv_val}' not an integer"
                 )
             });
             assert_eq!(
                 *v, expected,
-                "Column '{}' id '{}': SFrame={}, CSV={}",
-                col_name, row_id, v, expected
+                "Column '{col_name}' id '{row_id}': SFrame={v}, CSV={expected}"
             );
         }
         FlexType::Float(v) => {
             let expected: f64 = csv_val.parse().unwrap_or_else(|_| {
                 panic!(
-                    "Column '{}' id '{}': CSV value '{}' not a float",
-                    col_name, row_id, csv_val
+                    "Column '{col_name}' id '{row_id}': CSV value '{csv_val}' not a float"
                 )
             });
             assert!(
                 (v - expected).abs() < 1e-6
                     || (expected != 0.0 && ((v - expected) / expected).abs() < 1e-10),
-                "Column '{}' id '{}': SFrame={}, CSV={}",
-                col_name,
-                row_id,
-                v,
-                expected
+                "Column '{col_name}' id '{row_id}': SFrame={v}, CSV={expected}"
             );
         }
         FlexType::String(s) => {
@@ -99,11 +92,7 @@ fn assert_flex_matches_csv(
             assert_eq!(
                 s.as_ref(),
                 &csv_unescaped,
-                "Column '{}' id '{}': SFrame='{}', CSV='{}'",
-                col_name,
-                row_id,
-                s,
-                csv_unescaped
+                "Column '{col_name}' id '{row_id}': SFrame='{s}', CSV='{csv_unescaped}'"
             );
         }
         FlexType::Vector(v) => {
@@ -121,28 +110,19 @@ fn assert_flex_matches_csv(
             for (j, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert!(
                     (a - e).abs() < 1e-10,
-                    "Column '{}' id '{}' element {}: SFrame={}, CSV={}",
-                    col_name,
-                    row_id,
-                    j,
-                    a,
-                    e
+                    "Column '{col_name}' id '{row_id}' element {j}: SFrame={a}, CSV={e}"
                 );
             }
         }
         FlexType::Undefined => {
             assert!(
                 csv_val.is_empty() || csv_val == "NA",
-                "Column '{}' id '{}': SFrame=Undefined, CSV='{}'",
-                col_name,
-                row_id,
-                csv_val
+                "Column '{col_name}' id '{row_id}': SFrame=Undefined, CSV='{csv_val}'"
             );
         }
         other => {
             panic!(
-                "Column '{}' id '{}': unexpected type {:?}",
-                col_name, row_id, other
+                "Column '{col_name}' id '{row_id}': unexpected type {other:?}"
             );
         }
     }
@@ -162,7 +142,7 @@ fn test_all_columns_match_csv() {
     let mut sf_columns: HashMap<String, Vec<FlexType>> = HashMap::new();
     for col_name in &col_names {
         let col = sf.read_column_by_name(col_name)
-            .unwrap_or_else(|e| panic!("Failed to read column '{}': {}", col_name, e));
+            .unwrap_or_else(|e| panic!("Failed to read column '{col_name}': {e}"));
         sf_columns.insert(col_name.clone(), col);
     }
 
@@ -173,13 +153,12 @@ fn test_all_columns_match_csv() {
     for i in 0..nrows {
         let business_id = match &id_col[i] {
             FlexType::String(s) => s.as_ref().to_string(),
-            other => panic!("Row {} business_id: expected String, got {:?}", i, other),
+            other => panic!("Row {i} business_id: expected String, got {other:?}"),
         };
 
         let csv_row = csv_rows.get(&business_id).unwrap_or_else(|| {
             panic!(
-                "SFrame row {} business_id '{}' not found in CSV",
-                i, business_id
+                "SFrame row {i} business_id '{business_id}' not found in CSV"
             )
         });
 

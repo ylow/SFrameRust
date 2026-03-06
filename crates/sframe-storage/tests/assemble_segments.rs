@@ -14,7 +14,7 @@ fn test_assemble_from_two_segments() {
 
     // Write segment 0: rows [1, 2, 3]
     let seg0_name = "seg.0000".to_string();
-    let seg0_path = format!("{}/{}", base_path, seg0_name);
+    let seg0_path = format!("{base_path}/{seg0_name}");
     let seg0_sizes = {
         let file = std::fs::File::create(&seg0_path).unwrap();
         let mut sw = SegmentWriter::new(BufWriter::new(file), 2);
@@ -43,7 +43,7 @@ fn test_assemble_from_two_segments() {
 
     // Write segment 1: rows [4, 5]
     let seg1_name = "seg.0001".to_string();
-    let seg1_path = format!("{}/{}", base_path, seg1_name);
+    let seg1_path = format!("{base_path}/{seg1_name}");
     let seg1_sizes = {
         let file = std::fs::File::create(&seg1_path).unwrap();
         let mut sw = SegmentWriter::new(BufWriter::new(file), 2);

@@ -22,7 +22,7 @@ pub(crate) struct DenseBitset {
 impl DenseBitset {
     /// Allocate a zeroed bitset that can hold `len` bits.
     pub fn new(len: usize) -> Self {
-        let num_words = (len + 63) / 64;
+        let num_words = len.div_ceil(64);
         DenseBitset {
             bits: vec![0u64; num_words],
             len,
@@ -793,8 +793,8 @@ pub(crate) fn split_fields_bytes(line: &[u8], config: &ByteConfig) -> Vec<String
             }
 
             // Check for delimiter (only at top level)
-            if bracket_depth == 0 && brace_depth == 0 && !delim.is_empty() {
-                if i + delim.len() <= line.len()
+            if bracket_depth == 0 && brace_depth == 0 && !delim.is_empty()
+                && i + delim.len() <= line.len()
                     && line[i..i + delim.len()] == *delim
                 {
                     fields.push(finish_field_bytes(&current, config));
@@ -809,7 +809,6 @@ pub(crate) fn split_fields_bytes(line: &[u8], config: &ByteConfig) -> Vec<String
                     }
                     continue;
                 }
-            }
         }
 
         current.push(ch);
@@ -1046,8 +1045,8 @@ where
                 }
             }
 
-            if bracket_depth == 0 && brace_depth == 0 && !delim.is_empty() {
-                if i + delim.len() <= line.len()
+            if bracket_depth == 0 && brace_depth == 0 && !delim.is_empty()
+                && i + delim.len() <= line.len()
                     && line[i..i + delim.len()] == *delim
                 {
                     let s = finish_field_bytes(&current, config);
@@ -1064,7 +1063,6 @@ where
                     }
                     continue;
                 }
-            }
         }
 
         current.push(ch);
@@ -1392,6 +1390,8 @@ fn process_line_fused<F>(
 /// immediately parsing needed columns into `FlexType` and building
 /// column-major output directly. Avoids `Vec<String>` allocation entirely
 /// for lines without quotes, escapes, or brackets.
+// All parameters are distinct parser state; bundling into a struct would not simplify the API.
+#[allow(clippy::too_many_arguments)]
 fn parse_thread_fused<F>(
     buffer: &[u8],
     parity: &DenseBitset,
@@ -1564,7 +1564,7 @@ mod tests {
         let cfg = ByteConfig::from_config(&CsvConfig::default()).unwrap();
         let bp = find_true_newline_positions(buf, &cfg);
         for i in 0..buf.len() {
-            assert!(!bp.get(i), "bit {} should not be set", i);
+            assert!(!bp.get(i), "bit {i} should not be set");
         }
     }
 
@@ -1632,7 +1632,7 @@ mod tests {
         let bp = find_true_newline_positions(buf, &cfg);
         // Nothing should be in-quote (comment skips to newline)
         for i in 0..buf.len() {
-            assert!(!bp.get(i), "bit {} should not be set", i);
+            assert!(!bp.get(i), "bit {i} should not be set");
         }
     }
 
@@ -1711,7 +1711,7 @@ mod tests {
         let expected = csv_tokenizer::split_fields(line, config);
         let bcfg = ByteConfig::from_config(config).unwrap();
         let actual = split_fields_bytes(line.as_bytes(), &bcfg);
-        assert_eq!(expected, actual, "mismatch for line: {:?}", line);
+        assert_eq!(expected, actual, "mismatch for line: {line:?}");
     }
 
     #[test]
@@ -1796,7 +1796,7 @@ mod tests {
         let inner = s
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
-        format!("\"{}\"", inner)
+        format!("\"{inner}\"")
     }
 
     #[test]

@@ -99,6 +99,11 @@ impl SpaceSaving {
         self.items.len()
     }
 
+    /// Returns `true` if no items are being tracked.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// Bubble an item up to maintain descending count order.
     fn bubble_up(&mut self, mut idx: usize) {
         while idx > 0 && self.counts[idx] > self.counts[idx - 1] {

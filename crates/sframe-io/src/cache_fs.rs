@@ -126,19 +126,19 @@ impl CacheFs {
     /// The file does not exist yet — call `open_write` to create it.
     pub fn alloc_path(&self) -> String {
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("cache://{}", id)
+        format!("cache://{id}")
     }
 
     /// Allocate a new unique directory path in this cache.
     /// Returns a `cache://dir_N` URL. The directory does not exist yet.
     pub fn alloc_dir(&self) -> String {
         let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("cache://dir_{}", id)
+        format!("cache://dir_{id}")
     }
 
     /// Remove all files under a directory prefix and the directory itself.
     pub fn remove_dir(&self, dir_path: &str) -> Result<()> {
-        let prefix = format!("{}/", dir_path);
+        let prefix = format!("{dir_path}/");
         // Remove all in-memory files under this prefix
         {
             let mut mem = self.in_memory.lock().unwrap();

@@ -220,6 +220,6 @@ mod tests {
     #[test]
     fn test_image_display() {
         let img = FlexImage::new(vec![0; 12], 2, 2, 3, ImageFormat::Raw);
-        assert_eq!(format!("{}", img), "Image(2x2 3ch)");
+        assert_eq!(format!("{img}"), "Image(2x2 3ch)");
     }
 }

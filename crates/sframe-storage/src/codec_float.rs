@@ -39,8 +39,7 @@ pub fn decode_floats(
             LEGACY_ENCODING => decode_floats_legacy(&data[1..], num_elements),
             INTEGER_ENCODING => decode_floats_integer(&data[1..], num_elements),
             other => Err(SFrameError::Format(format!(
-                "Unknown float encoding reserved byte: {}",
-                other
+                "Unknown float encoding reserved byte: {other}"
             ))),
         }
     } else {
@@ -100,7 +99,7 @@ pub fn encode_floats(writer: &mut (impl Write + ?Sized), values: &[f64]) -> Resu
 /// Sign-magnitude rotation for legacy float encoding.
 /// C++ encoding: `encoded = (bits << 1) | (bits >> 63)`
 fn rotate_double_bits(bits: u64) -> u64 {
-    (bits << 1) | (bits >> 63)
+    bits.rotate_left(1)
 }
 
 /// Undo the sign-magnitude rotation used for legacy float encoding.
@@ -108,7 +107,7 @@ fn rotate_double_bits(bits: u64) -> u64 {
 /// C++ encoding: `encoded = (bits << 1) | (bits >> 63)`
 /// Decoding: `bits = (encoded >> 1) | (encoded << 63)`
 pub fn unrotate_double_bits(encoded: u64) -> u64 {
-    (encoded >> 1) | (encoded << 63)
+    encoded.rotate_right(1)
 }
 
 #[cfg(test)]
@@ -121,9 +120,9 @@ mod tests {
         for val in test_values {
             let bits = val.to_bits();
             // Simulate C++ encoding
-            let encoded = (bits << 1) | (bits >> 63);
+            let encoded = bits.rotate_left(1);
             let decoded_bits = unrotate_double_bits(encoded);
-            assert_eq!(decoded_bits, bits, "roundtrip failed for {}", val);
+            assert_eq!(decoded_bits, bits, "roundtrip failed for {val}");
         }
     }
 }

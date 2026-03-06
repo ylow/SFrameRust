@@ -181,13 +181,12 @@ pub fn read_string(reader: &mut (impl Read + ?Sized)) -> Result<String> {
     let len = read_u64(reader)? as usize;
     if len > 256 * 1024 * 1024 {
         return Err(SFrameError::Format(format!(
-            "String length {} exceeds sanity limit",
-            len
+            "String length {len} exceeds sanity limit"
         )));
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
-    String::from_utf8(buf).map_err(|e| SFrameError::Format(format!("Invalid UTF-8: {}", e)))
+    String::from_utf8(buf).map_err(|e| SFrameError::Format(format!("Invalid UTF-8: {e}")))
 }
 
 /// Read a GraphLab-serialized Vec<f64>: 8-byte LE length + raw f64 bytes (POD).
@@ -214,8 +213,7 @@ pub fn read_flex_type(reader: &mut (impl Read + ?Sized)) -> Result<FlexType> {
 
     if tag < FLEX_TYPE_TAG_OFFSET {
         return Err(SFrameError::Format(format!(
-            "Legacy FlexType tag {} not supported",
-            tag
+            "Legacy FlexType tag {tag} not supported"
         )));
     }
 
@@ -370,7 +368,7 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         match read_flex_type(&mut cursor).unwrap() {
             FlexType::Float(f) => assert!((f - 3.14).abs() < f64::EPSILON),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -405,7 +403,7 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         match read_flex_type(&mut cursor).unwrap() {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]),
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -425,7 +423,7 @@ mod tests {
                 assert_eq!(l[0], FlexType::Integer(1));
                 assert_eq!(l[1], FlexType::String(Arc::from("hi")));
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -447,7 +445,7 @@ mod tests {
                 assert_eq!(d[0].0, FlexType::String(Arc::from("key")));
                 assert_eq!(d[0].1, FlexType::Integer(99));
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 }

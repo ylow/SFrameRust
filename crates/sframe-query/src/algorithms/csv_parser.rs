@@ -349,13 +349,13 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
     match dtype {
         FlexTypeEnum::Integer => {
             let v = val.parse::<i64>().map_err(|_| {
-                SFrameError::Format(format!("Cannot parse '{}' as integer", val))
+                SFrameError::Format(format!("Cannot parse '{val}' as integer"))
             })?;
             Ok(FlexType::Integer(v))
         }
         FlexTypeEnum::Float => {
             let v = val.parse::<f64>().map_err(|_| {
-                SFrameError::Format(format!("Cannot parse '{}' as float", val))
+                SFrameError::Format(format!("Cannot parse '{val}' as float"))
             })?;
             Ok(FlexType::Float(v))
         }
@@ -654,7 +654,7 @@ pub fn parse_rows_slice_parallel(
         return parse_rows_slice(rows, column_types, na_values, col_indices);
     }
 
-    let num_sub = (rows.len() + SUB_CHUNK_SIZE - 1) / SUB_CHUNK_SIZE;
+    let num_sub = rows.len().div_ceil(SUB_CHUNK_SIZE);
     let sub_results: Vec<Result<Vec<Vec<FlexType>>>> = (0..num_sub)
         .into_par_iter()
         .map(|idx| {
@@ -1229,7 +1229,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]
@@ -1338,7 +1338,7 @@ mod tests {
 
         match batch.column(1).get(0) {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]),
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 

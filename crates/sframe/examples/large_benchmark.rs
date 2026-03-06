@@ -97,11 +97,11 @@ fn human_bytes(bytes: u64) -> String {
     let mut val = bytes as f64;
     for &unit in UNITS {
         if val < 1024.0 {
-            return format!("{:.2} {}", val, unit);
+            return format!("{val:.2} {unit}");
         }
         val /= 1024.0;
     }
-    format!("{:.2} PB", val)
+    format!("{val:.2} PB")
 }
 
 fn separator(title: &str) {
@@ -137,7 +137,7 @@ fn generate_and_write(path: &str, total_rows: u64) {
     let reg_arcs: Vec<Arc<str>> = REGIONS.iter().map(|&s| Arc::from(s)).collect();
 
     let mut rng = Rng::new(42);
-    let num_batches = ((total_rows as usize) + BATCH_SIZE - 1) / BATCH_SIZE;
+    let num_batches = (total_rows as usize).div_ceil(BATCH_SIZE);
     let t0 = Instant::now();
 
     for batch_idx in 0..num_batches {
@@ -225,7 +225,7 @@ fn lazy_open(path: &str) -> SFrame {
     );
     println!("  Schema:");
     for (name, dtype) in sf.schema() {
-        println!("    {:<15} {:?}", name, dtype);
+        println!("    {name:<15} {dtype:?}");
     }
 
     sf
@@ -291,7 +291,7 @@ fn bench_groupby(sf: &SFrame) {
         .expect("sort failed");
     let elapsed = t0.elapsed();
 
-    println!("{}", grouped);
+    println!("{grouped}");
     println!(
         "  GroupBy ({} groups) + sort in {:.2}s ({:.1} M rows/sec)",
         grouped.num_rows().unwrap(),
@@ -329,7 +329,7 @@ fn bench_pipeline(sf: &SFrame) {
         .unwrap();
     let elapsed = t0.elapsed();
 
-    println!("{}", result);
+    println!("{result}");
     println!(
         "  Full pipeline in {:.2}s ({:.1} M rows/sec)",
         elapsed.as_secs_f64(),
@@ -360,7 +360,7 @@ fn bench_sort_filtered(sf: &SFrame) {
     let top = sorted.head(10).unwrap();
     let elapsed = t0.elapsed();
 
-    println!("{}", top);
+    println!("{top}");
     println!(
         "  Filtered to {} rows, sorted, took top 10 in {:.2}s",
         format_count(n),
@@ -388,7 +388,7 @@ fn bench_full_sort(sf: &SFrame) {
     let top = sorted.head(10).unwrap();
     let elapsed = t0.elapsed();
 
-    println!("{}", top);
+    println!("{top}");
     println!(
         "  Full sort of {} rows in {:.2}s ({:.1} M rows/sec)",
         format_count(sf.num_rows().unwrap()),
@@ -403,7 +403,7 @@ fn col_idx(sf: &SFrame, name: &str) -> usize {
     sf.column_names()
         .iter()
         .position(|n| n == name)
-        .unwrap_or_else(|| panic!("column '{}' not found", name))
+        .unwrap_or_else(|| panic!("column '{name}' not found"))
 }
 
 fn format_count(n: u64) -> String {
@@ -414,7 +414,7 @@ fn format_count(n: u64) -> String {
     } else if n >= 1_000 {
         format!("{:.1}K", n as f64 / 1e3)
     } else {
-        format!("{}", n)
+        format!("{n}")
     }
 }
 
@@ -435,9 +435,9 @@ fn main() {
     println!("║  Rows:    {:>12}                                    ║", format_count(total_rows));
     println!("║  Columns: 7 (3 int, 2 float, 2 string)                  ║");
     println!("║  Est. uncompressed: ~{}                          ║", human_bytes(total_rows * 68));
-    println!("║  Threads: {:>12}                                    ║", n_threads);
+    println!("║  Threads: {n_threads:>12}                                    ║");
     println!("╚═══════════════════════════════════════════════════════════╝");
-    println!("  Cache dir: {}", cache_dir);
+    println!("  Cache dir: {cache_dir}");
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let sf_path = tmp.path().join("benchmark.sf");
@@ -472,6 +472,6 @@ fn main() {
 
     // Summary
     separator("Done");
-    println!("  Temporary SFrame at: {}", path_str);
+    println!("  Temporary SFrame at: {path_str}");
     println!("  Will be cleaned up on exit.");
 }

@@ -127,8 +127,7 @@ pub fn read_block_index(
 
     if footer_size > file_size - 8 {
         return Err(SFrameError::Format(format!(
-            "Footer size {} exceeds file size {}",
-            footer_size, file_size
+            "Footer size {footer_size} exceeds file size {file_size}"
         )));
     }
 
@@ -165,7 +164,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]
@@ -183,7 +182,7 @@ mod tests {
 
         // Each column should have at least 1 block
         for (i, col_blocks) in block_index.iter().enumerate() {
-            assert!(!col_blocks.is_empty(), "Column {} has no blocks", i);
+            assert!(!col_blocks.is_empty(), "Column {i} has no blocks");
         }
 
         // Total elements across blocks in each column should = 11536
@@ -191,8 +190,7 @@ mod tests {
             let total: u64 = col_blocks.iter().map(|b| b.num_elem).sum();
             assert_eq!(
                 total, 11536,
-                "Column {} has {} total elements, expected 11536",
-                i, total
+                "Column {i} has {total} total elements, expected 11536"
             );
         }
 
@@ -209,9 +207,7 @@ mod tests {
                 );
                 assert!(
                     block.length > 0,
-                    "Column {} block {} has zero length",
-                    i,
-                    j
+                    "Column {i} block {j} has zero length"
                 );
             }
         }

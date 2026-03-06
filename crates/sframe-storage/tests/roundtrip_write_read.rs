@@ -9,7 +9,7 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 fn samples_dir() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    format!("{}/../../samples", manifest)
+    format!("{manifest}/../../samples")
 }
 
 /// Compare two FlexType values for equality (floats within tolerance).
@@ -127,11 +127,7 @@ fn test_roundtrip_business_sf() {
         {
             assert!(
                 flex_eq(orig, round),
-                "Mismatch at column '{}' row {}: original={:?}, roundtrip={:?}",
-                name,
-                row_idx,
-                orig,
-                round
+                "Mismatch at column '{name}' row {row_idx}: original={orig:?}, roundtrip={round:?}"
             );
         }
     }
@@ -192,17 +188,17 @@ fn test_roundtrip_small() {
     let scores = sf.read_column_by_name("score").unwrap();
     match &scores[0] {
         FlexType::Float(v) => assert!((v - 95.5).abs() < 1e-10),
-        other => panic!("Expected Float, got {:?}", other),
+        other => panic!("Expected Float, got {other:?}"),
     }
 
     let tags = sf.read_column_by_name("tags").unwrap();
     match &tags[0] {
         FlexType::Vector(v) => assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]),
-        other => panic!("Expected Vector, got {:?}", other),
+        other => panic!("Expected Vector, got {other:?}"),
     }
     match &tags[2] {
         FlexType::Vector(v) => assert!(v.is_empty()),
-        other => panic!("Expected empty Vector, got {:?}", other),
+        other => panic!("Expected empty Vector, got {other:?}"),
     }
 }
 
@@ -283,7 +279,7 @@ fn test_streaming_writer_large_batch() {
     let mut writer = SFrameWriter::new(out_path_str, col_names, col_types).unwrap();
 
     let n = 50_000;
-    let data: Vec<FlexType> = (0..n).map(|i| FlexType::Integer(i)).collect();
+    let data: Vec<FlexType> = (0..n).map(FlexType::Integer).collect();
     writer.write_columns(&[data]).unwrap();
     writer.finish().unwrap();
 
@@ -343,7 +339,7 @@ fn test_streaming_writer_variable_batch_sizes() {
     assert_eq!(sf.num_rows(), total as u64);
     let col = sf.read_column_by_name("val").unwrap();
     for i in 0..total {
-        assert_eq!(col[i], FlexType::Integer(i as i64), "Mismatch at row {}", i);
+        assert_eq!(col[i], FlexType::Integer(i as i64), "Mismatch at row {i}");
     }
 }
 
@@ -393,7 +389,7 @@ fn test_multi_segment_roundtrip() {
     let ids = sf.read_column_by_name("id").unwrap();
     assert_eq!(ids.len(), total_rows);
     for i in 0..total_rows {
-        assert_eq!(ids[i], FlexType::Integer(i as i64), "id mismatch at row {}", i);
+        assert_eq!(ids[i], FlexType::Integer(i as i64), "id mismatch at row {i}");
     }
 
     let values = sf.read_column_by_name("value").unwrap();
@@ -422,7 +418,7 @@ fn test_multi_segment_exact_boundary() {
     let mut writer =
         SFrameWriter::with_segment_size(out_path_str, col_names, col_types, 1000).unwrap();
 
-    let data: Vec<FlexType> = (0..2000).map(|i| FlexType::Integer(i)).collect();
+    let data: Vec<FlexType> = (0..2000).map(FlexType::Integer).collect();
     writer.write_columns(&[data]).unwrap();
     writer.finish().unwrap();
 

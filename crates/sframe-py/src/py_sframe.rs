@@ -51,10 +51,9 @@ impl PySFrame {
     #[pyo3(signature = (path, delimiter=None))]
     fn from_csv(path: &str, delimiter: Option<&str>, py: Python<'_>) -> PyResult<Self> {
         let path = path.to_string();
-        let opts = delimiter.map(|d| {
-            let mut o = CsvOptions::default();
-            o.delimiter = d.to_string();
-            o
+        let opts = delimiter.map(|d| CsvOptions {
+            delimiter: d.to_string(),
+            ..Default::default()
         });
         let sf = allow(py, move || SFrame::from_csv(&path, opts))?;
         Ok(PySFrame::new(sf))
@@ -99,7 +98,7 @@ impl PySFrame {
         }
         let rust_cols: Vec<(&str, SArray)> = names
             .iter()
-            .zip(arrays.into_iter())
+            .zip(arrays)
             .map(|(n, a)| (n.as_str(), a))
             .collect();
         let sf = SFrame::from_columns(rust_cols).into_pyresult()?;
@@ -116,10 +115,9 @@ impl PySFrame {
     fn to_csv(&self, path: &str, delimiter: Option<&str>, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
         let path = path.to_string();
-        let opts = delimiter.map(|d| {
-            let mut o = CsvWriterOptions::default();
-            o.delimiter = d.to_string();
-            o
+        let opts = delimiter.map(|d| CsvWriterOptions {
+            delimiter: d.to_string(),
+            ..Default::default()
         });
         allow(py, move || inner.to_csv(&path, opts))
     }
@@ -183,12 +181,12 @@ impl PySFrame {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{}", inner))
+        py.allow_threads(move || format!("{inner}"))
     }
 
     fn __str__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{}", inner))
+        py.allow_threads(move || format!("{inner}"))
     }
 
     // ── Column access ───────────────────────────────────────────────
@@ -457,8 +455,7 @@ impl PySFrame {
             "full" => JoinType::Full,
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "Unknown join type: '{}'",
-                    how
+                    "Unknown join type: '{how}'"
                 )))
             }
         };
@@ -517,7 +514,7 @@ impl PySFrame {
                 .iter()
                 .position(|n| n == col_name)
                 .ok_or_else(|| {
-                    PyKeyError::new_err(format!("Column '{}' not found", col_name))
+                    PyKeyError::new_err(format!("Column '{col_name}' not found"))
                 })?;
 
             let aggregator = py_spec.make_aggregator()?;
@@ -716,7 +713,7 @@ impl PySFrameIter {
                     self.current_batch = Some(batch);
                 }
                 Ok(Err(e)) => {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)));
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")));
                 }
                 Err(_) => return Ok(None), // Channel closed, stream finished.
             }

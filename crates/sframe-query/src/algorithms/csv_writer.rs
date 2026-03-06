@@ -154,12 +154,12 @@ fn format_value(val: &FlexType, na_rep: &str) -> String {
             } else if f.is_infinite() {
                 if *f > 0.0 { "inf".to_string() } else { "-inf".to_string() }
             } else {
-                format!("{}", f)
+                format!("{f}")
             }
         }
         FlexType::String(s) => s.to_string(),
         FlexType::Vector(v) => {
-            let elements: Vec<String> = v.iter().map(|f| format!("{}", f)).collect();
+            let elements: Vec<String> = v.iter().map(|f| format!("{f}")).collect();
             format!("[{}]", elements.join(", "))
         }
         FlexType::List(l) => {

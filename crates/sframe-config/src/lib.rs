@@ -182,6 +182,8 @@ pub fn set_cache_capacity_per_file(bytes: usize) {
 
 /// Parse a byte size string. Supports plain integers and suffixes:
 /// `K`/`KB`, `M`/`MB`, `G`/`GB` (case-insensitive).
+// Changing to a richer error type would break the public API for minimal benefit.
+#[allow(clippy::result_unit_err)]
 pub fn parse_byte_size(s: &str) -> Result<usize, ()> {
     let s = s.trim();
     let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")).or_else(|| s.strip_suffix("G").or_else(|| s.strip_suffix("g"))) {

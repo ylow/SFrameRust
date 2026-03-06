@@ -109,11 +109,8 @@ impl EncodedBlockRange {
         }
         let n = n.min(self.total_rows - self.current_row);
         let state = self.gen.resume_with(DecoderCmd::Skip(n));
-        match state {
-            GeneratorState::Yielded(DecoderResponse::Skipped(actual)) => {
-                self.current_row += actual;
-            }
-            _ => {}
+        if let GeneratorState::Yielded(DecoderResponse::Skipped(actual)) = state {
+            self.current_row += actual;
         }
     }
 
@@ -559,6 +556,8 @@ async fn stream_vectors(
 ///
 /// Decodes all defined values upfront, interleaves with undefineds from the
 /// bitmap, then serves from buffer.
+// Parameters are tightly coupled to the block decoding protocol; splitting would add complexity.
+#[allow(clippy::too_many_arguments)]
 async fn stream_with_undefineds(
     co: &Co<DecoderResponse, DecoderCmd>,
     type_data: &[u8],
@@ -682,7 +681,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     /// Helper: get decompressed block data and block info for every block
@@ -861,10 +860,10 @@ mod tests {
         let sf = SFrameReader::open(&format!("{}/business.sf", samples_dir())).unwrap();
         let types: Vec<FlexTypeEnum> = sf.group_index.columns.iter().map(|c| c.dtype).collect();
 
-        let has_int = types.iter().any(|t| *t == FlexTypeEnum::Integer);
-        let has_float = types.iter().any(|t| *t == FlexTypeEnum::Float);
-        let has_string = types.iter().any(|t| *t == FlexTypeEnum::String);
-        let has_vector = types.iter().any(|t| *t == FlexTypeEnum::Vector);
+        let has_int = types.contains(&FlexTypeEnum::Integer);
+        let has_float = types.contains(&FlexTypeEnum::Float);
+        let has_string = types.contains(&FlexTypeEnum::String);
+        let has_vector = types.contains(&FlexTypeEnum::Vector);
 
         assert!(has_int, "business.sf should have integer columns");
         assert!(has_float, "business.sf should have float columns");

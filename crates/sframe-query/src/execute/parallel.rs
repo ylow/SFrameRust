@@ -136,8 +136,8 @@ pub fn execute_parallel(
         .into_par_iter()
         .enumerate()
         .map(|(i, plan)| {
-            let seg_name = format!("seg.{:04}", i);
-            let seg_path = format!("{}/{}", base_path, seg_name);
+            let seg_name = format!("seg.{i:04}");
+            let seg_path = format!("{base_path}/{seg_name}");
             let file = sframe_io::vfs::VirtualFileSystem::open_write(&*vfs, &seg_path)?;
             let seg_writer = sframe_storage::segment_writer::SegmentWriter::new(file, dtypes.len());
 
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn test_execute_parallel_roundtrip() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = format!("{}/../../samples/business.sf", manifest);
+        let path = format!("{manifest}/../../samples/business.sf");
         let reader = sframe_storage::sframe_reader::SFrameReader::open(&path).unwrap();
         let col_names: Vec<String> = reader.column_names().to_vec();
         let col_types: Vec<FlexTypeEnum> = reader

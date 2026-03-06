@@ -28,7 +28,7 @@ impl TryFrom<u8> for FlexTypeEnum {
             5 => Ok(Self::Dict),
             6 => Ok(Self::DateTime),
             7 => Ok(Self::Undefined),
-            _ => Err(SFrameError::Type(format!("Unknown type enum value: {}", value))),
+            _ => Err(SFrameError::Type(format!("Unknown type enum value: {value}"))),
         }
     }
 }
@@ -152,16 +152,16 @@ impl FlexType {
 impl std::fmt::Display for FlexType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FlexType::Integer(v) => write!(f, "{}", v),
-            FlexType::Float(v) => write!(f, "{}", v),
-            FlexType::String(v) => write!(f, "{}", v),
+            FlexType::Integer(v) => write!(f, "{v}"),
+            FlexType::Float(v) => write!(f, "{v}"),
+            FlexType::String(v) => write!(f, "{v}"),
             FlexType::Vector(v) => {
                 write!(f, "[")?;
                 for (i, x) in v.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", x)?;
+                    write!(f, "{x}")?;
                 }
                 write!(f, "]")
             }
@@ -171,7 +171,7 @@ impl std::fmt::Display for FlexType {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", x)?;
+                    write!(f, "{x}")?;
                 }
                 write!(f, "]")
             }
@@ -181,7 +181,7 @@ impl std::fmt::Display for FlexType {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", k, val)?;
+                    write!(f, "{k}: {val}")?;
                 }
                 write!(f, "}}")
             }
@@ -481,7 +481,7 @@ mod tests {
     fn test_add_floats() {
         match FlexType::Float(1.5) + FlexType::Float(2.5) {
             FlexType::Float(v) => assert!((v - 4.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -489,7 +489,7 @@ mod tests {
     fn test_add_int_float_promotion() {
         match FlexType::Integer(1) + FlexType::Float(2.5) {
             FlexType::Float(v) => assert!((v - 3.5).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -507,7 +507,7 @@ mod tests {
         let b = FlexType::Vector(Arc::from(vec![4.0, 5.0, 6.0]));
         match a + b {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[5.0, 7.0, 9.0]),
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -523,7 +523,7 @@ mod tests {
     fn test_mul_int_float() {
         match FlexType::Integer(3) * FlexType::Float(2.5) {
             FlexType::Float(v) => assert!((v - 7.5).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -532,7 +532,7 @@ mod tests {
         let v = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
         match v * FlexType::Float(2.0) {
             FlexType::Vector(r) => assert_eq!(r.as_ref(), &[2.0, 4.0, 6.0]),
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -540,7 +540,7 @@ mod tests {
     fn test_div_always_float() {
         match FlexType::Integer(7) / FlexType::Integer(2) {
             FlexType::Float(v) => assert!((v - 3.5).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(-FlexType::Integer(5), FlexType::Integer(-5));
         match -FlexType::Float(3.14) {
             FlexType::Float(v) => assert!((v + 3.14).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -573,7 +573,7 @@ mod tests {
     fn test_neg_vector() {
         match -FlexType::Vector(Arc::from(vec![1.0, -2.0, 3.0])) {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[-1.0, 2.0, -3.0]),
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 

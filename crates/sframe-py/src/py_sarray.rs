@@ -72,12 +72,12 @@ impl PySArray {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{}", inner))
+        py.allow_threads(move || format!("{inner}"))
     }
 
     fn __str__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{}", inner))
+        py.allow_threads(move || format!("{inner}"))
     }
 
     /// First n values as a Python list.
@@ -566,7 +566,7 @@ impl PySArrayIter {
                     // Loop back to yield from this batch.
                 }
                 Ok(Err(e)) => {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)));
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")));
                 }
                 Err(_) => return Ok(None), // Channel closed, stream finished.
             }
@@ -627,7 +627,7 @@ impl PySArray {
             // Empty slice
             let inner = self.inner.clone();
             let empty = SArray::from_vec(vec![], inner.dtype())
-                .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             return Ok(PySArray::new(empty).into_pyobject(py)?.into_any().unbind());
         }
 

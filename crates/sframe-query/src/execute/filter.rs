@@ -19,5 +19,5 @@ pub(super) fn logical_filter_batch(data: &SFrameRows, mask: &SFrameRows) -> Resu
         .map(|col| col.gather(&indices))
         .collect();
 
-    Ok(SFrameRows::new(columns)?)
+    SFrameRows::new(columns)
 }

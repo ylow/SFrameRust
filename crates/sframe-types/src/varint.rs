@@ -68,15 +68,15 @@ pub fn encode_varint(value: u64, writer: &mut (impl Write + ?Sized)) -> Result<(
         writer.write_all(&(encoded as u32).to_le_bytes())?;
     } else if bits_needed <= 35 {
         let encoded = (value << 5) | 0b0_1111;
-        let bytes = (encoded as u64).to_le_bytes();
+        let bytes = encoded.to_le_bytes();
         writer.write_all(&bytes[..5])?;
     } else if bits_needed <= 42 {
         let encoded = (value << 6) | 0b01_1111;
-        let bytes = (encoded as u64).to_le_bytes();
+        let bytes = encoded.to_le_bytes();
         writer.write_all(&bytes[..6])?;
     } else if bits_needed <= 49 {
         let encoded = (value << 7) | 0b011_1111;
-        let bytes = (encoded as u64).to_le_bytes();
+        let bytes = encoded.to_le_bytes();
         writer.write_all(&bytes[..7])?;
     } else {
         // 9 bytes: sentinel + raw u64
@@ -170,7 +170,7 @@ mod tests {
             encode_varint(val, &mut buf).unwrap();
             let mut cursor = Cursor::new(&buf);
             let decoded = decode_varint(&mut cursor).unwrap();
-            assert_eq!(decoded, val, "roundtrip failed for {}", val);
+            assert_eq!(decoded, val, "roundtrip failed for {val}");
         }
     }
 
@@ -180,13 +180,13 @@ mod tests {
         for val in [0u64, 1, 42, 63, 64, 127] {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf).unwrap();
-            assert_eq!(buf.len(), 1, "expected 1 byte for {}", val);
+            assert_eq!(buf.len(), 1, "expected 1 byte for {val}");
         }
         // 2 bytes for values 128..=8191 (14 bits available)
         for val in [128u64, 256, 8191] {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf).unwrap();
-            assert_eq!(buf.len(), 2, "expected 2 bytes for {}", val);
+            assert_eq!(buf.len(), 2, "expected 2 bytes for {val}");
         }
         // 9 bytes for large values
         let mut buf = Vec::new();

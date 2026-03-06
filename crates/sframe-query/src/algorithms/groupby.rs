@@ -28,6 +28,9 @@ use crate::algorithms::aggregators::AggSpec;
 use crate::execute::{compile, for_each_batch_sync, parallel_slice_row_count};
 use crate::planner::{clone_plan_with_row_range, Aggregator, PlannerNode};
 
+/// (hash, keys, aggregators) triple used during flush and merge.
+type GroupEntry = (u64, Vec<FlexType>, Vec<Box<dyn Aggregator>>);
+
 /// Default number of hash-partition segments.
 const DEFAULT_NUM_SEGMENTS: usize = 16;
 
@@ -251,7 +254,7 @@ fn write_output_to_cache(
     VirtualFileSystem::mkdir_p(&*vfs, &base_path)?;
 
     let seg_name = "seg.0000".to_string();
-    let seg_path = format!("{}/{}", base_path, seg_name);
+    let seg_path = format!("{base_path}/{seg_name}");
     let file = VirtualFileSystem::open_write(&*vfs, &seg_path)?;
     let mut seg_writer = SegmentWriter::new(file, num_cols);
 
@@ -278,8 +281,7 @@ fn write_output_to_cache(
 
     let num_segments = segments.len();
 
-    for seg_id in 0..num_segments {
-        let segment = &mut segments[seg_id];
+    for (seg_id, segment) in segments.iter_mut().enumerate().take(num_segments) {
 
         if let Some(state) = spill_state.as_mut() {
             if !state.chunks[seg_id].is_empty() {
@@ -421,7 +423,7 @@ fn flush_segment(
     state: &mut SpillState,
 ) -> Result<()> {
     // Collect and sort entries by (hash, keys) for merge-friendly ordering
-    let mut entries: Vec<(u64, Vec<FlexType>, Vec<Box<dyn Aggregator>>)> = groups
+    let mut entries: Vec<GroupEntry> = groups
         .drain()
         .map(|(key, mut aggs)| {
             let h = compute_key_hash(&key);
@@ -565,12 +567,14 @@ impl Ord for HeapEntry {
 }
 
 /// K-way merge of all chunks for a segment, writing directly to buffered output.
+// All parameters are distinct merge state; bundling into a struct would not simplify the API.
+#[allow(clippy::too_many_arguments)]
 fn merge_segment_chunks_buffered(
     state: &mut SpillState,
     seg_id: usize,
     num_key_cols: usize,
     agg_specs: &[AggSpec],
-    row_buffer: &mut Vec<Vec<FlexType>>,
+    row_buffer: &mut [Vec<FlexType>],
     seg_writer: &mut SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>,
     column_types: &[FlexTypeEnum],
     total_rows: &mut u64,
@@ -781,7 +785,7 @@ mod tests {
             let row = result.row(i);
             let city = match &row[0] {
                 FlexType::String(s) => s.to_string(),
-                other => panic!("Expected String, got {:?}", other),
+                other => panic!("Expected String, got {other:?}"),
             };
             results.insert(city, row[1..].to_vec());
         }
@@ -791,7 +795,7 @@ mod tests {
         assert_eq!(phoenix[1], FlexType::Integer(2));
         match &phoenix[2] {
             FlexType::Float(v) => assert!((v - 20.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
 
         let scottsdale = &results["Scottsdale"];
@@ -799,13 +803,13 @@ mod tests {
         assert_eq!(scottsdale[1], FlexType::Integer(2));
         match &scottsdale[2] {
             FlexType::Float(v) => assert!((v - 30.0).abs() < 1e-10),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]
@@ -845,7 +849,7 @@ mod tests {
             let row = result.row(i);
             match &row[1] {
                 FlexType::Integer(c) => total += c,
-                other => panic!("Expected Integer count, got {:?}", other),
+                other => panic!("Expected Integer count, got {other:?}"),
             }
         }
         assert_eq!(total, 11536);
@@ -920,7 +924,7 @@ mod tests {
                 let row = result.row(i);
                 let city = match &row[0] {
                     FlexType::String(s) => s.to_string(),
-                    other => panic!("Expected String, got {:?}", other),
+                    other => panic!("Expected String, got {other:?}"),
                 };
                 map.insert(city, row[1..].to_vec());
             }
@@ -933,21 +937,20 @@ mod tests {
         for (city, mem_vals) in &mem_map {
             let spill_vals = spill_map
                 .get(city)
-                .unwrap_or_else(|| panic!("City {} missing from spill result", city));
+                .unwrap_or_else(|| panic!("City {city} missing from spill result"));
             for (i, (m, s)) in mem_vals.iter().zip(spill_vals.iter()).enumerate() {
                 match (m, s) {
                     (FlexType::Integer(a), FlexType::Integer(b)) => {
-                        assert_eq!(a, b, "Mismatch for city {} agg {}", city, i);
+                        assert_eq!(a, b, "Mismatch for city {city} agg {i}");
                     }
                     (FlexType::Float(a), FlexType::Float(b)) => {
                         assert!(
                             (a - b).abs() < 1e-10,
-                            "Float mismatch for city {} agg {}: {} vs {}",
-                            city, i, a, b
+                            "Float mismatch for city {city} agg {i}: {a} vs {b}"
                         );
                     }
                     _ => {
-                        assert_eq!(m, s, "Type mismatch for city {} agg {}", city, i);
+                        assert_eq!(m, s, "Type mismatch for city {city} agg {i}");
                     }
                 }
             }

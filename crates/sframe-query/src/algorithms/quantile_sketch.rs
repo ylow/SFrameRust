@@ -92,7 +92,7 @@ impl QuantileSketch {
 
         // Sort the buffer
         let mut buf = std::mem::take(&mut self.buffer);
-        buf.sort_by(|a, b| compare_flex_type(a, b));
+        buf.sort_by(compare_flex_type);
 
         // Insert each buffered value
         for value in buf {
@@ -210,7 +210,7 @@ impl QuantileSketch {
         if self.tuples.is_empty() {
             // Everything is still in the buffer
             let mut sorted = self.buffer.clone();
-            sorted.sort_by(|a, b| compare_flex_type(a, b));
+            sorted.sort_by(compare_flex_type);
             let idx = ((quantile * (sorted.len() as f64 - 1.0)).round() as usize)
                 .min(sorted.len() - 1);
             return sorted[idx].clone();
@@ -375,8 +375,7 @@ mod tests {
             FlexType::Integer(v) => {
                 assert!(
                     (v - 5000).unsigned_abs() < 200,
-                    "median off: {} vs 5000",
-                    v
+                    "median off: {v} vs 5000"
                 );
             }
             _ => panic!("Expected Integer"),
@@ -404,13 +403,10 @@ mod tests {
                 FlexType::Integer(v) => {
                     assert!(
                         (*v - expected).unsigned_abs() < 200,
-                        "cut {} off: {} vs {}",
-                        i,
-                        v,
-                        expected
+                        "cut {i} off: {v} vs {expected}"
                     );
                 }
-                _ => panic!("Expected Integer at cut {}", i),
+                _ => panic!("Expected Integer at cut {i}"),
             }
         }
     }
@@ -442,8 +438,7 @@ mod tests {
             FlexType::Integer(v) => {
                 assert!(
                     (v - 5000).unsigned_abs() < 300,
-                    "merged median off: {} vs 5000",
-                    v
+                    "merged median off: {v} vs 5000"
                 );
             }
             _ => panic!("Expected Integer"),
@@ -511,8 +506,7 @@ mod tests {
             FlexType::Float(v) => {
                 assert!(
                     (v - 50.0).abs() < 3.0,
-                    "float median off: {} vs 50.0",
-                    v
+                    "float median off: {v} vs 50.0"
                 );
             }
             _ => panic!("Expected Float"),

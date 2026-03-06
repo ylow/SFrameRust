@@ -49,8 +49,7 @@ impl DirArchive {
                         if key == "version" {
                             version = value.parse().map_err(|_| {
                                 SFrameError::Format(format!(
-                                    "Invalid version in dir_archive.ini: {}",
-                                    value
+                                    "Invalid version in dir_archive.ini: {value}"
                                 ))
                             })?;
                         }
@@ -94,7 +93,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]

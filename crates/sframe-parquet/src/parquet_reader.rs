@@ -20,7 +20,7 @@ use crate::type_mapping::{arrow_type_to_sframe, record_batch_to_sframe_rows};
 pub fn read_parquet_schema(path: &str) -> Result<(Vec<String>, Vec<FlexTypeEnum>)> {
     let file = File::open(path).map_err(SFrameError::Io)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| SFrameError::Format(format!("Parquet error: {}", e)))?;
+        .map_err(|e| SFrameError::Format(format!("Parquet error: {e}")))?;
     let schema = builder.schema();
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let types: Vec<FlexTypeEnum> = schema
@@ -41,7 +41,7 @@ pub fn count_parquet_rows(paths: &[PathBuf]) -> Result<u64> {
     for path in paths {
         let file = File::open(path).map_err(SFrameError::Io)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| SFrameError::Format(format!("Parquet error: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Parquet error: {e}")))?;
         let metadata = builder.metadata();
         for rg in metadata.row_groups() {
             total += rg.num_rows() as u64;
@@ -83,7 +83,7 @@ pub fn read_parquet_batches(paths: &[PathBuf]) -> Result<BatchIterator> {
                 Ok(b) => b,
                 Err(e) => {
                     co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
-                        format!("Parquet error: {}", e),
+                        format!("Parquet error: {e}"),
                     ))))
                     .await;
                     return;
@@ -93,7 +93,7 @@ pub fn read_parquet_batches(paths: &[PathBuf]) -> Result<BatchIterator> {
                 Ok(r) => r,
                 Err(e) => {
                     co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
-                        format!("Parquet error: {}", e),
+                        format!("Parquet error: {e}"),
                     ))))
                     .await;
                     return;
@@ -105,7 +105,7 @@ pub fn read_parquet_batches(paths: &[PathBuf]) -> Result<BatchIterator> {
                     Ok(rb) => rb,
                     Err(e) => {
                         co.yield_(BatchResponse::Batch(Err(SFrameError::Format(
-                            format!("Parquet error: {}", e),
+                            format!("Parquet error: {e}"),
                         ))))
                         .await;
                         return;
@@ -147,14 +147,13 @@ pub fn read_parquet_batches(paths: &[PathBuf]) -> Result<BatchIterator> {
 pub fn resolve_parquet_paths(path: &str) -> Result<Vec<PathBuf>> {
     if path.contains('*') || path.contains('?') || path.contains('[') {
         let mut paths: Vec<PathBuf> = glob::glob(path)
-            .map_err(|e| SFrameError::Format(format!("Invalid glob pattern: {}", e)))?
+            .map_err(|e| SFrameError::Format(format!("Invalid glob pattern: {e}")))?
             .filter_map(|entry| entry.ok())
             .collect();
         paths.sort();
         if paths.is_empty() {
             return Err(SFrameError::Format(format!(
-                "No files matched pattern: {}",
-                path
+                "No files matched pattern: {path}"
             )));
         }
         Ok(paths)
@@ -163,7 +162,7 @@ pub fn resolve_parquet_paths(path: &str) -> Result<Vec<PathBuf>> {
         if !p.exists() {
             return Err(SFrameError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("File not found: {}", path),
+                format!("File not found: {path}"),
             )));
         }
         Ok(vec![p])
@@ -430,8 +429,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, SFrameError::Io(_)),
-            "Expected Io error, got: {:?}",
-            err
+            "Expected Io error, got: {err:?}"
         );
     }
 
@@ -473,8 +471,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, SFrameError::Format(ref msg) if msg.contains("No files matched")),
-            "Expected Format error about no matches, got: {:?}",
-            err
+            "Expected Format error about no matches, got: {err:?}"
         );
     }
 

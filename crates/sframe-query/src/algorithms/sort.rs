@@ -84,7 +84,7 @@ fn spill_sorted_run(
     run_id: usize,
 ) -> Result<SortedRunInfo> {
     let indices = build_sort_indices(buffer, keys);
-    let seg_path = format!("{}/run_{:04}", base_path, run_id);
+    let seg_path = format!("{base_path}/run_{run_id:04}");
     let file = vfs.open_write(&seg_path)?;
     let mut seg_writer = SegmentWriter::new(file, dtypes.len());
 
@@ -298,8 +298,8 @@ fn merge_sorted_runs(
 
             // Collect the full row from this run
             let run = &cursors[entry.run_idx];
-            for col in 0..ncols {
-                out_cols[col].push(run.current_value(col).clone());
+            for (col, out_col) in out_cols.iter_mut().enumerate().take(ncols) {
+                out_col.push(run.current_value(col).clone());
             }
 
             // Advance cursor
@@ -665,7 +665,7 @@ mod tests {
         let mut iter = sort(input, &[SortKey::asc(0)]).unwrap();
         let result = collect_batches(&mut iter);
 
-        let expected = vec![1, 1, 3, 4, 5];
+        let expected = [1, 1, 3, 4, 5];
         for (i, &exp) in expected.iter().enumerate() {
             assert_eq!(result.row(i), vec![FlexType::Integer(exp)]);
         }
@@ -685,11 +685,11 @@ mod tests {
         let mut iter = sort(input, &[SortKey::desc(0)]).unwrap();
         let result = collect_batches(&mut iter);
 
-        let expected = vec![3.5, 2.5, 1.5];
+        let expected = [3.5, 2.5, 1.5];
         for (i, &exp) in expected.iter().enumerate() {
             match &result.row(i)[0] {
                 FlexType::Float(v) => assert!((v - exp).abs() < 1e-10),
-                other => panic!("Expected Float, got {:?}", other),
+                other => panic!("Expected Float, got {other:?}"),
             }
         }
     }

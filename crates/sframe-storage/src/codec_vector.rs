@@ -35,8 +35,7 @@ pub fn decode_vectors(
     let total_values: i64 = lengths.iter().sum();
     if total_values < 0 {
         return Err(SFrameError::Format(format!(
-            "Negative total vector length: {}",
-            total_values
+            "Negative total vector length: {total_values}"
         )));
     }
 

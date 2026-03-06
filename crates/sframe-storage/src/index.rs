@@ -44,30 +44,30 @@ impl FrameIndex {
                     "sframe" => match key {
                         "version" => {
                             version = value.parse().map_err(|_| {
-                                SFrameError::Format(format!("Invalid version: {}", value))
+                                SFrameError::Format(format!("Invalid version: {value}"))
                             })?
                         }
                         "num_columns" => {
                             num_columns = value.parse().map_err(|_| {
-                                SFrameError::Format(format!("Invalid num_columns: {}", value))
+                                SFrameError::Format(format!("Invalid num_columns: {value}"))
                             })?
                         }
                         "nrows" => {
                             nrows = value.parse().map_err(|_| {
-                                SFrameError::Format(format!("Invalid nrows: {}", value))
+                                SFrameError::Format(format!("Invalid nrows: {value}"))
                             })?
                         }
                         _ => {}
                     },
                     "column_names" => {
                         let idx: usize = key.parse().map_err(|_| {
-                            SFrameError::Format(format!("Invalid column index: {}", key))
+                            SFrameError::Format(format!("Invalid column index: {key}"))
                         })?;
                         column_names.push((idx, value.to_string()));
                     }
                     "column_files" => {
                         let idx: usize = key.parse().map_err(|_| {
-                            SFrameError::Format(format!("Invalid column index: {}", key))
+                            SFrameError::Format(format!("Invalid column index: {key}"))
                         })?;
                         column_files.push((idx, value.to_string()));
                     }
@@ -127,7 +127,7 @@ impl GroupIndex {
     /// Parse a .sidx file content (JSON format).
     pub fn parse(content: &str) -> Result<Self> {
         let json: serde_json::Value = serde_json::from_str(content)
-            .map_err(|e| SFrameError::Format(format!("Invalid JSON in .sidx: {}", e)))?;
+            .map_err(|e| SFrameError::Format(format!("Invalid JSON in .sidx: {e}")))?;
 
         // Parse sarray section
         let sarray = json
@@ -153,10 +153,10 @@ impl GroupIndex {
         let mut segment_files: Vec<(usize, String)> = Vec::new();
         for (key, val) in seg_files_obj {
             let idx: usize = key.parse().map_err(|_| {
-                SFrameError::Format(format!("Invalid segment file key: {}", key))
+                SFrameError::Format(format!("Invalid segment file key: {key}"))
             })?;
             let filename = val.as_str().ok_or_else(|| {
-                SFrameError::Format(format!("Invalid segment file value for key {}", key))
+                SFrameError::Format(format!("Invalid segment file value for key {key}"))
             })?;
             segment_files.push((idx, filename.to_string()));
         }
@@ -187,7 +187,7 @@ impl GroupIndex {
                 .ok_or_else(|| SFrameError::Format("Missing __type__ in metadata".to_string()))?;
 
             let type_id: u8 = type_str.parse().map_err(|_| {
-                SFrameError::Format(format!("Invalid __type__ value: {}", type_str))
+                SFrameError::Format(format!("Invalid __type__ value: {type_str}"))
             })?;
             let dtype = FlexTypeEnum::try_from(type_id)?;
 
@@ -201,13 +201,13 @@ impl GroupIndex {
             let mut seg_sizes: Vec<(usize, u64)> = Vec::new();
             for (key, val) in seg_sizes_obj {
                 let idx: usize = key.parse().map_err(|_| {
-                    SFrameError::Format(format!("Invalid segment size key: {}", key))
+                    SFrameError::Format(format!("Invalid segment size key: {key}"))
                 })?;
                 let size_str = val.as_str().ok_or_else(|| {
-                    SFrameError::Format(format!("Invalid segment size value for key {}", key))
+                    SFrameError::Format(format!("Invalid segment size value for key {key}"))
                 })?;
                 let size: u64 = size_str.parse().map_err(|_| {
-                    SFrameError::Format(format!("Invalid segment size: {}", size_str))
+                    SFrameError::Format(format!("Invalid segment size: {size_str}"))
                 })?;
                 seg_sizes.push((idx, size));
             }
@@ -236,7 +236,7 @@ mod tests {
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        format!("{}/../../samples", manifest)
+        format!("{manifest}/../../samples")
     }
 
     #[test]

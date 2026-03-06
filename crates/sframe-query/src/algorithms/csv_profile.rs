@@ -19,9 +19,9 @@ mod tests {
         let mut buf = Vec::with_capacity(n * 60);
         buf.extend_from_slice(b"id,category,value,score,label\n");
         for i in 0..n {
-            write!(
+            writeln!(
                 buf,
-                "{},cat_{},{:.2},{},label_{}\n",
+                "{},cat_{},{:.2},{},label_{}",
                 i,
                 i % 100,
                 i as f64 * 0.1,
@@ -37,7 +37,7 @@ mod tests {
     #[ignore]
     fn profile_csv_phases() {
         let n = 1_000_000;
-        eprintln!("Generating {} rows...", n);
+        eprintln!("Generating {n} rows...");
         let data = generate_csv(n);
         eprintln!("CSV size: {:.1} MB", data.len() as f64 / 1e6);
 
@@ -129,10 +129,10 @@ mod tests {
             parse_time, parse_count as f64 / parse_time.as_secs_f64(), parse_count);
 
         eprintln!("\nSummary:");
-        eprintln!("  Parity scan:    {:?}", parity_time);
-        eprintln!("  Par tokenize:   {:?}", tokenize_time);
-        eprintln!("  Seq tokenize:   {:?}", seq_tokenize_time);
-        eprintln!("  Fused tok+parse:{:?}", fused_time);
-        eprintln!("  Seq parse_cell: {:?}", parse_time);
+        eprintln!("  Parity scan:    {parity_time:?}");
+        eprintln!("  Par tokenize:   {tokenize_time:?}");
+        eprintln!("  Seq tokenize:   {seq_tokenize_time:?}");
+        eprintln!("  Fused tok+parse:{fused_time:?}");
+        eprintln!("  Seq parse_cell: {parse_time:?}");
     }
 }

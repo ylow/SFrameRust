@@ -39,7 +39,7 @@ impl DenseBitset {
 
     /// Create a new bitset of the given length, all bits cleared.
     pub fn new(len: usize) -> Self {
-        let arrlen = (len + 63) / 64;
+        let arrlen = len.div_ceil(64);
         DenseBitset {
             len,
             words: vec![0u64; arrlen],

@@ -15,6 +15,9 @@ pub struct SFrameRows {
     num_rows: usize,
 }
 
+/// Shared reference to a dictionary (list of key-value pairs).
+pub type DictRef = Option<Arc<[(FlexType, FlexType)]>>;
+
 /// Typed column vector. `None` represents UNDEFINED/NULL.
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -23,7 +26,7 @@ pub enum ColumnData {
     String(Vec<Option<Arc<str>>>),
     Vector(Vec<Option<Arc<[f64]>>>),
     List(Vec<Option<Arc<[FlexType]>>>),
-    Dict(Vec<Option<Arc<[(FlexType, FlexType)]>>>),
+    Dict(Vec<DictRef>),
     DateTime(Vec<Option<FlexDateTime>>),
     /// Mixed-type column for UNDEFINED/per-value-parsed data.
     /// Uses `FlexType::Undefined` for null instead of `Option` wrapping.
@@ -270,7 +273,7 @@ impl ColumnData {
             ColumnData::List(v) => map_opt!(v, List),
             ColumnData::Dict(v) => map_opt!(v, Dict),
             ColumnData::DateTime(v) => map_opt!(v, DateTime),
-            ColumnData::Flexible(v) => v.iter().map(|val| func(val)).collect(),
+            ColumnData::Flexible(v) => v.iter().map(func).collect(),
         }
     }
 
@@ -750,7 +753,7 @@ mod tests {
         assert_eq!(batch.column(0).get(3), FlexType::Undefined);
         match batch.column(0).get(4) {
             FlexType::Dict(d) => assert_eq!(d.len(), 1),
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 

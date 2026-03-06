@@ -486,7 +486,7 @@ mod tests {
     fn test_parse_float_scientific() {
         match parse_flextype("1.5e10") {
             FlexType::Float(v) => assert!((v - 1.5e10).abs() < 1.0),
-            other => panic!("Expected Float, got {:?}", other),
+            other => panic!("Expected Float, got {other:?}"),
         }
     }
 
@@ -494,15 +494,15 @@ mod tests {
     fn test_parse_float_special() {
         match parse_flextype("inf") {
             FlexType::Float(v) => assert!(v.is_infinite() && v > 0.0),
-            other => panic!("Expected Float(inf), got {:?}", other),
+            other => panic!("Expected Float(inf), got {other:?}"),
         }
         match parse_flextype("-inf") {
             FlexType::Float(v) => assert!(v.is_infinite() && v < 0.0),
-            other => panic!("Expected Float(-inf), got {:?}", other),
+            other => panic!("Expected Float(-inf), got {other:?}"),
         }
         match parse_flextype("nan") {
             FlexType::Float(v) => assert!(v.is_nan()),
-            other => panic!("Expected Float(nan), got {:?}", other),
+            other => panic!("Expected Float(nan), got {other:?}"),
         }
     }
 
@@ -534,7 +534,7 @@ mod tests {
             FlexType::Vector(v) => {
                 assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]);
             }
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -544,7 +544,7 @@ mod tests {
             FlexType::Vector(v) => {
                 assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]);
             }
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -554,7 +554,7 @@ mod tests {
             FlexType::Vector(v) => {
                 assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]);
             }
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -565,7 +565,7 @@ mod tests {
             FlexType::Vector(v) => {
                 assert_eq!(v.as_ref(), &[1.0, 2.0, 3.0]);
             }
-            other => panic!("Expected Vector, got {:?}", other),
+            other => panic!("Expected Vector, got {other:?}"),
         }
     }
 
@@ -575,7 +575,7 @@ mod tests {
             FlexType::Vector(v) => {
                 assert_eq!(v.len(), 0);
             }
-            other => panic!("Expected empty Vector, got {:?}", other),
+            other => panic!("Expected empty Vector, got {other:?}"),
         }
     }
 
@@ -590,7 +590,7 @@ mod tests {
                 assert_eq!(v[1], FlexType::String(Arc::from("hello")));
                 assert_eq!(v[2], FlexType::Float(2.5));
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -601,14 +601,14 @@ mod tests {
                 assert_eq!(v.len(), 2);
                 match &v[0] {
                     FlexType::Vector(inner) => assert_eq!(inner.as_ref(), &[1.0, 2.0]),
-                    other => panic!("Expected Vector, got {:?}", other),
+                    other => panic!("Expected Vector, got {other:?}"),
                 }
                 match &v[1] {
                     FlexType::Vector(inner) => assert_eq!(inner.as_ref(), &[3.0, 4.0]),
-                    other => panic!("Expected Vector, got {:?}", other),
+                    other => panic!("Expected Vector, got {other:?}"),
                 }
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -624,7 +624,7 @@ mod tests {
                 assert_eq!(v[1].0, FlexType::String(Arc::from("b")));
                 assert_eq!(v[1].1, FlexType::Integer(2));
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 
@@ -636,7 +636,7 @@ mod tests {
                 assert_eq!(v[0].0, FlexType::String(Arc::from("a")));
                 assert_eq!(v[0].1, FlexType::Integer(1));
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 
@@ -646,7 +646,7 @@ mod tests {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 0);
             }
-            other => panic!("Expected empty Dict, got {:?}", other),
+            other => panic!("Expected empty Dict, got {other:?}"),
         }
     }
 
@@ -661,10 +661,10 @@ mod tests {
                         assert_eq!(inner[0].0, FlexType::String(Arc::from("b")));
                         assert_eq!(inner[0].1, FlexType::Integer(1));
                     }
-                    other => panic!("Expected Dict value, got {:?}", other),
+                    other => panic!("Expected Dict value, got {other:?}"),
                 }
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 
@@ -693,7 +693,7 @@ mod tests {
                 assert_eq!(v[1], FlexType::String(Arc::from("b")));
                 assert_eq!(v[2], FlexType::String(Arc::from("c")));
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -732,7 +732,7 @@ mod tests {
                     FlexType::String(Arc::from("value with spaces"))
                 );
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 
@@ -744,7 +744,7 @@ mod tests {
                 assert_eq!(v[0], FlexType::String(Arc::from("hello, world")));
                 assert_eq!(v[1], FlexType::String(Arc::from("foo")));
             }
-            other => panic!("Expected List, got {:?}", other),
+            other => panic!("Expected List, got {other:?}"),
         }
     }
 
@@ -759,7 +759,7 @@ mod tests {
                 assert_eq!(v[1].1, FlexType::Integer(30));
                 assert_eq!(v[2].1, FlexType::Float(9.5));
             }
-            other => panic!("Expected Dict, got {:?}", other),
+            other => panic!("Expected Dict, got {other:?}"),
         }
     }
 }

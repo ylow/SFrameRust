@@ -60,9 +60,7 @@ pub fn encode_typed_block(values: &[FlexType]) -> Result<Vec<u8>> {
         Some(t) => t,
         None => {
             // All undefined
-            let mut buf = Vec::new();
-            buf.push(1u8); // num_types = 1
-            buf.push(FlexTypeEnum::Undefined as u8);
+            let buf = vec![1u8, FlexTypeEnum::Undefined as u8]; // num_types = 1
             return Ok(buf);
         }
     };

@@ -246,8 +246,8 @@ mod tests {
 
         // Write files larger than cache
         for i in 0..5 {
-            let path = dir.path().join(format!("{}.txt", i));
-            std::fs::write(&path, format!("data-{}-padding-padding", i)).unwrap();
+            let path = dir.path().join(format!("{i}.txt"));
+            std::fs::write(&path, format!("data-{i}-padding-padding")).unwrap();
             let _ = fs.read_to_string(path.to_str().unwrap()).unwrap();
         }
 

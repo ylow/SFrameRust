@@ -121,8 +121,7 @@ pub fn decode_group(
         }
         _ => {
             return Err(SFrameError::Format(format!(
-                "Unknown codec type: {}",
-                codec
+                "Unknown codec type: {codec}"
             )));
         }
     }
@@ -168,7 +167,7 @@ pub fn skip_group(
     let pack_count = match codec {
         CODEC_FOR => group_size,
         CODEC_FOR_DELTA | CODEC_FOR_DELTA_NEGATIVE => {
-            if group_size > 1 { group_size - 1 } else { 0 }
+            group_size.saturating_sub(1)
         }
         _ => group_size,
     };
@@ -178,7 +177,7 @@ pub fn skip_group(
         reader.seek(SeekFrom::Current(skip_bytes as i64))?;
     } else {
         let total_bits = pack_count * nbits;
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = total_bits.div_ceil(8);
         reader.seek(SeekFrom::Current(total_bytes as i64))?;
     }
 
@@ -229,7 +228,7 @@ fn read_packed_values(
 
     // Calculate bytes needed
     let total_bits = count * bit_width;
-    let total_bytes = (total_bits + 7) / 8;
+    let total_bytes = total_bits.div_ceil(8);
 
     let mut packed = vec![0u8; total_bytes];
     reader.read_exact(&mut packed)?;
@@ -253,7 +252,7 @@ fn read_packed_values(
 
         // Read enough bytes to cover the value
         let mut val = 0u64;
-        let bytes_needed = ((bit_shift + bit_width) + 7) / 8;
+        let bytes_needed = (bit_shift + bit_width).div_ceil(8);
 
         for j in 0..bytes_needed.min(8) {
             if byte_offset + j < packed.len() {
@@ -454,7 +453,7 @@ fn write_packed_values(
 
     let count = values.len();
     let total_bits = count * bit_width;
-    let total_bytes = (total_bits + 7) / 8;
+    let total_bytes = total_bits.div_ceil(8);
 
     let mut packed = vec![0u8; total_bytes];
     let mask: u64 = (1u64 << bit_width) - 1;
@@ -584,7 +583,7 @@ mod tests {
     #[test]
     fn test_zigzag_encode_roundtrip() {
         for v in [-100i64, -2, -1, 0, 1, 2, 100, i64::MIN, i64::MAX] {
-            assert_eq!(zigzag_decode(zigzag_encode(v)), v, "zigzag roundtrip failed for {}", v);
+            assert_eq!(zigzag_decode(zigzag_encode(v)), v, "zigzag roundtrip failed for {v}");
         }
     }
 
@@ -645,7 +644,7 @@ mod tests {
             let mut encoded = Vec::new();
             encode_integers_for(&mut encoded, values).unwrap();
             let decoded = decode_integers_for(&encoded, values.len()).unwrap();
-            assert_eq!(&decoded, values, "roundtrip failed for test case {}", i);
+            assert_eq!(&decoded, values, "roundtrip failed for test case {i}");
         }
     }
 
@@ -663,7 +662,7 @@ mod tests {
         let expected = [0, 1, 2, 4, 8, 16, 32, 64];
         for (sp, &exp) in expected.iter().enumerate() {
             let nbits = if sp == 0 { 0 } else { 1usize << (sp - 1) };
-            assert_eq!(nbits, exp, "shiftpos {} → nbits {}, expected {}", sp, nbits, exp);
+            assert_eq!(nbits, exp, "shiftpos {sp} → nbits {nbits}, expected {exp}");
         }
     }
 

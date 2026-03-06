@@ -178,11 +178,8 @@ mod tests {
 
         let iter = BatchIterator::new(|co: BatchCo| async move {
             let cmd = co.yield_(BatchResponse::Ready).await;
-            match cmd {
-                BatchCommand::NextBatch => {
-                    co.yield_(BatchResponse::Batch(Ok(batch))).await;
-                }
-                _ => {}
+            if let BatchCommand::NextBatch = cmd {
+                co.yield_(BatchResponse::Batch(Ok(batch))).await;
             }
         });
 
@@ -274,8 +271,7 @@ mod tests {
         let err = result.unwrap().unwrap_err();
         assert!(
             matches!(err, SFrameError::Format(ref msg) if msg == "test error"),
-            "Expected Format error, got: {:?}",
-            err
+            "Expected Format error, got: {err:?}"
         );
     }
 
