@@ -11,8 +11,11 @@
 
 use rayon::prelude::*;
 
+use sframe_io::cache_fs::global_cache_fs;
+use sframe_io::vfs::VirtualFileSystem;
+use sframe_storage::segment_writer::SegmentWriter;
 use sframe_types::error::Result;
-use sframe_types::flex_type::FlexType;
+use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::batch::SFrameRows;
 use crate::execute::BatchIterator;
@@ -45,6 +48,56 @@ impl SortKey {
             order: SortOrder::Descending,
         }
     }
+}
+
+/// Metadata for a sorted run stored as a segment on CacheFs.
+struct SortedRunInfo {
+    path: String,
+    num_rows: u64,
+}
+
+/// RAII guard that removes the sort scratch directory from CacheFs on drop.
+struct SortCleanup {
+    base_path: String,
+}
+
+impl Drop for SortCleanup {
+    fn drop(&mut self) {
+        let _ = global_cache_fs().remove_dir(&self.base_path);
+    }
+}
+
+/// Sort the buffer in memory and write the sorted data as a segment to CacheFs.
+///
+/// Uses index-based sorting to avoid creating a full sorted copy.
+/// Data is written in `source_batch_size` chunks so the segment has
+/// multiple blocks for efficient sub-range reads during merge.
+fn spill_sorted_run(
+    buffer: &SFrameRows,
+    keys: &[SortKey],
+    dtypes: &[FlexTypeEnum],
+    vfs: &dyn VirtualFileSystem,
+    base_path: &str,
+    run_id: usize,
+) -> Result<SortedRunInfo> {
+    let indices = build_sort_indices(buffer, keys);
+    let seg_path = format!("{}/run_{:04}", base_path, run_id);
+    let file = vfs.open_write(&seg_path)?;
+    let mut seg_writer = SegmentWriter::new(file, dtypes.len());
+
+    let chunk_size = sframe_config::global().source_batch_size;
+    for chunk in indices.chunks(chunk_size) {
+        for (col_idx, col) in buffer.columns().iter().enumerate() {
+            let values: Vec<FlexType> = chunk.iter().map(|&i| col.get(i)).collect();
+            seg_writer.write_column_block(col_idx, &values, dtypes[col_idx])?;
+        }
+    }
+
+    seg_writer.finish()?;
+    Ok(SortedRunInfo {
+        path: seg_path,
+        num_rows: buffer.num_rows() as u64,
+    })
 }
 
 /// Sort a batch stream by the given keys.
@@ -133,8 +186,6 @@ pub fn estimate_batch_size(batch: &SFrameRows) -> usize {
     if n == 0 {
         return 0;
     }
-
-    let _config = sframe_config::global();
 
     let mut size = 0usize;
     for col_idx in 0..batch.num_columns() {
@@ -341,5 +392,43 @@ mod tests {
         let size = estimate_batch_size(&batch);
         // 2 rows × (9 bytes for int + 9 bytes for float) = 36
         assert_eq!(size, 36);
+    }
+
+    #[test]
+    fn test_spill_sorted_run() {
+        use sframe_io::cache_fs::global_cache_fs;
+        use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
+        use sframe_storage::segment_reader::SegmentReader;
+
+        let rows = vec![
+            vec![FlexType::Integer(3), FlexType::String("c".into())],
+            vec![FlexType::Integer(1), FlexType::String("a".into())],
+            vec![FlexType::Integer(2), FlexType::String("b".into())],
+        ];
+        let dtypes = [FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+
+        let cache_fs = global_cache_fs();
+        let vfs: std::sync::Arc<dyn VirtualFileSystem> =
+            std::sync::Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+        let base_path = cache_fs.alloc_dir();
+        VirtualFileSystem::mkdir_p(&*vfs, &base_path).unwrap();
+
+        let keys = [SortKey::asc(0)];
+        let info = spill_sorted_run(&batch, &keys, &dtypes, &*vfs, &base_path, 0).unwrap();
+        assert_eq!(info.num_rows, 3);
+
+        // Read back via SegmentReader and verify sorted order
+        let file = vfs.open_read(&info.path).unwrap();
+        let file_size = file.size().unwrap();
+        let mut reader = SegmentReader::open(Box::new(file), file_size, dtypes.to_vec()).unwrap();
+        let col0 = reader.read_column(0).unwrap();
+        // Data should be sorted by column 0: 1, 2, 3
+        assert_eq!(col0, vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)]);
+        let col1 = reader.read_column(1).unwrap();
+        // Column 1 should follow the sort order: a, b, c
+        assert_eq!(col1, vec![FlexType::String("a".into()), FlexType::String("b".into()), FlexType::String("c".into())]);
+
+        let _ = cache_fs.remove_dir(&base_path);
     }
 }
