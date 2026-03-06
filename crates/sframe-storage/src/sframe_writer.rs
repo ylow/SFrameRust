@@ -6,23 +6,12 @@
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
-use rayon::prelude::*;
 use sframe_io::local_fs::LocalFileSystem;
 use sframe_io::vfs::{VirtualFileSystem, WritableFile};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
-use crate::block_encode::encode_typed_block;
-use crate::segment_writer::SegmentWriter;
-
-/// Target block size in bytes (64KB like C++).
-const TARGET_BLOCK_SIZE: usize = 64 * 1024;
-
-/// Minimum rows per block.
-const MIN_ROWS_PER_BLOCK: usize = 8;
-
-/// Maximum rows per block.
-const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
+use crate::segment_writer::BufferedSegmentWriter;
 
 /// Default number of rows per segment before auto-splitting.
 /// Set to u64::MAX so segments are 1:1 with writer threads; block-level
@@ -120,18 +109,17 @@ pub fn write_sframe(
 
 /// Write a single segment file containing all rows.
 ///
-/// Each column is written independently with its own block size. The block
-/// size starts from a static type-based estimate and is refined online after
-/// each block write using the actual compressed size, targeting ~64KB blocks.
+/// Each column is written independently with adaptive block sizing
+/// handled by `BufferedSegmentWriter`.
 fn write_segment(
     path: &str,
-    num_columns: usize,
+    _num_columns: usize,
     column_types: &[FlexTypeEnum],
     rows: &[Vec<FlexType>],
 ) -> Result<Vec<u64>> {
     let file = std::fs::File::create(path).map_err(SFrameError::Io)?;
     let buf_writer = BufWriter::new(file);
-    let mut seg_writer = SegmentWriter::new(buf_writer, num_columns);
+    let mut seg_writer = BufferedSegmentWriter::new(buf_writer, column_types);
 
     if rows.is_empty() {
         return seg_writer.finish();
@@ -139,57 +127,16 @@ fn write_segment(
 
     let nrows = rows.len();
 
-    // Write each column independently with adaptive block sizing
-    for col in 0..num_columns {
-        let bpv = estimate_bytes_per_value(column_types[col]).max(1);
-        let mut rows_per_block = (TARGET_BLOCK_SIZE / bpv)
-            .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
-
-        let mut total_encoded_bytes: u64 = 0;
-        let mut total_encoded_values: u64 = 0;
-
-        let mut row_offset = 0;
-        while row_offset < nrows {
-            let block_end = (row_offset + rows_per_block).min(nrows);
-            let values: Vec<FlexType> = rows[row_offset..block_end]
-                .iter()
-                .map(|row| row[col].clone())
-                .collect();
-            let on_disk_bytes = seg_writer.write_column_block(
-                col,
-                &values,
-                column_types[col],
-            )?;
-
-            // Update online estimate
-            total_encoded_bytes += on_disk_bytes;
-            total_encoded_values += (block_end - row_offset) as u64;
-            let avg_bpv = total_encoded_bytes as f64 / total_encoded_values as f64;
-            if avg_bpv > 0.0 {
-                rows_per_block = (TARGET_BLOCK_SIZE as f64 / avg_bpv) as usize;
-                rows_per_block = rows_per_block
-                    .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
-            }
-
-            row_offset = block_end;
-        }
+    // Write each column independently
+    for col in 0..column_types.len() {
+        let values: Vec<FlexType> = rows[0..nrows]
+            .iter()
+            .map(|row| row[col].clone())
+            .collect();
+        seg_writer.write_column_block(col, &values, column_types[col])?;
     }
 
     seg_writer.finish()
-}
-
-/// Rough estimate of bytes per value for a given column type, used for block sizing.
-fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
-    match dtype {
-        FlexTypeEnum::Integer => 8,
-        FlexTypeEnum::Float => 8,
-        FlexTypeEnum::String => 32,
-        FlexTypeEnum::Vector => 64,
-        FlexTypeEnum::List => 64,
-        FlexTypeEnum::Dict => 64,
-        FlexTypeEnum::DateTime => 12,
-        FlexTypeEnum::Undefined => 1,
-    }
 }
 
 /// Build the .sidx JSON content string.
@@ -383,30 +330,20 @@ pub struct SFrameWriter {
     column_names: Vec<String>,
     column_types: Vec<FlexTypeEnum>,
     data_prefix: String,
-    /// Per-column block sizes, adapted online from actual compressed sizes.
-    /// Initialized from a static type-based estimate, then refined after
-    /// each block write using cumulative average bytes-per-value.
-    per_column_rows_per_block: Vec<usize>,
     rows_per_segment: u64,
     num_columns: usize,
 
     // Current segment state
-    seg_writer: SegmentWriter<Box<dyn WritableFile>>,
+    seg_writer: BufferedSegmentWriter<Box<dyn WritableFile>>,
     current_segment_idx: usize,
-    /// Total rows received (appended to buffers) for the current segment.
+    /// Total rows received for the current segment.
     rows_in_current_segment: u64,
 
     // Accumulated metadata across all finished segments
     segment_files: Vec<String>,
     all_segment_sizes: Vec<Vec<u64>>,
 
-    // Cross-batch buffering (per-column, may have different lengths after flushing)
-    column_buffers: Vec<Vec<FlexType>>,
     total_rows: u64,
-
-    // Online block-size estimation: cumulative encoded bytes and values per column
-    col_encoded_bytes: Vec<u64>,
-    col_encoded_values: Vec<u64>,
 
     // User metadata
     metadata: std::collections::HashMap<String, String>,
@@ -473,22 +410,12 @@ impl SFrameWriter {
 
         vfs.mkdir_p(base_path)?;
 
-        let per_column_rows_per_block: Vec<usize> = column_types
-            .iter()
-            .map(|&dtype| {
-                let bpv = estimate_bytes_per_value(dtype).max(1);
-                (TARGET_BLOCK_SIZE / bpv)
-                    .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
-                    .min(rows_per_segment as usize)
-            })
-            .collect();
-
-        let seg_writer = create_segment_writer_vfs(
+        let seg_writer = create_buffered_segment_writer_vfs(
             &*vfs,
             base_path,
             &data_prefix,
             0,
-            num_columns,
+            column_types,
         )?;
 
         Ok(SFrameWriter {
@@ -497,7 +424,6 @@ impl SFrameWriter {
             column_names: column_names.iter().map(|s| s.to_string()).collect(),
             column_types: column_types.to_vec(),
             data_prefix,
-            per_column_rows_per_block,
             rows_per_segment,
             num_columns,
             seg_writer,
@@ -505,10 +431,7 @@ impl SFrameWriter {
             rows_in_current_segment: 0,
             segment_files: Vec::new(),
             all_segment_sizes: Vec::new(),
-            column_buffers: vec![Vec::new(); num_columns],
             total_rows: 0,
-            col_encoded_bytes: vec![0; num_columns],
-            col_encoded_values: vec![0; num_columns],
             metadata: std::collections::HashMap::new(),
         })
     }
@@ -521,9 +444,9 @@ impl SFrameWriter {
     /// Write a batch of column data. Each element of `columns` contains
     /// the values for one column. All columns must have the same length.
     ///
-    /// Data is buffered internally. Each column flushes blocks independently
-    /// based on its per-column block size (determined by type). When a segment
-    /// fills up, all remaining buffers are flushed and a new segment starts.
+    /// Data is buffered internally by `BufferedSegmentWriter` and flushed
+    /// in blocks of approximately 64KB. When a segment fills up, it is
+    /// finalized and a new segment starts.
     pub fn write_columns(&mut self, columns: &[Vec<FlexType>]) -> Result<()> {
         if columns.is_empty() {
             return Ok(());
@@ -547,8 +470,7 @@ impl SFrameWriter {
             // How many rows can the current segment still accept?
             let segment_remaining = (self.rows_per_segment - self.rows_in_current_segment) as usize;
             if segment_remaining == 0 {
-                // Segment is full — flush remaining buffers and split
-                self.flush_all_buffers()?;
+                // Segment is full — finish and start a new one
                 self.finish_current_segment()?;
                 self.start_new_segment()?;
                 continue;
@@ -556,123 +478,20 @@ impl SFrameWriter {
 
             let chunk_size = (num_rows - offset).min(segment_remaining);
 
-            // Append chunk to buffers
-            for (buf, col_data) in self.column_buffers.iter_mut().zip(columns.iter()) {
-                buf.extend_from_slice(&col_data[offset..offset + chunk_size]);
+            for (col_idx, col_data) in columns.iter().enumerate() {
+                self.seg_writer.write_column_block(
+                    col_idx,
+                    &col_data[offset..offset + chunk_size],
+                    self.column_types[col_idx],
+                )?;
             }
+
             self.rows_in_current_segment += chunk_size as u64;
             self.total_rows += chunk_size as u64;
             offset += chunk_size;
-
-            // Flush ready blocks per column
-            self.flush_ready_columns()?;
         }
 
         Ok(())
-    }
-
-    /// Flush all complete blocks from each column's buffer independently.
-    /// Encoding + LZ4 compression is parallelized across blocks, then
-    /// the encoded results are written to the segment file sequentially.
-    fn flush_ready_columns(&mut self) -> Result<()> {
-        self.flush_blocks_parallel(false)
-    }
-
-    /// Flush all remaining buffered data for every column as partial blocks.
-    fn flush_all_buffers(&mut self) -> Result<()> {
-        self.flush_blocks_parallel(true)
-    }
-
-    /// Shared implementation for flush_ready_columns and flush_all_buffers.
-    /// When `flush_all` is true, drains all remaining data (partial blocks).
-    fn flush_blocks_parallel(&mut self, flush_all: bool) -> Result<()> {
-        // 1. Determine block boundaries and collect slices to encode.
-        //    Each entry: (col_idx, start_offset, block_size)
-        let mut block_specs: Vec<(usize, usize, usize)> = Vec::new();
-
-        for col_idx in 0..self.num_columns {
-            let buf_len = self.column_buffers[col_idx].len();
-            let rows_per_block = self.per_column_rows_per_block[col_idx];
-            let mut offset = 0;
-
-            while offset + rows_per_block <= buf_len {
-                block_specs.push((col_idx, offset, rows_per_block));
-                offset += rows_per_block;
-            }
-            if flush_all && offset < buf_len {
-                block_specs.push((col_idx, offset, buf_len - offset));
-            }
-        }
-
-        if block_specs.is_empty() {
-            return Ok(());
-        }
-
-        // 2. Encode + compress all blocks in parallel.
-        //    Each thread reads from the column buffer (immutable slice).
-        const COMPRESS_THRESHOLD: f64 = 0.9;
-        let buffers = &self.column_buffers;
-
-        let encoded_blocks: Vec<Result<(Vec<u8>, u64, bool)>> = block_specs
-            .par_iter()
-            .map(|&(col_idx, start, size)| {
-                let block = &buffers[col_idx][start..start + size];
-                let encoded = encode_typed_block(block)?;
-                let uncompressed_size = encoded.len() as u64;
-                let compressed = lz4_flex::compress(&encoded);
-                let use_compression =
-                    (compressed.len() as f64) < COMPRESS_THRESHOLD * (uncompressed_size as f64);
-                if use_compression {
-                    Ok((compressed, uncompressed_size, true))
-                } else {
-                    Ok((encoded, uncompressed_size, false))
-                }
-            })
-            .collect();
-
-        // 3. Write encoded blocks sequentially and update metadata.
-        for (i, result) in encoded_blocks.into_iter().enumerate() {
-            let (data, uncompressed_size, is_compressed) = result?;
-            let (col_idx, _, block_size) = block_specs[i];
-            let on_disk_bytes = self.seg_writer.write_pre_encoded_block(
-                col_idx,
-                &data,
-                uncompressed_size,
-                block_size as u64,
-                is_compressed,
-                self.column_types[col_idx],
-            )?;
-            self.update_block_size(col_idx, block_size as u64, on_disk_bytes);
-        }
-
-        // 4. Drain processed rows from column buffers.
-        //    Calculate total drained per column.
-        let mut drained_per_col = vec![0usize; self.num_columns];
-        for &(col_idx, _, size) in &block_specs {
-            drained_per_col[col_idx] += size;
-        }
-        for (col_idx, &drained) in drained_per_col.iter().enumerate().take(self.num_columns) {
-            if drained > 0 {
-                self.column_buffers[col_idx].drain(..drained);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Update the per-column block size estimate using the actual compressed
-    /// size from the most recent block write (cumulative average).
-    fn update_block_size(&mut self, col_idx: usize, num_values: u64, on_disk_bytes: u64) {
-        self.col_encoded_bytes[col_idx] += on_disk_bytes;
-        self.col_encoded_values[col_idx] += num_values;
-        let avg_bpv = self.col_encoded_bytes[col_idx] as f64
-            / self.col_encoded_values[col_idx] as f64;
-        if avg_bpv > 0.0 {
-            let new_rpb = (TARGET_BLOCK_SIZE as f64 / avg_bpv) as usize;
-            self.per_column_rows_per_block[col_idx] = new_rpb
-                .clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
-                .min(self.rows_per_segment as usize);
-        }
     }
 
     /// Finish the current segment: write its footer and record its metadata.
@@ -680,9 +499,9 @@ impl SFrameWriter {
         // Swap in a NullWriter placeholder while we finish the current segment.
         let seg_writer = std::mem::replace(
             &mut self.seg_writer,
-            SegmentWriter::new(
+            BufferedSegmentWriter::new(
                 Box::new(NullWriter) as Box<dyn WritableFile>,
-                self.num_columns,
+                &self.column_types,
             ),
         );
 
@@ -698,12 +517,12 @@ impl SFrameWriter {
         self.current_segment_idx += 1;
         self.rows_in_current_segment = 0;
 
-        let seg_writer = create_segment_writer_vfs(
+        let seg_writer = create_buffered_segment_writer_vfs(
             &*self.vfs,
             &self.base_path,
             &self.data_prefix,
             self.current_segment_idx,
-            self.num_columns,
+            &self.column_types,
         )?;
         self.seg_writer = seg_writer;
         Ok(())
@@ -714,10 +533,7 @@ impl SFrameWriter {
     ///
     /// Returns the total number of rows written.
     pub fn finish(mut self) -> Result<u64> {
-        // Flush any remaining buffered rows as a partial block
-        self.flush_all_buffers()?;
-
-        // Finish the current (last) segment
+        // Finish the current (last) segment (flushes remaining buffered data)
         let segment_sizes = self.seg_writer.finish()?;
         let segment_file = segment_filename(&self.data_prefix, self.current_segment_idx);
         self.segment_files.push(segment_file);
@@ -825,18 +641,18 @@ fn segment_filename(data_prefix: &str, segment_idx: usize) -> String {
     format!("{data_prefix}.{segment_idx:04}")
 }
 
-/// Create a new SegmentWriter via VFS for the given segment index.
-fn create_segment_writer_vfs(
+/// Create a new BufferedSegmentWriter via VFS for the given segment index.
+fn create_buffered_segment_writer_vfs(
     vfs: &dyn VirtualFileSystem,
     base_path: &str,
     data_prefix: &str,
     segment_idx: usize,
-    num_columns: usize,
-) -> Result<SegmentWriter<Box<dyn WritableFile>>> {
+    dtypes: &[FlexTypeEnum],
+) -> Result<BufferedSegmentWriter<Box<dyn WritableFile>>> {
     let segment_file = segment_filename(data_prefix, segment_idx);
     let segment_path = format!("{base_path}/{segment_file}");
     let file = vfs.open_write(&segment_path)?;
-    Ok(SegmentWriter::new(file, num_columns))
+    Ok(BufferedSegmentWriter::new(file, dtypes))
 }
 
 /// Generate a deterministic hash prefix from the path.
