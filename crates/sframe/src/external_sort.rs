@@ -162,6 +162,116 @@ fn build_sketch_parallel(
     Ok(combined)
 }
 
+/// Phase 3 (parallel): Partition data using N rayon readers and P MPSC writer threads.
+///
+/// Each reader reads a row-range slice, classifies rows by partition, and sends
+/// batched column data through sync_channels to P writer threads. Each writer
+/// drains its channel into an SFrameBuilder.
+fn partition_data_parallel(
+    plan: &Arc<PlannerNode>,
+    sf: &SFrame,
+    primary_key: &SortKey,
+    cut_points: &[FlexType],
+    total_rows: u64,
+) -> Result<Vec<SFrame>> {
+    let num_partitions = cut_points.len() + 1;
+    let column_names = sf.column_names().to_vec();
+    let dtypes = sf.column_types();
+    let key_column = primary_key.column;
+    let ncols = dtypes.len();
+    let n_workers = rayon::current_num_threads().max(1);
+    let worker_plans = make_worker_plans(plan, total_rows, n_workers);
+
+    // Create P MPSC channels (one per partition)
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_partitions)
+        .map(|_| std::sync::mpsc::sync_channel::<Vec<Vec<FlexType>>>(CHANNEL_BUFFER_DEPTH))
+        .unzip();
+
+    // Spawn P writer threads — each drains its channel into an SFrameBuilder
+    let writer_handles: Vec<std::thread::JoinHandle<Result<SFrame>>> = receivers
+        .into_iter()
+        .map(|rx| {
+            let names = column_names.clone();
+            let dt = dtypes.clone();
+            std::thread::spawn(move || {
+                let mut builder = SFrameBuilder::anonymous(names, dt)?;
+                for columns in rx {
+                    builder.write_columns(&columns)?;
+                }
+                builder.finish()
+            })
+        })
+        .collect();
+
+    // N rayon readers: read slice -> scatter rows -> send to channels
+    let reader_results: Vec<Result<()>> = worker_plans
+        .into_par_iter()
+        .map(|wp| {
+            let my_senders: Vec<_> = senders.iter().cloned().collect();
+            let mut iter = compile(&wp)?;
+
+            // Per-partition row buffers (column-major)
+            let mut bufs: Vec<Vec<Vec<FlexType>>> = (0..num_partitions)
+                .map(|_| (0..ncols).map(|_| Vec::new()).collect())
+                .collect();
+
+            while let Some(batch_result) = iter.next_batch() {
+                let batch = batch_result?;
+                for row_idx in 0..batch.num_rows() {
+                    let key_val = batch.column(key_column).get(row_idx);
+                    let part_idx = find_partition(&key_val, cut_points);
+                    for col_idx in 0..ncols {
+                        bufs[part_idx][col_idx].push(batch.column(col_idx).get(row_idx));
+                    }
+                    if bufs[part_idx][0].len() >= PARTITION_FLUSH_ROWS {
+                        let buf = std::mem::replace(
+                            &mut bufs[part_idx],
+                            (0..ncols).map(|_| Vec::new()).collect(),
+                        );
+                        my_senders[part_idx]
+                            .send(buf)
+                            .map_err(|_| SFrameError::Format(
+                                "Partition writer closed unexpectedly".into(),
+                            ))?;
+                    }
+                }
+            }
+
+            // Flush remaining buffers
+            for (part_idx, buf) in bufs.into_iter().enumerate() {
+                if !buf.is_empty() && !buf[0].is_empty() {
+                    my_senders[part_idx]
+                        .send(buf)
+                        .map_err(|_| SFrameError::Format(
+                            "Partition writer closed unexpectedly".into(),
+                        ))?;
+                }
+            }
+            drop(my_senders);
+            Ok(())
+        })
+        .collect();
+
+    // Close original senders so writer threads see EOF
+    drop(senders);
+
+    // Check reader errors
+    for r in reader_results {
+        r?;
+    }
+
+    // Collect writer results
+    let mut partitions = Vec::with_capacity(num_partitions);
+    for handle in writer_handles {
+        let result = handle
+            .join()
+            .map_err(|_| SFrameError::Format("Partition writer thread panicked".into()))?;
+        partitions.push(result?);
+    }
+
+    Ok(partitions)
+}
+
 /// Phase 3: Partition data by the primary sort key using the cut points.
 ///
 /// Produces `cut_points.len() + 1` partitions. For ascending sort:
@@ -419,6 +529,51 @@ mod tests {
         let rows = sorted.iter_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![FlexType::Integer(42)]);
+    }
+
+    #[test]
+    fn test_partition_data_parallel() {
+        // Values 0..999 should scatter across partitions
+        let n = 1000i64;
+        let values: Vec<FlexType> = (0..n).map(FlexType::Integer).collect();
+        let sf = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(values, FlexTypeEnum::Integer).unwrap(),
+        )])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part_test.sf");
+        sf.save(path.to_str().unwrap()).unwrap();
+        let sf2 = SFrame::read(path.to_str().unwrap()).unwrap();
+
+        let plan = sf2.fuse_plan().unwrap();
+        let total_rows = parallel_slice_row_count(&plan).unwrap();
+
+        // Use cut points [250, 500, 750] -> 4 partitions
+        let cut_points = vec![
+            FlexType::Integer(250),
+            FlexType::Integer(500),
+            FlexType::Integer(750),
+        ];
+        let primary_key = SortKey::asc(0);
+
+        let partitions =
+            partition_data_parallel(&plan, &sf2, &primary_key, &cut_points, total_rows).unwrap();
+        assert_eq!(partitions.len(), 4);
+
+        // Total rows across all partitions should equal input
+        let total: u64 = partitions.iter().map(|p| p.num_rows().unwrap_or(0)).sum();
+        assert_eq!(total, n as u64);
+
+        // Each partition should have roughly 250 rows
+        for (i, p) in partitions.iter().enumerate() {
+            let rows = p.num_rows().unwrap_or(0);
+            assert!(
+                rows > 200 && rows < 300,
+                "partition {i} has {rows} rows, expected ~250"
+            );
+        }
     }
 
     #[test]
