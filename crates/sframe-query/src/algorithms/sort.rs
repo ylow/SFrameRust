@@ -357,11 +357,11 @@ fn merge_sorted_runs(
 /// Sort a batch stream by the given keys.
 ///
 /// Streams input batches into a memory-bounded buffer. When the buffer
-/// exceeds `SFRAME_SORT_BUFFER_SIZE`, sorts and spills to CacheFs.
+/// exceeds `SFRAME_SORT_MAX_MEMORY / nthreads`, sorts and spills to CacheFs.
 /// After all input, either returns sorted data directly (fast path)
 /// or k-way merges the sorted runs (external sort path).
 pub fn sort(input: BatchIterator, keys: &[SortKey]) -> Result<BatchIterator> {
-    let budget = sframe_config::global().sort_memory_budget;
+    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
     sort_with_budget(input, keys, budget)
 }
 

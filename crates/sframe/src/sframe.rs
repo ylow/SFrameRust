@@ -757,7 +757,7 @@ impl SFrame {
 
         // Estimate data size and decide between in-memory vs external sort
         let estimated_size = self.estimate_size();
-        let budget = sframe_config::global().sort_memory_budget;
+        let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
 
         if estimated_size <= budget {
             self.sort_in_memory(&sort_keys)

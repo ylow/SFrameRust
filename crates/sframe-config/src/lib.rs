@@ -10,7 +10,6 @@
 //! - `SFRAME_CACHE_CAPACITY`: CacheFs in-memory store limit (default 2G)
 //! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Max single file in cache (default 2G)
 //! - `SFRAME_SOURCE_BATCH_SIZE`: Rows per batch (default 4096)
-//! - `SFRAME_SORT_BUFFER_SIZE`: Sort memory budget (default 256M)
 //! - `SFRAME_SORT_MAX_MEMORY`: Max total memory for external sort phase (default 4G)
 //! - `SFRAME_GROUPBY_BUFFER_NUM_ROWS`: Groupby hash table limit (default 1048576)
 //! - `SFRAME_JOIN_BUFFER_NUM_CELLS`: Join hash table limit (default 50000000)
@@ -39,9 +38,6 @@ pub struct SFrameConfig {
     // --- Immutable after init ---
     /// Batch size for source operators (rows per batch).
     pub source_batch_size: usize,
-    /// Memory budget for in-memory sort. If estimated data size exceeds
-    /// this, external sort is used.
-    pub sort_memory_budget: usize,
     /// Maximum total memory (RSS) allowed for the external sort phase.
     /// Used with `cache_capacity` to form the RSS goal:
     /// `G = cache_capacity + sort_max_memory`.
@@ -84,7 +80,6 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
     let mut cache_cap = DEFAULT_CACHE_CAPACITY;
     let mut cache_cap_per_file = DEFAULT_CACHE_CAPACITY_PER_FILE;
     let mut source_batch_size: usize = 4096;
-    let mut sort_memory_budget: usize = 256 * 1024 * 1024;
     let mut sort_max_memory: usize = DEFAULT_SORT_MAX_MEMORY;
     let mut groupby_buffer_num_rows: usize = 1_048_576;
     let mut join_buffer_num_cells: usize = 50_000_000;
@@ -104,11 +99,6 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
     if let Ok(val) = std::env::var("SFRAME_SOURCE_BATCH_SIZE") {
         if let Ok(n) = val.parse::<usize>() {
             source_batch_size = n;
-        }
-    }
-    if let Ok(val) = std::env::var("SFRAME_SORT_BUFFER_SIZE") {
-        if let Ok(n) = parse_byte_size(&val) {
-            sort_memory_budget = n;
         }
     }
     if let Ok(val) = std::env::var("SFRAME_SORT_MAX_MEMORY") {
@@ -141,7 +131,6 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
         cache_capacity: AtomicUsize::new(cache_cap),
         cache_capacity_per_file: AtomicUsize::new(cache_cap_per_file),
         source_batch_size,
-        sort_memory_budget,
         sort_max_memory,
         groupby_buffer_num_rows,
         join_buffer_num_cells,
