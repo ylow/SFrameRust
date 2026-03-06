@@ -6,6 +6,7 @@ members = [
     "crates/sframe-io",
     "crates/sframe-storage",
     "crates/sframe-query",
+    "crates/sframe-parquet",
     "crates/sframe",
     "crates/sframe-py",
 ]
