@@ -6,7 +6,7 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 /// Convert a FlexType to a Python object.
-pub fn flextype_to_py(py: Python<'_>, val: &FlexType) -> PyObject {
+pub fn flextype_to_py(py: Python<'_>, val: &FlexType) -> Py<PyAny> {
     match val {
         FlexType::Integer(i) => i.into_pyobject(py).unwrap().into_any().unbind(),
         FlexType::Float(f) => f.into_pyobject(py).unwrap().into_any().unbind(),
@@ -16,7 +16,7 @@ pub fn flextype_to_py(py: Python<'_>, val: &FlexType) -> PyObject {
             list.into_any().unbind()
         }
         FlexType::List(items) => {
-            let py_items: Vec<PyObject> = items.iter().map(|x| flextype_to_py(py, x)).collect();
+            let py_items: Vec<Py<PyAny>> = items.iter().map(|x| flextype_to_py(py, x)).collect();
             let list = PyList::new(py, &py_items).unwrap();
             list.into_any().unbind()
         }
@@ -45,26 +45,26 @@ pub fn py_to_flextype(obj: &Bound<'_, PyAny>) -> PyResult<FlexType> {
         return Ok(FlexType::Undefined);
     }
     // Bool must be checked before int (bool is a subclass of int in Python)
-    if let Ok(b) = obj.downcast::<PyBool>() {
+    if let Ok(b) = obj.cast::<PyBool>() {
         return Ok(FlexType::Integer(if b.is_true() { 1 } else { 0 }));
     }
     // Int
-    if let Ok(i) = obj.downcast::<PyInt>() {
+    if let Ok(i) = obj.cast::<PyInt>() {
         let val: i64 = i.extract()?;
         return Ok(FlexType::Integer(val));
     }
     // Float
-    if let Ok(f) = obj.downcast::<PyFloat>() {
+    if let Ok(f) = obj.cast::<PyFloat>() {
         let val: f64 = f.extract()?;
         return Ok(FlexType::Float(val));
     }
     // String
-    if let Ok(s) = obj.downcast::<PyString>() {
+    if let Ok(s) = obj.cast::<PyString>() {
         let val: String = s.extract()?;
         return Ok(FlexType::String(Arc::from(val.as_str())));
     }
     // Dict
-    if let Ok(d) = obj.downcast::<PyDict>() {
+    if let Ok(d) = obj.cast::<PyDict>() {
         let mut pairs = Vec::new();
         for (k, v) in d.iter() {
             pairs.push((py_to_flextype(&k)?, py_to_flextype(&v)?));
@@ -72,12 +72,12 @@ pub fn py_to_flextype(obj: &Bound<'_, PyAny>) -> PyResult<FlexType> {
         return Ok(FlexType::Dict(Arc::from(pairs)));
     }
     // List
-    if let Ok(l) = obj.downcast::<PyList>() {
+    if let Ok(l) = obj.cast::<PyList>() {
         // Check if all elements are numeric -> Vector
         let items: Vec<Bound<'_, PyAny>> = l.iter().collect();
         let all_numeric = !items.is_empty()
             && items.iter().all(|item| {
-                item.downcast::<PyFloat>().is_ok() || item.downcast::<PyInt>().is_ok()
+                item.cast::<PyFloat>().is_ok() || item.cast::<PyInt>().is_ok()
             });
         if all_numeric {
             let floats: Vec<f64> = items

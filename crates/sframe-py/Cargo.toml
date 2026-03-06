@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 sframe_core = { path = "../sframe", package = "sframe" }
 sframe-types = { path = "../sframe-types" }
 sframe-query = { path = "../sframe-query" }
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.28", features = ["extension-module"] }

@@ -25,7 +25,7 @@ impl PySArray {
 /// This prevents deadlocks when Rust parallel execution needs to call back
 /// into Python (e.g. Python lambdas in apply/filter).
 fn allow<T: Send>(py: Python<'_>, f: impl FnOnce() -> sframe_types::error::Result<T> + Send) -> PyResult<T> {
-    py.allow_threads(f).into_pyresult()
+    py.detach(f).into_pyresult()
 }
 
 #[pymethods]
@@ -72,17 +72,17 @@ impl PySArray {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{inner}"))
+        py.detach(move || format!("{inner}"))
     }
 
     fn __str__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{inner}"))
+        py.detach(move || format!("{inner}"))
     }
 
     /// First n values as a Python list.
     #[pyo3(signature = (n=10))]
-    fn head(&self, n: usize, py: Python<'_>) -> PyResult<PyObject> {
+    fn head(&self, n: usize, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let vals = allow(py, move || inner.head(n))?;
         let list = PyList::new(py, vals.iter().map(|v| flextype_to_py(py, v)))?;
@@ -91,7 +91,7 @@ impl PySArray {
 
     /// Last n values as a Python list.
     #[pyo3(signature = (n=10))]
-    fn tail(&self, n: usize, py: Python<'_>) -> PyResult<PyObject> {
+    fn tail(&self, n: usize, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let vals = allow(py, move || inner.tail(n))?;
         let list = PyList::new(py, vals.iter().map(|v| flextype_to_py(py, v)))?;
@@ -99,7 +99,7 @@ impl PySArray {
     }
 
     /// All values as a Python list.
-    fn to_list(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_list(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let vals = allow(py, move || inner.to_vec())?;
         let list = PyList::new(py, vals.iter().map(|v| flextype_to_py(py, v)))?;
@@ -189,39 +189,39 @@ impl PySArray {
 
     // ── Reductions ──────────────────────────────────────────────────
 
-    fn sum(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn sum(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.sum())?;
         Ok(flextype_to_py(py, &val))
     }
 
-    fn min(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn min(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.min_val())?;
         Ok(flextype_to_py(py, &val))
     }
 
-    fn max(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn max(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.max_val())?;
         Ok(flextype_to_py(py, &val))
     }
 
-    fn mean(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn mean(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.mean())?;
         Ok(flextype_to_py(py, &val))
     }
 
     #[pyo3(signature = (ddof=1))]
-    fn std(&self, ddof: u8, py: Python<'_>) -> PyResult<PyObject> {
+    fn std(&self, ddof: u8, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.std_dev(ddof))?;
         Ok(flextype_to_py(py, &val))
     }
 
     #[pyo3(signature = (ddof=1))]
-    fn var(&self, ddof: u8, py: Python<'_>) -> PyResult<PyObject> {
+    fn var(&self, ddof: u8, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let val = allow(py, move || inner.variance(ddof))?;
         Ok(flextype_to_py(py, &val))
@@ -313,7 +313,7 @@ impl PySArray {
         allow(py, move || inner.approx_count_distinct())
     }
 
-    fn frequent_items(&self, k: usize, py: Python<'_>) -> PyResult<PyObject> {
+    fn frequent_items(&self, k: usize, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let items = allow(py, move || inner.frequent_items(k))?;
         let list = PyList::new(
@@ -436,14 +436,14 @@ impl PySArray {
     // ── Apply / Filter (Python lambda support) ──────────────────────
 
     #[pyo3(signature = (func, dtype=None))]
-    fn apply(&self, func: PyObject, dtype: Option<&str>) -> PyResult<PySArray> {
+    fn apply(&self, func: Py<PyAny>, dtype: Option<&str>) -> PyResult<PySArray> {
         let output_type = match dtype {
             Some(s) => py_str_to_dtype(s)?,
             None => self.inner.dtype(),
         };
         let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> =
             Arc::new(move |v: &FlexType| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let py_val = flextype_to_py(py, v);
                     match func.call1(py, (py_val,)) {
                         Ok(r) => py_to_flextype(r.bind(py)).unwrap_or(FlexType::Undefined),
@@ -455,13 +455,13 @@ impl PySArray {
     }
 
     #[pyo3(name = "filter")]
-    fn py_filter(&self, func: PyObject) -> PyResult<PySArray> {
+    fn py_filter(&self, func: Py<PyAny>) -> PyResult<PySArray> {
         let pred: Arc<dyn Fn(&FlexType) -> bool + Send + Sync> =
             Arc::new(move |v: &FlexType| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let py_val = flextype_to_py(py, v);
                     match func.call1(py, (py_val,)) {
-                        Ok(r) => r.is_truthy(py).unwrap_or(false),
+                        Ok(r) => r.bind(py).is_truthy().unwrap_or(false),
                         Err(_) => false,
                     }
                 })
@@ -485,7 +485,7 @@ impl PySArray {
         let inner = slf.inner.clone();
         let (rx, col_idx) = slf
             .py()
-            .allow_threads(move || inner.batch_channel(2))
+            .detach(move || inner.batch_channel(2))
             .into_pyresult()?;
         Ok(PySArrayIter {
             receiver: std::sync::Mutex::new(rx),
@@ -501,14 +501,14 @@ impl PySArray {
         ))
     }
 
-    fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyObject> {
+    fn __getitem__(&self, key: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Integer index -> single value
         if let Ok(index) = key.extract::<isize>() {
             return self.getitem_int(index, py);
         }
 
         // Slice -> lazy SArray
-        if let Ok(slice) = key.downcast::<pyo3::types::PySlice>() {
+        if let Ok(slice) = key.cast::<pyo3::types::PySlice>() {
             return self.getitem_slice(slice, py);
         }
 
@@ -542,7 +542,7 @@ impl PySArrayIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         loop {
             // Yield from current batch if available.
             if let Some(batch) = &self.current_batch {
@@ -585,7 +585,7 @@ enum BinOp {
 }
 
 impl PySArray {
-    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<PyObject> {
+    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let len = allow(py, move || inner.len())? as isize;
         let idx = if index < 0 { len + index } else { index };
@@ -608,7 +608,7 @@ impl PySArray {
         &self,
         slice: &Bound<'_, pyo3::types::PySlice>,
         py: Python<'_>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let len = allow(py, move || inner.len())? as isize;
 

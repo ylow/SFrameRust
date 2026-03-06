@@ -44,7 +44,7 @@ impl PySFrameStreamWriter {
         let mut expected_len: Option<usize> = None;
 
         for (i, (_key, val)) in data.iter().enumerate() {
-            let list = val.downcast::<PyList>().map_err(|_| {
+            let list = val.cast::<PyList>().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err("Column values must be lists")
             })?;
 

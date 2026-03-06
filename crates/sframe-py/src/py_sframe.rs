@@ -21,7 +21,7 @@ fn allow<T: Send>(
     py: Python<'_>,
     f: impl FnOnce() -> sframe_types::error::Result<T> + Send,
 ) -> PyResult<T> {
-    py.allow_threads(f).into_pyresult()
+    py.detach(f).into_pyresult()
 }
 
 /// A lazy dataframe backed by the Rust SFrame.
@@ -69,7 +69,7 @@ impl PySFrame {
     #[staticmethod]
     #[pyo3(signature = (path))]
     fn from_parquet(path: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
-        if let Ok(list) = path.downcast::<PyList>() {
+        if let Ok(list) = path.cast::<PyList>() {
             let paths: Vec<String> = list
                 .iter()
                 .map(|item| item.extract::<String>())
@@ -181,12 +181,12 @@ impl PySFrame {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{inner}"))
+        py.detach(move || format!("{inner}"))
     }
 
     fn __str__(&self, py: Python<'_>) -> String {
         let inner = self.inner.clone();
-        py.allow_threads(move || format!("{inner}"))
+        py.detach(move || format!("{inner}"))
     }
 
     // ── Column access ───────────────────────────────────────────────
@@ -245,7 +245,7 @@ impl PySFrame {
 
     // ── Indexing ────────────────────────────────────────────────────
 
-    fn __getitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn __getitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = key.py();
 
         // Integer index -> single row as dict
@@ -254,7 +254,7 @@ impl PySFrame {
         }
 
         // Slice -> lazy SFrame
-        if let Ok(slice) = key.downcast::<pyo3::types::PySlice>() {
+        if let Ok(slice) = key.cast::<pyo3::types::PySlice>() {
             return self.getitem_slice(slice, py);
         }
 
@@ -268,7 +268,7 @@ impl PySFrame {
         }
 
         // List of strings -> select columns
-        if let Ok(list) = key.downcast::<PyList>() {
+        if let Ok(list) = key.cast::<PyList>() {
             if let Ok(names) = list
                 .iter()
                 .map(|item| item.extract::<String>())
@@ -331,13 +331,13 @@ impl PySFrame {
     }
 
     #[pyo3(name = "filter")]
-    fn py_filter(&self, column_name: &str, func: PyObject) -> PyResult<PySFrame> {
+    fn py_filter(&self, column_name: &str, func: Py<PyAny>) -> PyResult<PySFrame> {
         let pred: Arc<dyn Fn(&FlexType) -> bool + Send + Sync> =
             Arc::new(move |v: &FlexType| {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let py_val = flextype_to_py(py, v);
                     match func.call1(py, (py_val,)) {
-                        Ok(r) => r.is_truthy(py).unwrap_or(false),
+                        Ok(r) => r.bind(py).is_truthy().unwrap_or(false),
                         Err(_) => false,
                     }
                 })
@@ -467,7 +467,7 @@ impl PySFrame {
             return Ok(PySFrame::new(sf));
         }
 
-        if let Ok(d) = on.downcast::<PyDict>() {
+        if let Ok(d) = on.cast::<PyDict>() {
             let pairs: Vec<(String, String)> = d
                 .iter()
                 .map(|(k, v)| {
@@ -575,7 +575,7 @@ impl PySFrame {
 
     // ── Iteration ───────────────────────────────────────────────────
 
-    fn iter_rows(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn iter_rows(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let rows = allow(py, move || inner.iter_rows())?;
         let names = self.inner.column_names();
@@ -594,7 +594,7 @@ impl PySFrame {
         let inner = slf.inner.clone();
         let rx = slf
             .py()
-            .allow_threads(move || inner.batch_channel(2))
+            .detach(move || inner.batch_channel(2))
             .into_pyresult()?;
         let names = slf.inner.column_names().to_vec();
         Ok(PySFrameIter {
@@ -607,7 +607,7 @@ impl PySFrame {
 }
 
 impl PySFrame {
-    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<PyObject> {
+    fn getitem_int(&self, index: isize, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let len = allow(py, move || inner.num_rows())? as isize;
         let idx = if index < 0 { len + index } else { index };
@@ -634,7 +634,7 @@ impl PySFrame {
         &self,
         slice: &Bound<'_, pyo3::types::PySlice>,
         py: Python<'_>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let len = allow(py, move || inner.num_rows())? as isize;
 
@@ -687,7 +687,7 @@ impl PySFrameIter {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         loop {
             // Yield from current batch if available.
             if let Some(batch) = &self.current_batch {
@@ -737,10 +737,10 @@ fn parse_sort_keys(
         return Ok(vec![(name, order)]);
     }
 
-    if let Ok(list) = spec.downcast::<PyList>() {
+    if let Ok(list) = spec.cast::<PyList>() {
         let mut keys = Vec::new();
         for item in list.iter() {
-            if let Ok(tup) = item.downcast::<PyTuple>() {
+            if let Ok(tup) = item.cast::<PyTuple>() {
                 if tup.len() == 2 {
                     let name: String = tup.get_item(0)?.extract()?;
                     let asc: bool = tup.get_item(1)?.extract()?;
