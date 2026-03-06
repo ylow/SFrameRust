@@ -349,6 +349,61 @@ impl SFrame {
         builder.finish()
     }
 
+    /// Read one or more Parquet files into an SFrame.
+    ///
+    /// The `path` may be a single file path or a glob pattern (e.g.
+    /// `"data/*.parquet"`). Schemas are read from the first matched file;
+    /// all files must share the same schema.
+    ///
+    /// Data is streamed through the parquet reader and written to an
+    /// anonymous cache-backed SFrame in `DEFAULT_CHUNK_SIZE` chunks.
+    pub fn from_parquet(path: &str) -> Result<Self> {
+        let paths = sframe_parquet::parquet_reader::resolve_parquet_paths(path)?;
+        Self::from_parquet_files_inner(&paths)
+    }
+
+    /// Read an explicit list of Parquet files into an SFrame.
+    ///
+    /// Schemas are read from the first file; all files must share the
+    /// same schema.
+    pub fn from_parquet_files(paths: &[&str]) -> Result<Self> {
+        let path_bufs: Vec<std::path::PathBuf> =
+            paths.iter().map(|p| std::path::PathBuf::from(p)).collect();
+        Self::from_parquet_files_inner(&path_bufs)
+    }
+
+    /// Shared implementation for `from_parquet` and `from_parquet_files`.
+    fn from_parquet_files_inner(paths: &[std::path::PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(SFrameError::Format(
+                "No parquet files provided".to_string(),
+            ));
+        }
+
+        let (column_names, column_types) =
+            sframe_parquet::parquet_reader::read_parquet_schema(paths[0].to_str().unwrap())?;
+
+        if column_names.is_empty() {
+            let batch = SFrameRows::empty(&column_types);
+            let plan = PlannerNode::materialized(batch);
+            let columns: Vec<SArray> = column_types
+                .iter()
+                .enumerate()
+                .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(0), i))
+                .collect();
+            return Ok(SFrame::new_with_columns(columns, column_names));
+        }
+
+        let mut builder = SFrameBuilder::anonymous(column_names.clone(), column_types.clone())?;
+        let mut iter = sframe_parquet::parquet_reader::read_parquet_batches(paths)?;
+        while let Some(batch_result) = iter.next_batch() {
+            let batch = batch_result?;
+            builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
+        }
+
+        builder.finish()
+    }
+
     /// Build an SFrame from named columns.
     pub fn from_columns(cols: Vec<(&str, SArray)>) -> Result<Self> {
         let column_names: Vec<String> = cols.iter().map(|(name, _)| name.to_string()).collect();
@@ -1491,6 +1546,81 @@ impl SFrame {
     pub fn to_json(&self, path: &str) -> Result<()> {
         let batch = self.materialize_batch()?;
         json_io::write_json_file(path, &batch, &self.column_names)
+    }
+
+    /// Write to a single Parquet file.
+    ///
+    /// Streams batches to disk — does not materialize the full frame in memory.
+    pub fn to_parquet(&self, path: &str) -> Result<()> {
+        let stream = self.compile_stream()?;
+        let names = self.column_names.clone();
+        let types = self.column_types();
+        sframe_parquet::parquet_writer::write_parquet(
+            stream,
+            &names,
+            &types,
+            std::path::Path::new(path),
+        )
+    }
+
+    /// Write to sharded Parquet files with parallel execution.
+    ///
+    /// Output files are named `{prefix}_{i}_of_{N}.parquet`.
+    ///
+    /// If the query plan is parallel-sliceable (no Reduce, Append, etc.),
+    /// each shard is written in parallel using rayon. Otherwise, falls back
+    /// to writing a single shard sequentially.
+    pub fn to_parquet_sharded(&self, prefix: &str) -> Result<()> {
+        use rayon::prelude::*;
+        use sframe_query::execute::parallel_slice_row_count;
+        use sframe_query::planner::clone_plan_with_row_range;
+
+        let plan = self.fuse_plan()?;
+        let names = self.column_names.clone();
+        let types = self.column_types();
+
+        // Check if parallel slicing is possible
+        if let Some(total_rows) = parallel_slice_row_count(&plan) {
+            let n_workers = rayon::current_num_threads().max(1);
+
+            // Build per-worker plans with row ranges
+            let worker_plans: Vec<(usize, Arc<PlannerNode>)> = (0..n_workers)
+                .filter_map(|i| {
+                    let begin = (i as u64 * total_rows) / n_workers as u64;
+                    let end = ((i as u64 + 1) * total_rows) / n_workers as u64;
+                    if begin >= end {
+                        return None;
+                    }
+                    Some((i, clone_plan_with_row_range(&plan, begin, end)))
+                })
+                .collect();
+
+            let actual_shards = worker_plans.len();
+
+            // Execute in parallel
+            let results: Vec<Result<()>> = worker_plans
+                .into_par_iter()
+                .map(|(i, worker_plan)| {
+                    let iter = compile(&worker_plan)?;
+                    sframe_parquet::parquet_writer::write_parquet_shard(
+                        iter, &names, &types, prefix, i, actual_shards,
+                    )
+                })
+                .collect();
+
+            // Propagate any worker error
+            for result in results {
+                result?;
+            }
+
+            Ok(())
+        } else {
+            // Fallback: single-threaded sequential write to one shard
+            let stream = self.compile_stream()?;
+            sframe_parquet::parquet_writer::write_parquet_shard(
+                stream, &names, &types, prefix, 0, 1,
+            )
+        }
     }
 
     /// Iterate over rows.
@@ -2662,5 +2792,319 @@ mod tests {
         // Verify other columns survived the pipeline
         let ids = filtered.column("id").unwrap().to_vec().unwrap();
         assert_eq!(ids.len(), filtered_scores.len());
+    }
+
+    // ===================== Parquet integration tests =====================
+
+    /// Helper: write a test Parquet file with (id: i64, name: string) columns.
+    fn write_test_parquet(path: &std::path::Path, ids: &[i64], names: &[&str]) {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::Compression;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let id_array = Int64Array::from(ids.to_vec());
+        let name_array = StringArray::from(names.to_vec());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(path).unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn test_from_parquet_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.parquet");
+        write_test_parquet(&path, &[10, 20, 30], &["alpha", "beta", "gamma"]);
+
+        let sf = SFrame::from_parquet(path.to_str().unwrap()).unwrap();
+        assert_eq!(sf.num_rows().unwrap(), 3);
+        assert_eq!(sf.num_columns(), 2);
+        assert_eq!(sf.column_names(), &["id", "name"]);
+        assert_eq!(
+            sf.column_types(),
+            vec![FlexTypeEnum::Integer, FlexTypeEnum::String]
+        );
+
+        let rows = sf.iter_rows().unwrap();
+        assert_eq!(rows[0][0], FlexType::Integer(10));
+        assert_eq!(rows[1][0], FlexType::Integer(20));
+        assert_eq!(rows[2][0], FlexType::Integer(30));
+        assert_eq!(rows[0][1], FlexType::String("alpha".into()));
+        assert_eq!(rows[1][1], FlexType::String("beta".into()));
+        assert_eq!(rows[2][1], FlexType::String("gamma".into()));
+    }
+
+    #[test]
+    fn test_from_parquet_glob_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_parquet(&dir.path().join("part0.parquet"), &[1, 2], &["a", "b"]);
+        write_test_parquet(&dir.path().join("part1.parquet"), &[3, 4], &["c", "d"]);
+
+        let pattern = format!("{}/*.parquet", dir.path().to_str().unwrap());
+        let sf = SFrame::from_parquet(&pattern).unwrap();
+        assert_eq!(sf.num_rows().unwrap(), 4);
+        assert_eq!(sf.num_columns(), 2);
+
+        let rows = sf.iter_rows().unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                FlexType::Integer(v) => *v,
+                _ => panic!("expected integer"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_from_parquet_files_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.parquet");
+        let p2 = dir.path().join("b.parquet");
+        write_test_parquet(&p1, &[100], &["x"]);
+        write_test_parquet(&p2, &[200], &["y"]);
+
+        let sf = SFrame::from_parquet_files(&[
+            p1.to_str().unwrap(),
+            p2.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(sf.num_rows().unwrap(), 2);
+        assert_eq!(sf.num_columns(), 2);
+
+        let rows = sf.iter_rows().unwrap();
+        assert_eq!(rows[0][0], FlexType::Integer(100));
+        assert_eq!(rows[1][0], FlexType::Integer(200));
+    }
+
+    #[test]
+    fn test_to_parquet_roundtrip() {
+        let sf = SFrame::from_columns(vec![
+            (
+                "x",
+                SArray::from_vec(
+                    vec![FlexType::Integer(1), FlexType::Integer(2), FlexType::Integer(3)],
+                    FlexTypeEnum::Integer,
+                )
+                .unwrap(),
+            ),
+            (
+                "y",
+                SArray::from_vec(
+                    vec![
+                        FlexType::String("a".into()),
+                        FlexType::String("b".into()),
+                        FlexType::String("c".into()),
+                    ],
+                    FlexTypeEnum::String,
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.parquet");
+        sf.to_parquet(path.to_str().unwrap()).unwrap();
+
+        // Read back
+        let sf2 = SFrame::from_parquet(path.to_str().unwrap()).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), 3);
+        assert_eq!(sf2.num_columns(), 2);
+        assert_eq!(sf2.column_names(), &["x", "y"]);
+
+        let rows = sf2.iter_rows().unwrap();
+        assert_eq!(rows[0][0], FlexType::Integer(1));
+        assert_eq!(rows[1][0], FlexType::Integer(2));
+        assert_eq!(rows[2][0], FlexType::Integer(3));
+        assert_eq!(rows[0][1], FlexType::String("a".into()));
+        assert_eq!(rows[1][1], FlexType::String("b".into()));
+        assert_eq!(rows[2][1], FlexType::String("c".into()));
+    }
+
+    #[test]
+    fn test_to_parquet_sharded_roundtrip() {
+        // Use a materialized SFrame (from_columns creates MaterializedSource),
+        // which is not parallel-sliceable, so this tests the fallback path.
+        let sf = SFrame::from_columns(vec![(
+            "val",
+            SArray::from_vec(
+                vec![
+                    FlexType::Integer(10),
+                    FlexType::Integer(20),
+                    FlexType::Integer(30),
+                ],
+                FlexTypeEnum::Integer,
+            )
+            .unwrap(),
+        )])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("shard").to_str().unwrap().to_string();
+        sf.to_parquet_sharded(&prefix).unwrap();
+
+        // Since from_columns is not sliceable, should produce a single shard
+        let shard_path = format!("{}_0_of_1.parquet", prefix);
+        assert!(
+            std::path::Path::new(&shard_path).exists(),
+            "Expected shard file at {}",
+            shard_path
+        );
+
+        // Read back via glob
+        let pattern = format!("{}_*.parquet", prefix);
+        let sf2 = SFrame::from_parquet(&pattern).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), 3);
+
+        let rows = sf2.iter_rows().unwrap();
+        assert_eq!(rows[0][0], FlexType::Integer(10));
+        assert_eq!(rows[1][0], FlexType::Integer(20));
+        assert_eq!(rows[2][0], FlexType::Integer(30));
+    }
+
+    #[test]
+    fn test_to_parquet_sharded_parallel_path() {
+        // Create an SFrame from an on-disk SFrame source, which IS
+        // parallel-sliceable.
+        let dir = tempfile::tempdir().unwrap();
+
+        // First, build an SFrame on disk
+        let sf = SFrame::from_columns(vec![
+            (
+                "id",
+                SArray::from_vec(
+                    (0..100).map(|i| FlexType::Integer(i)).collect(),
+                    FlexTypeEnum::Integer,
+                )
+                .unwrap(),
+            ),
+            (
+                "val",
+                SArray::from_vec(
+                    (0..100).map(|i| FlexType::Float(i as f64 * 0.5)).collect(),
+                    FlexTypeEnum::Float,
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        let sf_path = dir.path().join("source.sf");
+        sf.save(sf_path.to_str().unwrap()).unwrap();
+
+        // Read it back — now it has an SFrameSource plan (parallel-sliceable)
+        let sf_disk = SFrame::read(sf_path.to_str().unwrap()).unwrap();
+
+        let prefix = dir.path().join("out").to_str().unwrap().to_string();
+        sf_disk.to_parquet_sharded(&prefix).unwrap();
+
+        // Should produce multiple shards (at least 1)
+        let pattern = format!("{}_*.parquet", prefix);
+        let shard_files = sframe_parquet::parquet_reader::resolve_parquet_paths(&pattern).unwrap();
+        assert!(
+            !shard_files.is_empty(),
+            "Expected at least one shard file"
+        );
+
+        // Read all shards and verify total row count
+        let sf_back = SFrame::from_parquet(&pattern).unwrap();
+        assert_eq!(sf_back.num_rows().unwrap(), 100);
+
+        // Verify all 100 ids are present (order may vary due to shard
+        // filename lexicographic sorting not matching shard index order
+        // when there are >= 10 shards).
+        let rows = sf_back.iter_rows().unwrap();
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                FlexType::Integer(v) => *v,
+                _ => panic!("expected integer"),
+            })
+            .collect();
+        ids.sort();
+        let expected: Vec<i64> = (0..100).collect();
+        assert_eq!(ids, expected);
+
+        // Verify id-value pairs are consistent
+        for row in &rows {
+            if let (FlexType::Integer(id), FlexType::Float(val)) = (&row[0], &row[1]) {
+                assert_eq!(*val, *id as f64 * 0.5, "id={} val={}", id, val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parquet_roundtrip_with_floats_and_nulls() {
+        let sf = SFrame::from_columns(vec![
+            (
+                "i",
+                SArray::from_vec(
+                    vec![FlexType::Integer(1), FlexType::Undefined, FlexType::Integer(3)],
+                    FlexTypeEnum::Integer,
+                )
+                .unwrap(),
+            ),
+            (
+                "f",
+                SArray::from_vec(
+                    vec![FlexType::Float(1.5), FlexType::Float(2.5), FlexType::Undefined],
+                    FlexTypeEnum::Float,
+                )
+                .unwrap(),
+            ),
+            (
+                "s",
+                SArray::from_vec(
+                    vec![
+                        FlexType::Undefined,
+                        FlexType::String("hello".into()),
+                        FlexType::String("world".into()),
+                    ],
+                    FlexTypeEnum::String,
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.parquet");
+        sf.to_parquet(path.to_str().unwrap()).unwrap();
+
+        let sf2 = SFrame::from_parquet(path.to_str().unwrap()).unwrap();
+        assert_eq!(sf2.num_rows().unwrap(), 3);
+        assert_eq!(sf2.num_columns(), 3);
+
+        let rows = sf2.iter_rows().unwrap();
+        // Row 0: (1, 1.5, Undefined)
+        assert_eq!(rows[0][0], FlexType::Integer(1));
+        assert_eq!(rows[0][1], FlexType::Float(1.5));
+        assert_eq!(rows[0][2], FlexType::Undefined);
+        // Row 1: (Undefined, 2.5, "hello")
+        assert_eq!(rows[1][0], FlexType::Undefined);
+        assert_eq!(rows[1][1], FlexType::Float(2.5));
+        assert_eq!(rows[1][2], FlexType::String("hello".into()));
+        // Row 2: (3, Undefined, "world")
+        assert_eq!(rows[2][0], FlexType::Integer(3));
+        assert_eq!(rows[2][1], FlexType::Undefined);
+        assert_eq!(rows[2][2], FlexType::String("world".into()));
     }
 }

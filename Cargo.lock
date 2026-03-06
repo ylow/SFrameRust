@@ -2587,7 +2587,10 @@ dependencies = [
 name = "sframe"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "futures",
+ "parquet",
+ "rayon",
  "sframe-config",
  "sframe-io",
  "sframe-parquet",
