@@ -2622,6 +2622,7 @@ dependencies = [
  "arrow",
  "glob",
  "parquet",
+ "serde_json",
  "sframe-query",
  "sframe-types",
  "tempfile",

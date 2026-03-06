@@ -9,6 +9,7 @@ sframe-query = { path = "../sframe-query" }
 arrow = "58"
 parquet = { version = "58", features = ["arrow", "snap"] }
 glob = "0.3"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
