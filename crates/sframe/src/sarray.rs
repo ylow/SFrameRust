@@ -87,6 +87,25 @@ impl SArray {
         Ok(data.len() as u64)
     }
 
+    /// Display the logical and execution plans for this array.
+    ///
+    /// Shows the DAG of operations that will be executed when this array
+    /// is materialized.
+    pub fn explain(&self) -> String {
+        use sframe_query::optimizer;
+
+        let mut buf = String::new();
+
+        buf.push_str("Logical Plan:\n");
+        buf.push_str(&self.plan.explain());
+
+        let optimized = optimizer::optimize(&self.plan);
+        buf.push_str("\nExecution Plan:\n");
+        buf.push_str(&optimized.explain());
+
+        buf
+    }
+
     /// Materialize and return all values.
     pub fn to_vec(&self) -> Result<Vec<FlexType>> {
         let data = self.materialize_column()?;

@@ -474,6 +474,11 @@ impl PySArray {
         Ok(PySArray::new(result))
     }
 
+    /// Display the logical and execution plans for this array.
+    fn explain(&self) -> String {
+        self.inner.explain()
+    }
+
     // ── Iteration ───────────────────────────────────────────────────
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PySArrayIter> {
@@ -507,8 +512,14 @@ impl PySArray {
             return self.getitem_slice(slice, py);
         }
 
+        // SArray mask -> logical_filter
+        if let Ok(mask) = key.extract::<PyRef<PySArray>>() {
+            let result = self.inner.logical_filter(&mask.inner).into_pyresult()?;
+            return Ok(PySArray::new(result).into_pyobject(py)?.into_any().unbind());
+        }
+
         Err(PyTypeError::new_err(
-            "SArray indices must be integers or slices",
+            "SArray indices must be integers, slices, or SArray masks",
         ))
     }
 }

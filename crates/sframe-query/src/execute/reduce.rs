@@ -134,38 +134,49 @@ pub(super) fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFram
         })
         .collect();
 
-    // Process row ranges in parallel
+    // Process row ranges in parallel, reading in sub-chunks to bound memory
+    const CHUNK_SIZE: u64 = 256 * 1024; // 256K rows per chunk
+
     let partial_aggs: Vec<Result<Box<dyn Aggregator>>> = worker_ranges
         .par_iter()
         .map(|&(begin, end)| {
-            let columns = source::read_projected_row_range(
-                &*vfs,
-                &segment_paths,
-                &segment_sizes,
-                &plan.column_types,
-                &plan.column_indices,
-                begin,
-                end,
-            )?;
-
-            let num_rows = if columns.is_empty() {
-                0
-            } else {
-                columns[0].len()
-            };
-
             let mut local_agg = plan.aggregator.box_clone();
 
-            if single_column {
-                // Optimized single-column path: avoid Vec allocation per row
-                for i in 0..num_rows {
-                    local_agg.add(std::slice::from_ref(&columns[0][i]));
+            // Process the range in fixed-size chunks to avoid materializing
+            // the entire worker slice at once
+            let mut chunk_begin = begin;
+            while chunk_begin < end {
+                let chunk_end = (chunk_begin + CHUNK_SIZE).min(end);
+
+                let columns = source::read_projected_row_range(
+                    &*vfs,
+                    &segment_paths,
+                    &segment_sizes,
+                    &plan.column_types,
+                    &plan.column_indices,
+                    chunk_begin,
+                    chunk_end,
+                )?;
+
+                let num_rows = if columns.is_empty() {
+                    0
+                } else {
+                    columns[0].len()
+                };
+
+                if single_column {
+                    for i in 0..num_rows {
+                        local_agg.add(std::slice::from_ref(&columns[0][i]));
+                    }
+                } else {
+                    for i in 0..num_rows {
+                        let row: Vec<FlexType> = columns.iter().map(|c| c[i].clone()).collect();
+                        local_agg.add(&row);
+                    }
                 }
-            } else {
-                for i in 0..num_rows {
-                    let row: Vec<FlexType> = columns.iter().map(|c| c[i].clone()).collect();
-                    local_agg.add(&row);
-                }
+
+                chunk_begin = chunk_end;
+                // `columns` is dropped here, freeing memory before next chunk
             }
 
             Ok(local_agg)
