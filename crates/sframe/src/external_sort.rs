@@ -184,7 +184,7 @@ fn partition_data_parallel(
     let reader_results: Vec<Result<()>> = worker_plans
         .into_par_iter()
         .map(|wp| {
-            let my_senders: Vec<_> = senders.iter().cloned().collect();
+            let my_senders = senders.to_vec();
             let mut iter = compile(&wp)?;
 
             // Per-partition row buffers (column-major)
@@ -282,13 +282,11 @@ fn sort_partitions_and_assemble(
     let mut builder =
         SFrameBuilder::anonymous(sf.column_names().to_vec(), sf.column_types())?;
 
-    for result in sorted {
-        if let Some(sort_result) = result {
-            let sorted_part = sort_result?;
-            let mut stream = sorted_part.compile_stream()?;
-            while let Some(batch_result) = stream.next_batch() {
-                builder.write_batch_chunked(&batch_result?, CHUNK_SIZE)?;
-            }
+    for sort_result in sorted.into_iter().flatten() {
+        let sorted_part = sort_result?;
+        let mut stream = sorted_part.compile_stream()?;
+        while let Some(batch_result) = stream.next_batch() {
+            builder.write_batch_chunked(&batch_result?, CHUNK_SIZE)?;
         }
     }
 
