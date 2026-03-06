@@ -166,3 +166,241 @@ impl<W: Write> SegmentWriter<W> {
         Ok(segment_sizes)
     }
 }
+
+// ============================================================================
+// BufferedSegmentWriter — adaptive block sizing
+// ============================================================================
+
+/// Target on-disk block size in bytes (64 KiB).
+const TARGET_BLOCK_SIZE: usize = 64 * 1024;
+
+/// Minimum rows per block (lower bound for adaptive sizing).
+const MIN_ROWS_PER_BLOCK: usize = 8;
+
+/// Maximum rows per block (upper bound for adaptive sizing).
+const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
+
+/// Rough estimate of bytes per value for initial block sizing.
+fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
+    match dtype {
+        FlexTypeEnum::Integer => 8,
+        FlexTypeEnum::Float => 8,
+        FlexTypeEnum::String => 32,
+        FlexTypeEnum::Vector => 64,
+        FlexTypeEnum::List => 64,
+        FlexTypeEnum::Dict => 64,
+        FlexTypeEnum::DateTime => 12,
+        FlexTypeEnum::Undefined => 1,
+    }
+}
+
+/// A buffered wrapper around `SegmentWriter` that coalesces small writes
+/// into blocks of approximately `TARGET_BLOCK_SIZE` bytes.
+///
+/// The block size is adaptive: after each flush the writer updates its
+/// bytes-per-value estimate using a cumulative average and recalculates
+/// the number of rows to buffer before the next flush.
+pub struct BufferedSegmentWriter<W: Write> {
+    inner: SegmentWriter<W>,
+    dtypes: Vec<FlexTypeEnum>,
+    num_columns: usize,
+    /// Per-column value buffer, filled by `write_column_block`.
+    buffers: Vec<Vec<FlexType>>,
+    /// Per-column adaptive block size (number of rows).
+    rows_per_block: Vec<usize>,
+    /// Per-column cumulative encoded bytes (for adaptive estimate).
+    encoded_bytes: Vec<u64>,
+    /// Per-column cumulative encoded values (for adaptive estimate).
+    encoded_values: Vec<u64>,
+}
+
+impl<W: Write> BufferedSegmentWriter<W> {
+    /// Create a new `BufferedSegmentWriter`.
+    ///
+    /// `dtypes` determines the number of columns and their types.
+    /// Initial rows-per-block is estimated from `estimate_bytes_per_value`.
+    pub fn new(writer: W, dtypes: &[FlexTypeEnum]) -> Self {
+        let num_columns = dtypes.len();
+        let rows_per_block: Vec<usize> = dtypes
+            .iter()
+            .map(|&dt| {
+                let est = estimate_bytes_per_value(dt).max(1);
+                (TARGET_BLOCK_SIZE / est).clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
+            })
+            .collect();
+
+        BufferedSegmentWriter {
+            inner: SegmentWriter::new(writer, num_columns),
+            dtypes: dtypes.to_vec(),
+            num_columns,
+            buffers: vec![Vec::new(); num_columns],
+            rows_per_block,
+            encoded_bytes: vec![0u64; num_columns],
+            encoded_values: vec![0u64; num_columns],
+        }
+    }
+
+    /// Append values for a column, flushing full blocks as needed.
+    ///
+    /// Returns the total on-disk bytes written during any flushes triggered
+    /// by this call.
+    pub fn write_column_block(
+        &mut self,
+        column: usize,
+        values: &[FlexType],
+        dtype: FlexTypeEnum,
+    ) -> Result<u64> {
+        self.buffers[column].extend_from_slice(values);
+
+        let mut total_bytes = 0u64;
+
+        while self.buffers[column].len() >= self.rows_per_block[column] {
+            let rpb = self.rows_per_block[column];
+            // Drain one full block from the front.
+            let block: Vec<FlexType> = self.buffers[column].drain(..rpb).collect();
+            let num_values = block.len() as u64;
+            let on_disk = self.inner.write_column_block(column, &block, dtype)?;
+            total_bytes += on_disk;
+            self.update_block_size(column, num_values, on_disk);
+        }
+
+        Ok(total_bytes)
+    }
+
+    /// Flush all remaining buffered data and finalize the segment.
+    ///
+    /// Returns per-column element counts (same as `SegmentWriter::finish`).
+    pub fn finish(mut self) -> Result<Vec<u64>> {
+        for col in 0..self.num_columns {
+            if !self.buffers[col].is_empty() {
+                let dtype = self.dtypes[col];
+                let remaining: Vec<FlexType> = std::mem::take(&mut self.buffers[col]);
+                self.inner.write_column_block(col, &remaining, dtype)?;
+            }
+        }
+        self.inner.finish()
+    }
+
+    /// Update the adaptive block size for a column after flushing.
+    fn update_block_size(&mut self, col: usize, num_values: u64, on_disk_bytes: u64) {
+        self.encoded_bytes[col] += on_disk_bytes;
+        self.encoded_values[col] += num_values;
+
+        if self.encoded_values[col] > 0 {
+            let avg_bytes_per_value =
+                (self.encoded_bytes[col] as f64) / (self.encoded_values[col] as f64);
+            let est = avg_bytes_per_value.max(1.0);
+            let new_rpb = ((TARGET_BLOCK_SIZE as f64) / est) as usize;
+            self.rows_per_block[col] = new_rpb.clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment_reader::SegmentReader;
+    use std::sync::Arc;
+
+    /// Helper: write to a Vec<u8>, then read back with SegmentReader.
+    fn make_reader(buf: Vec<u8>, dtypes: &[FlexTypeEnum]) -> SegmentReader {
+        let len = buf.len() as u64;
+        let cursor = std::io::Cursor::new(buf);
+        SegmentReader::open(Box::new(cursor), len, dtypes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn test_buffered_writer_basic() {
+        let dtypes = vec![FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let mut buf = Vec::new();
+
+        {
+            let mut writer = BufferedSegmentWriter::new(&mut buf, &dtypes);
+
+            let ints: Vec<FlexType> = (0..10).map(|i| FlexType::Integer(i)).collect();
+            writer
+                .write_column_block(0, &ints, FlexTypeEnum::Integer)
+                .unwrap();
+
+            let strings: Vec<FlexType> = (0..10)
+                .map(|i| FlexType::String(Arc::from(format!("val_{i}"))))
+                .collect();
+            writer
+                .write_column_block(1, &strings, FlexTypeEnum::String)
+                .unwrap();
+
+            let sizes = writer.finish().unwrap();
+            assert_eq!(sizes, vec![10, 10]);
+        }
+
+        let mut reader = make_reader(buf, &dtypes);
+
+        // Verify integers
+        let col0 = reader.read_column(0).unwrap();
+        assert_eq!(col0.len(), 10);
+        for (i, v) in col0.iter().enumerate() {
+            assert_eq!(*v, FlexType::Integer(i as i64), "int mismatch at {i}");
+        }
+
+        // Verify strings
+        let col1 = reader.read_column(1).unwrap();
+        assert_eq!(col1.len(), 10);
+        for (i, v) in col1.iter().enumerate() {
+            let expected = FlexType::String(Arc::from(format!("val_{i}")));
+            assert_eq!(*v, expected, "string mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_buffered_writer_many_small_writes() {
+        let dtypes = vec![FlexTypeEnum::Integer];
+        let mut buf = Vec::new();
+
+        let n = 1000usize;
+        {
+            let mut writer = BufferedSegmentWriter::new(&mut buf, &dtypes);
+
+            // Write one value at a time.
+            for i in 0..n {
+                writer
+                    .write_column_block(
+                        0,
+                        &[FlexType::Integer(i as i64)],
+                        FlexTypeEnum::Integer,
+                    )
+                    .unwrap();
+            }
+
+            let sizes = writer.finish().unwrap();
+            assert_eq!(sizes, vec![n as u64]);
+        }
+
+        let mut reader = make_reader(buf, &dtypes);
+
+        // Verify all values round-trip.
+        let col0 = reader.read_column(0).unwrap();
+        assert_eq!(col0.len(), n);
+        for (i, v) in col0.iter().enumerate() {
+            assert_eq!(*v, FlexType::Integer(i as i64), "mismatch at {i}");
+        }
+
+        // Verify that values were coalesced into fewer blocks than 1000.
+        let num_blocks = reader.num_blocks(0);
+        assert!(
+            num_blocks < n,
+            "Expected coalescing: {num_blocks} blocks for {n} values"
+        );
+    }
+
+    #[test]
+    fn test_buffered_writer_empty() {
+        let dtypes = vec![FlexTypeEnum::Integer];
+        let mut buf = Vec::new();
+
+        {
+            let writer = BufferedSegmentWriter::new(&mut buf, &dtypes);
+            let sizes = writer.finish().unwrap();
+            assert_eq!(sizes, vec![0]);
+        }
+    }
+}
