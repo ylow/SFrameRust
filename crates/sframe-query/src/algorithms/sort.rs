@@ -9,6 +9,8 @@
 //! materialized and sorted in-memory. The EC-Sort path (disk-based) can
 //! be added later for truly out-of-core datasets.
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use sframe_io::cache_fs::global_cache_fs;
@@ -18,8 +20,8 @@ use sframe_storage::segment_writer::SegmentWriter;
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
-use crate::batch::SFrameRows;
-use crate::execute::BatchIterator;
+use crate::batch::{ColumnData, SFrameRows};
+use crate::execute::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
 
 /// Sort order for a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +226,133 @@ impl PartialEq for MergeHeapEntry {
 }
 
 impl Eq for MergeHeapEntry {}
+
+/// k-way merge of sorted runs into a BatchIterator.
+///
+/// Opens a RunCursor for each run, seeds a min-heap with the first row
+/// from each, then repeatedly pops the minimum and emits output batches.
+/// The SortCleanup guard is captured by the producer closure so that
+/// CacheFs scratch files are cleaned up when the iterator is dropped.
+fn merge_sorted_runs(
+    runs: Vec<SortedRunInfo>,
+    keys: &[SortKey],
+    dtypes: &[FlexTypeEnum],
+    vfs: Arc<dyn VirtualFileSystem>,
+    base_path: String,
+) -> Result<BatchIterator> {
+    use std::collections::BinaryHeap;
+
+    let keys = keys.to_vec();
+    let dtypes = dtypes.to_vec();
+    let ncols = dtypes.len();
+    let batch_size = sframe_config::global().source_batch_size;
+
+    let descending: Vec<bool> = keys
+        .iter()
+        .map(|k| k.order == SortOrder::Descending)
+        .collect();
+
+    let key_columns: Vec<usize> = keys.iter().map(|k| k.column).collect();
+
+    Ok(BatchIterator::new(move |co: BatchCo| async move {
+        let _cleanup = SortCleanup {
+            base_path: base_path.clone(),
+        };
+
+        let mut cursors: Vec<RunCursor> = Vec::with_capacity(runs.len());
+        for run in &runs {
+            match RunCursor::open(&*vfs, &run.path, &dtypes, run.num_rows, batch_size as u64) {
+                Ok(c) => cursors.push(c),
+                Err(e) => {
+                    co.yield_(BatchResponse::Ready).await;
+                    co.yield_(BatchResponse::Batch(Err(e))).await;
+                    return;
+                }
+            }
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (i, cursor) in cursors.iter().enumerate() {
+            if !cursor.is_exhausted() {
+                let kv: Vec<FlexType> = key_columns
+                    .iter()
+                    .map(|&c| cursor.current_value(c).clone())
+                    .collect();
+                heap.push(MergeHeapEntry {
+                    run_idx: i,
+                    key_values: kv,
+                    descending: descending.clone(),
+                });
+            }
+        }
+
+        let mut cmd = co.yield_(BatchResponse::Ready).await;
+
+        let mut out_cols: Vec<Vec<FlexType>> =
+            (0..ncols).map(|_| Vec::with_capacity(batch_size)).collect();
+
+        while let Some(entry) = heap.pop() {
+            if !matches!(cmd, BatchCommand::NextBatch) {
+                break;
+            }
+
+            // Collect the full row from this run
+            let run = &cursors[entry.run_idx];
+            for col in 0..ncols {
+                out_cols[col].push(run.current_value(col).clone());
+            }
+
+            // Advance cursor
+            let run = &mut cursors[entry.run_idx];
+            if let Err(e) = run.advance() {
+                co.yield_(BatchResponse::Batch(Err(e))).await;
+                return;
+            }
+
+            // Re-insert into heap if run has more data
+            if !run.is_exhausted() {
+                let kv: Vec<FlexType> = key_columns
+                    .iter()
+                    .map(|&c| run.current_value(c).clone())
+                    .collect();
+                heap.push(MergeHeapEntry {
+                    run_idx: entry.run_idx,
+                    key_values: kv,
+                    descending: descending.clone(),
+                });
+            }
+
+            // Emit batch when full
+            if out_cols[0].len() >= batch_size {
+                let columns: Vec<ColumnData> = out_cols
+                    .iter()
+                    .zip(dtypes.iter())
+                    .map(|(data, &dt)| ColumnData::from_flex_slice(data, dt))
+                    .collect();
+                match SFrameRows::new(columns) {
+                    Ok(batch) => cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await,
+                    Err(e) => {
+                        co.yield_(BatchResponse::Batch(Err(e))).await;
+                        return;
+                    }
+                }
+                out_cols = (0..ncols).map(|_| Vec::with_capacity(batch_size)).collect();
+            }
+        }
+
+        // Emit remaining rows
+        if !out_cols.is_empty() && !out_cols[0].is_empty() {
+            let columns: Vec<ColumnData> = out_cols
+                .iter()
+                .zip(dtypes.iter())
+                .map(|(data, &dt)| ColumnData::from_flex_slice(data, dt))
+                .collect();
+            if let Ok(batch) = SFrameRows::new(columns) {
+                co.yield_(BatchResponse::Batch(Ok(batch))).await;
+            }
+        }
+    }))
+}
 
 /// Sort a batch stream by the given keys.
 ///
@@ -624,5 +753,80 @@ mod tests {
         assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(1));
         assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(2));
         assert_eq!(heap.pop().unwrap().key_values[0], FlexType::Integer(3));
+    }
+
+    #[test]
+    fn test_merge_sorted_runs() {
+        use sframe_io::cache_fs::global_cache_fs;
+        use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
+
+        let dtypes = vec![FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let cache_fs = global_cache_fs();
+        let vfs: std::sync::Arc<dyn VirtualFileSystem> =
+            std::sync::Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+        let base_path = cache_fs.alloc_dir();
+        VirtualFileSystem::mkdir_p(&*vfs, &base_path).unwrap();
+
+        // Run 0: [1, 4, 7]
+        let batch0 = SFrameRows::from_rows(
+            &[
+                vec![FlexType::Integer(1), FlexType::String("a".into())],
+                vec![FlexType::Integer(4), FlexType::String("d".into())],
+                vec![FlexType::Integer(7), FlexType::String("g".into())],
+            ],
+            &dtypes,
+        )
+        .unwrap();
+        let run0 =
+            spill_sorted_run(&batch0, &[SortKey::asc(0)], &dtypes, &*vfs, &base_path, 0).unwrap();
+
+        // Run 1: [2, 5, 8]
+        let batch1 = SFrameRows::from_rows(
+            &[
+                vec![FlexType::Integer(2), FlexType::String("b".into())],
+                vec![FlexType::Integer(5), FlexType::String("e".into())],
+                vec![FlexType::Integer(8), FlexType::String("h".into())],
+            ],
+            &dtypes,
+        )
+        .unwrap();
+        let run1 =
+            spill_sorted_run(&batch1, &[SortKey::asc(0)], &dtypes, &*vfs, &base_path, 1).unwrap();
+
+        // Run 2: [3, 6, 9]
+        let batch2 = SFrameRows::from_rows(
+            &[
+                vec![FlexType::Integer(3), FlexType::String("c".into())],
+                vec![FlexType::Integer(6), FlexType::String("f".into())],
+                vec![FlexType::Integer(9), FlexType::String("i".into())],
+            ],
+            &dtypes,
+        )
+        .unwrap();
+        let run2 =
+            spill_sorted_run(&batch2, &[SortKey::asc(0)], &dtypes, &*vfs, &base_path, 2).unwrap();
+
+        let runs = vec![run0, run1, run2];
+        let keys = vec![SortKey::asc(0)];
+        let mut iter = merge_sorted_runs(runs, &keys, &dtypes, vfs.clone(), base_path).unwrap();
+
+        let mut all_ints: Vec<i64> = Vec::new();
+        let mut all_strs: Vec<String> = Vec::new();
+        while let Some(batch_result) = iter.next_batch() {
+            let batch = batch_result.unwrap();
+            for i in 0..batch.num_rows() {
+                if let FlexType::Integer(v) = batch.column(0).get(i) {
+                    all_ints.push(v);
+                }
+                if let FlexType::String(v) = batch.column(1).get(i) {
+                    all_strs.push(v.to_string());
+                }
+            }
+        }
+        assert_eq!(all_ints, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            all_strs,
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+        );
     }
 }
