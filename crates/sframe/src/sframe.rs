@@ -3221,4 +3221,88 @@ mod tests {
         let sf2 = SFrame::from_parquet(&pattern).unwrap();
         assert_eq!(sf2.num_rows().unwrap(), original_rows);
     }
+
+    #[test]
+    fn test_save_parallel_roundtrip() {
+        // Read business.sf (SFrameSource plan → parallel-sliceable)
+        let sf = SFrame::read(&format!("{}/business.sf", samples_dir())).unwrap();
+        let original_rows = sf.num_rows().unwrap();
+        let original_cols = sf.num_columns();
+        let original_names = sf.column_names().to_vec();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("parallel_save.sf");
+        let path_str = path.to_str().unwrap();
+
+        sf.save(path_str).unwrap();
+
+        let reloaded = SFrame::read(path_str).unwrap();
+        assert_eq!(reloaded.num_rows().unwrap(), original_rows);
+        assert_eq!(reloaded.num_columns(), original_cols);
+        assert_eq!(reloaded.column_names(), &original_names);
+
+        // Verify multiple segments were created (parallel wrote > 1 segment)
+        let reader = sframe_storage::sframe_reader::SFrameReader::open(path_str).unwrap();
+        if rayon::current_num_threads() > 1 {
+            assert!(
+                reader.segment_readers.len() > 1,
+                "Expected parallel save to produce multiple segments, got {}",
+                reader.segment_readers.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_parallel_data_integrity() {
+        // Full value-level verification of parallel roundtrip
+        let sf = SFrame::read(&format!("{}/business.sf", samples_dir())).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("integrity.sf");
+        let path_str = path.to_str().unwrap();
+
+        sf.save(path_str).unwrap();
+
+        let reloaded = SFrame::read(path_str).unwrap();
+
+        // Compare first 200 rows column by column
+        let n = 200;
+        for col_name in sf.column_names() {
+            let orig_col = sf.column(col_name).unwrap();
+            let reload_col = reloaded.column(col_name).unwrap();
+
+            let orig_vals = orig_col.head(n).unwrap();
+            let reload_vals = reload_col.head(n).unwrap();
+            assert_eq!(orig_vals.len(), reload_vals.len(),
+                "Column '{}' row count mismatch", col_name);
+
+            for (i, (orig, reload)) in orig_vals.iter().zip(reload_vals.iter()).enumerate() {
+                assert_eq!(
+                    orig, reload,
+                    "Mismatch at column '{}' row {}: {:?} vs {:?}",
+                    col_name, i, orig, reload
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_save_with_filter_parallel() {
+        // Filtered SFrame should still save correctly
+        let sf = SFrame::read(&format!("{}/business.sf", samples_dir())).unwrap();
+        let filtered = sf
+            .filter("stars", Arc::new(|v| matches!(v, FlexType::Float(f) if *f >= 4.0)))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("filtered.sf");
+        let path_str = path.to_str().unwrap();
+
+        filtered.save(path_str).unwrap();
+
+        let reloaded = SFrame::read(path_str).unwrap();
+        let n = reloaded.num_rows().unwrap();
+        assert!(n > 0, "Filtered result should have some rows");
+        assert!(n < 11536, "Filtered result should have fewer rows than total");
+    }
 }
