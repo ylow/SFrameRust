@@ -1732,7 +1732,7 @@ impl SFrame {
     /// Output columns are always 0..N matching the SFrame's column order.
     /// Returns an error only if columns have truly incompatible plans (e.g.
     /// different source tables with different row counts).
-    fn fuse_plan(&self) -> Result<Arc<PlannerNode>> {
+    pub(crate) fn fuse_plan(&self) -> Result<Arc<PlannerNode>> {
         if self.columns.is_empty() {
             return Ok(PlannerNode::materialized(SFrameRows::empty(&[])));
         }
