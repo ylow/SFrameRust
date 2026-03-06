@@ -995,4 +995,56 @@ mod tests {
         let expected: Vec<i64> = (0..n).collect();
         assert_eq!(values, expected);
     }
+
+    #[test]
+    fn test_sort_descending_external() {
+        let n = 500i64;
+        let rows: Vec<Vec<FlexType>> = (0..n)
+            .map(|i| vec![FlexType::Integer(i)])
+            .collect();
+        let dtypes = [FlexTypeEnum::Integer];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+        let input = make_sort_input(batch);
+
+        let mut result = sort_with_budget(input, &[SortKey::desc(0)], 1).unwrap();
+        let collected = collect_batches(&mut result);
+
+        for i in 0..n as usize {
+            assert_eq!(collected.row(i), vec![FlexType::Integer(n - 1 - i as i64)]);
+        }
+    }
+
+    #[test]
+    fn test_sort_multi_key_external() {
+        let rows = vec![
+            vec![FlexType::Integer(2), FlexType::String("b".into())],
+            vec![FlexType::Integer(1), FlexType::String("b".into())],
+            vec![FlexType::Integer(2), FlexType::String("a".into())],
+            vec![FlexType::Integer(1), FlexType::String("a".into())],
+        ];
+        let dtypes = [FlexTypeEnum::Integer, FlexTypeEnum::String];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+        let input = make_sort_input(batch);
+
+        let mut result = sort_with_budget(
+            input,
+            &[SortKey::asc(0), SortKey::asc(1)],
+            1,
+        ).unwrap();
+        let collected = collect_batches(&mut result);
+
+        assert_eq!(collected.row(0), vec![FlexType::Integer(1), FlexType::String("a".into())]);
+        assert_eq!(collected.row(1), vec![FlexType::Integer(1), FlexType::String("b".into())]);
+        assert_eq!(collected.row(2), vec![FlexType::Integer(2), FlexType::String("a".into())]);
+        assert_eq!(collected.row(3), vec![FlexType::Integer(2), FlexType::String("b".into())]);
+    }
+
+    #[test]
+    fn test_sort_empty_external() {
+        let input = BatchIterator::new(|co: BatchCo| async move {
+            co.yield_(BatchResponse::Ready).await;
+        });
+        let mut result = sort_with_budget(input, &[SortKey::asc(0)], 1).unwrap();
+        assert!(result.next_batch().is_none());
+    }
 }
