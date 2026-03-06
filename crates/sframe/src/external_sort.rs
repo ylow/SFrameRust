@@ -7,14 +7,22 @@
 //! 4. Sort each partition in-memory.
 //! 5. Write sorted partitions sequentially into a single output SFrame.
 
+use std::sync::Arc;
+
+use rayon::prelude::*;
+
 use sframe_query::algorithms::quantile_sketch::QuantileSketch;
 use sframe_query::algorithms::sort::{compare_flex_type, SortKey, SortOrder};
+use sframe_query::execute::{compile, parallel_slice_row_count};
+use sframe_query::planner::{clone_plan_with_row_range, PlannerNode};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexType;
 
 use crate::sframe::{SFrame, SFrameBuilder};
 
 const CHUNK_SIZE: usize = 8192;
+const CHANNEL_BUFFER_DEPTH: usize = 8;
+const PARTITION_FLUSH_ROWS: usize = 1024;
 
 /// Perform an external sort on `sf` using the given sort keys.
 ///
@@ -100,6 +108,58 @@ fn build_sketch(sf: &SFrame, key_column: usize) -> Result<QuantileSketch> {
 
     sketch.finish();
     Ok(sketch)
+}
+
+/// Split a parallel-sliceable plan into N worker plans with row ranges.
+fn make_worker_plans(
+    plan: &Arc<PlannerNode>,
+    total_rows: u64,
+    n_workers: usize,
+) -> Vec<Arc<PlannerNode>> {
+    (0..n_workers)
+        .filter_map(|i| {
+            let begin = (i as u64 * total_rows) / n_workers as u64;
+            let end = ((i as u64 + 1) * total_rows) / n_workers as u64;
+            if begin >= end {
+                return None;
+            }
+            Some(clone_plan_with_row_range(plan, begin, end))
+        })
+        .collect()
+}
+
+/// Phase 1 (parallel): Build quantile sketch using N rayon workers, each
+/// reading a row-range slice, then merge all sketches.
+fn build_sketch_parallel(
+    plan: &Arc<PlannerNode>,
+    key_column: usize,
+    total_rows: u64,
+) -> Result<QuantileSketch> {
+    let n_workers = rayon::current_num_threads().max(1);
+    let worker_plans = make_worker_plans(plan, total_rows, n_workers);
+
+    let sketches: Vec<Result<QuantileSketch>> = worker_plans
+        .into_par_iter()
+        .map(|wp| {
+            let mut sketch = QuantileSketch::new(0.01);
+            let mut iter = compile(&wp)?;
+            while let Some(batch_result) = iter.next_batch() {
+                let batch = batch_result?;
+                let col = batch.column(key_column);
+                for i in 0..batch.num_rows() {
+                    sketch.insert(col.get(i));
+                }
+            }
+            sketch.finish();
+            Ok(sketch)
+        })
+        .collect();
+
+    let mut combined = QuantileSketch::new(0.01);
+    for s in sketches {
+        combined.merge(&s?);
+    }
+    Ok(combined)
 }
 
 /// Phase 3: Partition data by the primary sort key using the cut points.
@@ -359,5 +419,38 @@ mod tests {
         let rows = sorted.iter_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![FlexType::Integer(42)]);
+    }
+
+    #[test]
+    fn test_build_sketch_parallel() {
+        let n = 10_000i64;
+        let values: Vec<FlexType> = (0..n).map(FlexType::Integer).collect();
+        let sf = SFrame::from_columns(vec![(
+            "x",
+            SArray::from_vec(values, FlexTypeEnum::Integer).unwrap(),
+        )])
+        .unwrap();
+
+        // Save + read to get SFrameSource plan (parallel-sliceable)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sketch_test.sf");
+        sf.save(path.to_str().unwrap()).unwrap();
+        let sf2 = SFrame::read(path.to_str().unwrap()).unwrap();
+
+        let plan = sf2.fuse_plan().unwrap();
+        let total_rows = parallel_slice_row_count(&plan).unwrap();
+
+        let sketch = build_sketch_parallel(&plan, 0, total_rows).unwrap();
+        assert_eq!(sketch.count(), n as usize);
+
+        // Median should be near 5000
+        let median = sketch.query(0.5);
+        match median {
+            FlexType::Integer(v) => assert!(
+                (v - 5000).unsigned_abs() < 500,
+                "parallel median off: {v} vs 5000"
+            ),
+            other => panic!("Expected Integer, got {other:?}"),
+        }
     }
 }
