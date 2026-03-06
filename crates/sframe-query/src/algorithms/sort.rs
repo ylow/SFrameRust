@@ -1,20 +1,20 @@
-//! Columnar sort with EC-Sort optimization.
+//! Columnar sort with EC-Sort optimization and external merge sort.
 //!
 //! Uses index-based sorting: only key column values are accessed during
 //! comparisons, and the permutation is applied to all columns in a single
 //! pass via `take()`. This is the in-memory equivalent of the C++ EC-Sort
 //! algorithm which avoids shuffling large value columns.
 //!
-//! For data that fits in the sort memory budget, the entire dataset is
-//! materialized and sorted in-memory. The EC-Sort path (disk-based) can
-//! be added later for truly out-of-core datasets.
+//! When data exceeds the sort memory budget (`SFRAME_SORT_BUFFER_SIZE`),
+//! an external merge sort is used: input is streamed into sorted runs on
+//! CacheFs, then k-way merged via a min-heap into a `BatchIterator`.
 
 use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use sframe_io::cache_fs::global_cache_fs;
-use sframe_io::vfs::VirtualFileSystem;
+use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_storage::segment_reader::{CachedSegmentReader, SegmentReader};
 use sframe_storage::segment_writer::SegmentWriter;
 use sframe_types::error::Result;
@@ -356,12 +356,132 @@ fn merge_sorted_runs(
 
 /// Sort a batch stream by the given keys.
 ///
-/// Materializes the input stream, then sorts using an index-based
-/// permutation (EC-Sort pattern). Only key columns are accessed during
-/// comparison; the permutation is applied to all columns in one pass.
-pub fn sort(input: BatchIterator, keys: &[SortKey]) -> Result<SFrameRows> {
-    let (batch, indices) = sort_indices(input, keys)?;
-    batch.take(&indices)
+/// Streams input batches into a memory-bounded buffer. When the buffer
+/// exceeds `SFRAME_SORT_BUFFER_SIZE`, sorts and spills to CacheFs.
+/// After all input, either returns sorted data directly (fast path)
+/// or k-way merges the sorted runs (external sort path).
+pub fn sort(input: BatchIterator, keys: &[SortKey]) -> Result<BatchIterator> {
+    let budget = sframe_config::global().sort_memory_budget;
+    sort_with_budget(input, keys, budget)
+}
+
+/// Sort with an explicit memory budget (for testing).
+fn sort_with_budget(
+    mut input: BatchIterator,
+    keys: &[SortKey],
+    budget: usize,
+) -> Result<BatchIterator> {
+    if keys.is_empty() {
+        return Ok(input);
+    }
+
+    let cache_fs = global_cache_fs();
+    let vfs: Arc<dyn VirtualFileSystem> =
+        Arc::new(ArcCacheFsVfs(cache_fs.clone()));
+    let base_path = cache_fs.alloc_dir();
+    VirtualFileSystem::mkdir_p(&*vfs, &base_path)?;
+
+    let mut buffer: Option<SFrameRows> = None;
+    let mut buffer_size: usize = 0;
+    let mut runs: Vec<SortedRunInfo> = Vec::new();
+    let mut dtypes: Option<Vec<FlexTypeEnum>> = None;
+    let mut run_id: usize = 0;
+
+    // Phase 1: Run generation
+    while let Some(batch_result) = input.next_batch() {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        if dtypes.is_none() {
+            dtypes = Some(
+                (0..batch.num_columns())
+                    .map(|i| batch.column(i).dtype())
+                    .collect(),
+            );
+        }
+
+        buffer_size += estimate_batch_size(&batch);
+        match &mut buffer {
+            None => buffer = Some(batch),
+            Some(existing) => existing.append(&batch)?,
+        }
+
+        if buffer_size >= budget {
+            let buf = buffer.take().unwrap();
+            let info = spill_sorted_run(
+                &buf,
+                keys,
+                dtypes.as_ref().unwrap(),
+                &*vfs,
+                &base_path,
+                run_id,
+            )?;
+            runs.push(info);
+            run_id += 1;
+            buffer_size = 0;
+        }
+    }
+
+    let dtypes = match dtypes {
+        Some(d) => d,
+        None => {
+            // Empty input
+            let _ = cache_fs.remove_dir(&base_path);
+            return Ok(BatchIterator::new(|co: BatchCo| async move {
+                co.yield_(BatchResponse::Ready).await;
+            }));
+        }
+    };
+
+    // Phase 2: Fast path — everything fit in memory
+    if runs.is_empty() {
+        let _ = cache_fs.remove_dir(&base_path);
+        let buf = buffer.unwrap();
+        if buf.num_rows() <= 1 {
+            return Ok(single_batch_iter(buf));
+        }
+        let indices = build_sort_indices(&buf, keys);
+        let batch_size = sframe_config::global().source_batch_size;
+        return Ok(BatchIterator::new(move |co: BatchCo| async move {
+            let mut cmd = co.yield_(BatchResponse::Ready).await;
+            for chunk in indices.chunks(batch_size) {
+                if !matches!(cmd, BatchCommand::NextBatch) {
+                    break;
+                }
+                match buf.take(chunk) {
+                    Ok(batch) => {
+                        cmd = co.yield_(BatchResponse::Batch(Ok(batch))).await;
+                    }
+                    Err(e) => {
+                        co.yield_(BatchResponse::Batch(Err(e))).await;
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    // Phase 3: Spill remaining buffer as final run
+    if let Some(buf) = buffer.take() {
+        if buf.num_rows() > 0 {
+            let info = spill_sorted_run(&buf, keys, &dtypes, &*vfs, &base_path, run_id)?;
+            runs.push(info);
+        }
+    }
+
+    // Phase 4: k-way merge
+    merge_sorted_runs(runs, keys, &dtypes, vfs, base_path)
+}
+
+fn single_batch_iter(batch: SFrameRows) -> BatchIterator {
+    BatchIterator::new(move |co: BatchCo| async move {
+        let cmd = co.yield_(BatchResponse::Ready).await;
+        if matches!(cmd, BatchCommand::NextBatch) {
+            co.yield_(BatchResponse::Batch(Ok(batch))).await;
+        }
+    })
 }
 
 /// Materializes the input stream and returns the original batch together
@@ -516,6 +636,19 @@ mod tests {
         })
     }
 
+    /// Collect all batches from a BatchIterator into a single SFrameRows.
+    fn collect_batches(iter: &mut BatchIterator) -> SFrameRows {
+        let mut result: Option<SFrameRows> = None;
+        while let Some(batch_result) = iter.next_batch() {
+            let batch = batch_result.unwrap();
+            match &mut result {
+                None => result = Some(batch),
+                Some(existing) => existing.append(&batch).unwrap(),
+            }
+        }
+        result.unwrap()
+    }
+
     #[test]
     fn test_sort_integers() {
         let rows = vec![
@@ -529,7 +662,8 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
         let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).unwrap();
+        let mut iter = sort(input, &[SortKey::asc(0)]).unwrap();
+        let result = collect_batches(&mut iter);
 
         let expected = vec![1, 1, 3, 4, 5];
         for (i, &exp) in expected.iter().enumerate() {
@@ -548,7 +682,8 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
         let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::desc(0)]).unwrap();
+        let mut iter = sort(input, &[SortKey::desc(0)]).unwrap();
+        let result = collect_batches(&mut iter);
 
         let expected = vec![3.5, 2.5, 1.5];
         for (i, &exp) in expected.iter().enumerate() {
@@ -570,7 +705,8 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
         let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).unwrap();
+        let mut iter = sort(input, &[SortKey::asc(0)]).unwrap();
+        let result = collect_batches(&mut iter);
 
         assert_eq!(result.row(0), vec![FlexType::String("apple".into())]);
         assert_eq!(result.row(1), vec![FlexType::String("banana".into())]);
@@ -589,11 +725,12 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
         let input = make_sort_input(batch);
 
-        let result = sort(
+        let mut iter = sort(
             input,
             &[SortKey::asc(0), SortKey::asc(1)],
         )
         .unwrap();
+        let result = collect_batches(&mut iter);
 
         assert_eq!(
             result.row(0),
@@ -625,7 +762,8 @@ mod tests {
         let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
         let input = make_sort_input(batch);
 
-        let result = sort(input, &[SortKey::asc(0)]).unwrap();
+        let mut iter = sort(input, &[SortKey::asc(0)]).unwrap();
+        let result = collect_batches(&mut iter);
 
         // Undefined sorts last
         assert_eq!(result.row(0), vec![FlexType::Integer(1)]);
@@ -828,5 +966,33 @@ mod tests {
             all_strs,
             vec!["a", "b", "c", "d", "e", "f", "g", "h", "i"]
         );
+    }
+
+    #[test]
+    fn test_sort_with_tiny_budget() {
+        let n = 1000i64;
+        let rows: Vec<Vec<FlexType>> = (0..n)
+            .rev()
+            .map(|i| vec![FlexType::Integer(i)])
+            .collect();
+        let dtypes = [FlexTypeEnum::Integer];
+        let batch = SFrameRows::from_rows(&rows, &dtypes).unwrap();
+        let input = make_sort_input(batch);
+
+        // Budget of 1 byte forces every batch to spill
+        let mut result = sort_with_budget(input, &[SortKey::asc(0)], 1).unwrap();
+
+        let mut values = Vec::new();
+        while let Some(batch_result) = result.next_batch() {
+            let batch = batch_result.unwrap();
+            for i in 0..batch.num_rows() {
+                if let FlexType::Integer(v) = batch.column(0).get(i) {
+                    values.push(v);
+                }
+            }
+        }
+
+        let expected: Vec<i64> = (0..n).collect();
+        assert_eq!(values, expected);
     }
 }
