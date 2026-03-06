@@ -68,6 +68,26 @@ impl PySFrame {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (path))]
+    fn from_parquet(path: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Self> {
+        if let Ok(list) = path.downcast::<PyList>() {
+            let paths: Vec<String> = list
+                .iter()
+                .map(|item| item.extract::<String>())
+                .collect::<PyResult<_>>()?;
+            let sf = allow(py, move || {
+                let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                SFrame::from_parquet_files(&path_refs)
+            })?;
+            Ok(PySFrame::new(sf))
+        } else {
+            let path_str: String = path.extract()?;
+            let sf = allow(py, move || SFrame::from_parquet(&path_str))?;
+            Ok(PySFrame::new(sf))
+        }
+    }
+
+    #[staticmethod]
     fn from_columns(cols: &Bound<'_, PyDict>) -> PyResult<Self> {
         let mut names: Vec<String> = Vec::new();
         let mut arrays: Vec<SArray> = Vec::new();
@@ -108,6 +128,17 @@ impl PySFrame {
         let inner = self.inner.clone();
         let path = path.to_string();
         allow(py, move || inner.to_json(&path))
+    }
+
+    #[pyo3(signature = (path, sharded=false))]
+    fn to_parquet(&self, path: &str, sharded: bool, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        let path = path.to_string();
+        if sharded {
+            allow(py, move || inner.to_parquet_sharded(&path))
+        } else {
+            allow(py, move || inner.to_parquet(&path))
+        }
     }
 
     // ── Schema / metadata ───────────────────────────────────────────
