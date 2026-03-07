@@ -38,9 +38,8 @@ pub struct SFrameConfig {
     // --- Immutable after init ---
     /// Batch size for source operators (rows per batch).
     pub source_batch_size: usize,
-    /// Maximum total memory (RSS) allowed for the external sort phase.
-    /// Used with `cache_capacity` to form the RSS goal:
-    /// `G = cache_capacity + sort_max_memory`.
+    /// Maximum total memory for the external sort phase.
+    /// The per-thread budget is `sort_max_memory / num_threads`.
     pub sort_max_memory: usize,
     /// Maximum number of rows in a groupby hash table per segment before
     /// spilling to disk.

@@ -7,8 +7,7 @@
 //! 4. Sort each partition in-memory.
 //! 5. Write sorted partitions sequentially into a single output SFrame.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -29,135 +28,6 @@ use crate::sframe::{AnonymousStore, SFrame, SFrameBuilder};
 const CHUNK_SIZE: usize = 8192;
 const CHANNEL_BUFFER_DEPTH: usize = 8;
 const PARTITION_FLUSH_ROWS: usize = 1024;
-
-// ---------------------------------------------------------------------------
-// RSS measurement + adaptive semaphore
-// ---------------------------------------------------------------------------
-
-/// Return the current process RSS in bytes, or 0 if unavailable.
-fn get_rss_bytes() -> usize {
-    memory_stats::memory_stats()
-        .map(|usage| usage.physical_mem)
-        .unwrap_or(0)
-}
-
-/// A semaphore whose permit count adapts based on RSS feedback.
-///
-/// Threads call `acquire()` before materializing a partition and receive a
-/// guard that releases the permit on drop. After reaching peak memory (right
-/// after `sort_indices`), threads call `adapt()` which reads RSS and adjusts
-/// the permit count:
-///
-/// - RSS < goal − estimated_partition → add 1 permit (room for more)
-/// - RSS > goal + estimated_partition → remove 1 permit (over budget)
-struct AdaptiveSemaphore {
-    permits: AtomicUsize,
-    active: AtomicUsize,
-    max_permits: usize,
-    lock: Mutex<()>,
-    cond: Condvar,
-}
-
-struct SemaphoreGuard<'a> {
-    sem: &'a AdaptiveSemaphore,
-}
-
-impl Drop for SemaphoreGuard<'_> {
-    fn drop(&mut self) {
-        self.sem.active.fetch_sub(1, Ordering::Relaxed);
-        let _guard = self.sem.lock.lock().unwrap();
-        self.sem.cond.notify_one();
-    }
-}
-
-impl AdaptiveSemaphore {
-    fn new(initial_permits: usize, max_permits: usize) -> Self {
-        Self {
-            permits: AtomicUsize::new(initial_permits),
-            active: AtomicUsize::new(0),
-            max_permits,
-            lock: Mutex::new(()),
-            cond: Condvar::new(),
-        }
-    }
-
-    /// Block until a permit is available, then return a guard that releases
-    /// the permit on drop.
-    fn acquire(&self) -> SemaphoreGuard<'_> {
-        let mut guard = self.lock.lock().unwrap();
-        loop {
-            if self.active.load(Ordering::Relaxed) < self.permits.load(Ordering::Relaxed) {
-                self.active.fetch_add(1, Ordering::Relaxed);
-                return SemaphoreGuard { sem: self };
-            }
-            guard = self.cond.wait(guard).unwrap();
-        }
-    }
-
-    /// Check RSS and adjust permits. Called at peak memory (after sort_indices).
-    fn adapt(&self, memory_goal: usize, estimated_partition_bytes: usize) {
-        let rss = get_rss_bytes();
-        if rss == 0 {
-            return; // RSS unavailable — keep current permits
-        }
-
-        if rss + estimated_partition_bytes < memory_goal {
-            // Room for more — try to add a permit
-            let mut current = self.permits.load(Ordering::Relaxed);
-            loop {
-                if current >= self.max_permits {
-                    break;
-                }
-                match self.permits.compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(prev) => {
-                        eprintln!(
-                            "[sframe] sort: RSS {:.0}MB < goal {:.0}MB, permits {} -> {}",
-                            rss as f64 / 1e6,
-                            memory_goal as f64 / 1e6,
-                            prev,
-                            prev + 1
-                        );
-                        let _guard = self.lock.lock().unwrap();
-                        self.cond.notify_one();
-                        break;
-                    }
-                    Err(actual) => current = actual,
-                }
-            }
-        } else if rss > memory_goal + estimated_partition_bytes {
-            // Over budget — try to remove a permit
-            let mut current = self.permits.load(Ordering::Relaxed);
-            loop {
-                if current <= 1 {
-                    break;
-                }
-                match self.permits.compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(prev) => {
-                        eprintln!(
-                            "[sframe] sort: RSS {:.0}MB > goal {:.0}MB, permits {} -> {}",
-                            rss as f64 / 1e6,
-                            memory_goal as f64 / 1e6,
-                            prev,
-                            prev - 1
-                        );
-                        break;
-                    }
-                    Err(actual) => current = actual,
-                }
-            }
-        }
-    }
-}
 
 /// Perform an external sort on `sf` using the given sort keys.
 ///
@@ -211,9 +81,8 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     };
 
     // Phase 4+5: Sort partitions in parallel + assemble output
-    let estimated_partition_bytes = estimated_size / partitions.len().max(1);
     eprintln!("[sframe] sort phase 4/4: sorting {num_partitions} partitions and assembling output...");
-    sort_partitions_and_assemble(partitions, sort_keys, primary_key, sf, estimated_partition_bytes)
+    sort_partitions_and_assemble(partitions, sort_keys, primary_key, sf)
 }
 
 /// Phase 1: Stream the data and build a quantile sketch of the primary sort key.
@@ -403,7 +272,6 @@ fn sort_partitions_and_assemble(
     sort_keys: &[SortKey],
     primary_key: &SortKey,
     sf: &SFrame,
-    estimated_partition_bytes: usize,
 ) -> Result<SFrame> {
     let column_names = sf.column_names().to_vec();
     let dtypes = sf.column_types();
@@ -422,24 +290,6 @@ fn sort_partitions_and_assemble(
         (0..partitions.len()).collect()
     };
 
-    // Set up adaptive concurrency control
-    let config = sframe_config::global();
-    let memory_goal = config.cache_capacity() + config.sort_max_memory;
-    let max_permits = rayon::current_num_threads().max(1);
-    let initial_permits = if estimated_partition_bytes > 0 {
-        (memory_goal / estimated_partition_bytes / 4).max(1).min(max_permits)
-    } else {
-        max_permits
-    };
-    eprintln!(
-        "[sframe] sort: memory_goal={:.0}MB, est_partition={:.0}MB, initial_permits={}, max_permits={}",
-        memory_goal as f64 / 1e6,
-        estimated_partition_bytes as f64 / 1e6,
-        initial_permits,
-        max_permits
-    );
-    let semaphore = AdaptiveSemaphore::new(initial_permits, max_permits);
-
     // Sort each partition in parallel, writing directly to segment files
     let sort_keys_owned = sort_keys.to_vec();
     let results: Vec<Option<Result<(String, Vec<u64>, u64)>>> = partition_order
@@ -451,15 +301,9 @@ fn sort_partitions_and_assemble(
                 return None;
             }
             Some((|| -> Result<(String, Vec<u64>, u64)> {
-                // Acquire permit — blocks if at concurrency limit
-                let _permit = semaphore.acquire();
-
                 // Materialize and sort
                 let stream = partitions[part_idx].compile_stream()?;
                 let (batch, indices) = sort::sort_indices(stream, &sort_keys_owned)?;
-
-                // At peak memory — adapt concurrency based on RSS
-                semaphore.adapt(memory_goal, estimated_partition_bytes);
                 if batch.num_rows() == 0 {
                     // Write an empty segment
                     let seg_file = segment_filename(&data_prefix, seg_idx);
@@ -923,7 +767,7 @@ mod tests {
         .unwrap();
 
         let result =
-            sort_partitions_and_assemble(partitions, &sort_keys, &sort_keys[0], &sf_schema, 1024)
+            sort_partitions_and_assemble(partitions, &sort_keys, &sort_keys[0], &sf_schema)
                 .unwrap();
 
         let rows = result.iter_rows().unwrap();
