@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::planner::{LogicalOp, PlannerNode};
+use sframe_storage::block_encode::encode_typed_block;
 use sframe_storage::scatter_writer::ScatterWriter;
 use sframe_storage::segment_reader::SegmentReader;
 use sframe_storage::segment_writer::{BufferedSegmentWriter, SegmentWriter};
@@ -94,6 +95,46 @@ fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread:
 // ---------------------------------------------------------------------------
 // Scatter phase
 // ---------------------------------------------------------------------------
+
+/// LZ4 compression threshold — skip if compressed >= 90% of original.
+const COMPRESSION_DISABLE_THRESHOLD: f64 = 0.9;
+
+/// Encode a block and LZ4-compress it, returning the encoded bytes and
+/// metadata needed by `SegmentWriter::write_pre_encoded_block`.
+/// All CPU work happens here, outside any lock.
+fn encode_and_compress(
+    values: &[FlexType],
+) -> Result<(Vec<u8>, u64, bool)> {
+    let encoded = encode_typed_block(values)?;
+    let uncompressed_size = encoded.len() as u64;
+    let compressed = lz4_flex::compress(&encoded);
+
+    if (compressed.len() as f64) < COMPRESSION_DISABLE_THRESHOLD * (encoded.len() as f64) {
+        Ok((compressed, uncompressed_size, true))
+    } else {
+        Ok((encoded, uncompressed_size, false))
+    }
+}
+
+/// Flush a buffer to a Mutex-wrapped SegmentWriter.
+/// Encoding + compression happens OUTSIDE the lock; only the sequential
+/// file write is serialized.
+fn flush_to_segment_writer(
+    segment_writers: &[Mutex<SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>>],
+    bucket: usize,
+    col_idx: usize,
+    values: &[FlexType],
+    dtype: FlexTypeEnum,
+) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let num_elem = values.len() as u64;
+    let (data, uncompressed_size, is_compressed) = encode_and_compress(values)?;
+    let mut sw = segment_writers[bucket].lock().unwrap();
+    sw.write_pre_encoded_block(col_idx, &data, uncompressed_size, num_elem, is_compressed, dtype)?;
+    Ok(())
+}
 
 /// Physical source info extracted from a plan.
 #[derive(Clone)]
@@ -332,8 +373,9 @@ fn scatter_columns_direct(
 
                         if seg_bufs[bucket].len() >= thresh {
                             let buf = std::mem::take(&mut seg_bufs[bucket]);
-                            segment_writers[bucket].lock().unwrap()
-                                .write_column_block(col_idx, &buf, dtype)?;
+                            flush_to_segment_writer(
+                                &segment_writers, bucket, col_idx, &buf, dtype,
+                            )?;
                         }
                     }
 
@@ -343,8 +385,9 @@ fn scatter_columns_direct(
                 // Flush remaining
                 for (out_seg, buf) in seg_bufs.into_iter().enumerate() {
                     if !buf.is_empty() {
-                        segment_writers[out_seg].lock().unwrap()
-                            .write_column_block(col_idx, &buf, dtype)?;
+                        flush_to_segment_writer(
+                            &segment_writers, out_seg, col_idx, &buf, dtype,
+                        )?;
                     }
                 }
 
@@ -368,14 +411,16 @@ fn scatter_columns_direct(
 
             if fmap_seg_bufs[bucket].len() >= fmap_thresh {
                 let buf = std::mem::take(&mut fmap_seg_bufs[bucket]);
-                segment_writers[bucket].lock().unwrap()
-                    .write_column_block(fmap_col_idx, &buf, fmap_dtype)?;
+                flush_to_segment_writer(
+                    &segment_writers, bucket, fmap_col_idx, &buf, fmap_dtype,
+                )?;
             }
         }
         for (seg_idx, buf) in fmap_seg_bufs.into_iter().enumerate() {
             if !buf.is_empty() {
-                segment_writers[seg_idx].lock().unwrap()
-                    .write_column_block(fmap_col_idx, &buf, fmap_dtype)?;
+                flush_to_segment_writer(
+                    &segment_writers, seg_idx, fmap_col_idx, &buf, fmap_dtype,
+                )?;
             }
         }
 
