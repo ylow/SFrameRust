@@ -179,8 +179,9 @@ impl SFrameReader {
 
     /// Read a row range `[begin, end)` from a single column.
     ///
-    /// Locates the segments that overlap the range, reads the relevant
-    /// column data from each, and slices to the exact row boundaries.
+    /// Uses block-level reads: only decodes blocks that overlap the
+    /// requested range, and slices at block boundaries to avoid reading
+    /// unnecessary data.
     pub fn read_column_range(
         &mut self,
         column: usize,
@@ -192,24 +193,45 @@ impl SFrameReader {
         }
         let seg_sizes = &self.group_index.columns[column].segment_sizes;
         let mut result = Vec::with_capacity((end - begin) as usize);
-        let mut row_offset = 0u64;
+        let mut seg_row_offset = 0u64;
 
         for (seg_idx, &seg_len) in seg_sizes.iter().enumerate() {
-            let seg_end = row_offset + seg_len;
-            if row_offset >= end {
+            let seg_end = seg_row_offset + seg_len;
+            if seg_row_offset >= end {
                 break;
             }
             if seg_end <= begin {
-                row_offset = seg_end;
+                seg_row_offset = seg_end;
                 continue;
             }
-            let local_begin = begin.saturating_sub(row_offset) as usize;
-            let local_end = (end - row_offset).min(seg_len) as usize;
 
-            let all_values = self.segment_readers[seg_idx].read_column(column)?;
-            result.extend_from_slice(&all_values[local_begin..local_end]);
+            // This segment overlaps [begin, end). Read block-by-block.
+            let seg = &mut self.segment_readers[seg_idx];
+            let num_blocks = seg.num_blocks(column);
+            let mut block_row_offset = seg_row_offset;
 
-            row_offset = seg_end;
+            for blk_idx in 0..num_blocks {
+                let blk_len = seg.block_num_elem(column, blk_idx);
+                let blk_end = block_row_offset + blk_len;
+
+                if block_row_offset >= end {
+                    break;
+                }
+                if blk_end <= begin {
+                    block_row_offset = blk_end;
+                    continue;
+                }
+
+                // This block overlaps [begin, end)
+                let block_data = seg.read_block(column, blk_idx)?;
+                let local_begin = begin.saturating_sub(block_row_offset) as usize;
+                let local_end = (end - block_row_offset).min(blk_len) as usize;
+                result.extend_from_slice(&block_data[local_begin..local_end]);
+
+                block_row_offset = blk_end;
+            }
+
+            seg_row_offset = seg_end;
         }
         Ok(result)
     }
