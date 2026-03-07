@@ -96,9 +96,9 @@ fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread:
 
 /// Scatter all input columns (plus the forward map) into segment files.
 ///
-/// Creates `num_buckets` segment files. Each segment stores all input columns
-/// plus one extra column (the forward map). Values are distributed to segments
-/// based on `bucket_id = (forward_map_value / rows_per_bucket).min(num_buckets - 1)`.
+/// Streams all columns + forward_map in a single pass. For each row,
+/// all column values are written to the bucket determined by
+/// `forward_map[row] / rows_per_bucket`.
 fn scatter_columns(
     vfs: &dyn VirtualFileSystem,
     base_path: &str,
@@ -111,9 +111,10 @@ fn scatter_columns(
     let input_dtypes = input.column_types();
     let num_input_cols = input_dtypes.len();
 
-    // Scatter columns: input columns + forward_map as the last column
+    // Output columns: input columns + forward_map as the last column
     let mut scatter_dtypes = input_dtypes.clone();
     scatter_dtypes.push(FlexTypeEnum::Integer);
+    let fmap_col_idx = num_input_cols;
 
     let mut scatter_writer = ScatterWriter::new(
         vfs,
@@ -123,73 +124,44 @@ fn scatter_columns(
         num_buckets,
     )?;
 
-    // Process each input column: stream [forward_map, column] together
-    for col_idx in 0..num_input_cols {
-        let col_sarray = input.columns()[col_idx].clone();
-        let fmap_sarray = forward_map.clone();
+    // Build an SFrame with all input columns + forward_map, stream in one pass
+    let mut all_cols: Vec<SArray> = input.columns().to_vec();
+    all_cols.push(forward_map.clone());
+    let mut all_names: Vec<String> = input.column_names().to_vec();
+    all_names.push("__fmap__".to_string());
+    let full_sf = SFrame::new_with_columns(all_cols, all_names);
 
-        // Build a 2-column SFrame [forward_map, value_column]
-        let pair_sf = SFrame::new_with_columns(
-            vec![fmap_sarray, col_sarray],
-            vec!["__fmap__".to_string(), "__val__".to_string()],
-        );
+    let mut stream = full_sf.compile_stream()?;
+    while let Some(batch_result) = stream.next_batch() {
+        let batch = batch_result?;
+        let fmap_col = batch.column(fmap_col_idx);
 
-        let mut stream = pair_sf.compile_stream()?;
-        while let Some(batch_result) = stream.next_batch() {
-            let batch = batch_result?;
-            let fmap_col = batch.column(0);
-            let val_col = batch.column(1);
+        for r in 0..batch.num_rows() {
+            let fmap_val = match fmap_col.get(r) {
+                FlexType::Integer(v) => v as u64,
+                _ => {
+                    return Err(SFrameError::Type(
+                        "forward_map must contain Integer values".into(),
+                    ))
+                }
+            };
 
-            for r in 0..batch.num_rows() {
-                let fmap_val = match fmap_col.get(r) {
-                    FlexType::Integer(v) => v as u64,
-                    _ => {
-                        return Err(SFrameError::Type(
-                            "forward_map must contain Integer values".into(),
-                        ))
-                    }
-                };
+            let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
 
-                let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-                scatter_writer.write_to_segment(col_idx, bucket, val_col.get(r))?;
-            }
-        }
-        scatter_writer.flush_column(col_idx)?;
-    }
-
-    // Now scatter the forward_map itself as the last column
-    {
-        let fmap_col_idx = num_input_cols;
-        let fmap_sarray = forward_map.clone();
-        let fmap_sf = SFrame::new_with_columns(
-            vec![fmap_sarray],
-            vec!["__fmap__".to_string()],
-        );
-
-        let mut stream = fmap_sf.compile_stream()?;
-        while let Some(batch_result) = stream.next_batch() {
-            let batch = batch_result?;
-            let col = batch.column(0);
-
-            for r in 0..batch.num_rows() {
-                let fmap_val = match col.get(r) {
-                    FlexType::Integer(v) => v as u64,
-                    _ => {
-                        return Err(SFrameError::Type(
-                            "forward_map must contain Integer values".into(),
-                        ))
-                    }
-                };
-
-                let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
+            // Scatter all input columns + forward_map for this row
+            for col_idx in 0..num_input_cols {
                 scatter_writer.write_to_segment(
-                    fmap_col_idx,
+                    col_idx,
                     bucket,
-                    FlexType::Integer(fmap_val as i64),
+                    batch.column(col_idx).get(r),
                 )?;
             }
+            scatter_writer.write_to_segment(
+                fmap_col_idx,
+                bucket,
+                FlexType::Integer(fmap_val as i64),
+            )?;
         }
-        scatter_writer.flush_column(fmap_col_idx)?;
     }
 
     scatter_writer.finish()

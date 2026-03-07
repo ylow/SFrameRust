@@ -1,8 +1,9 @@
 //! ScatterWriter: writes column values to M segment files by (column, segment) pair.
 //!
-//! Used by EC Sort to scatter column values into buckets. Columns must be
-//! written in sequential order so that blocks appear in column order within
-//! each segment file.
+//! Used by EC Sort to scatter column values into buckets. Values for any
+//! column can be written at any time — blocks in segment files may be
+//! interleaved across columns, and SegmentReader handles this via the
+//! offset field in BlockInfo.
 
 use sframe_io::vfs::{VirtualFileSystem, WritableFile};
 use sframe_types::error::{Result, SFrameError};
@@ -24,22 +25,20 @@ pub struct ScatterResult {
 
 /// Writes column values to M segment files, supporting scatter by (column, segment).
 ///
-/// Columns must be written in strictly increasing order. Within each column,
-/// values can be written to any segment in any order. Buffering and adaptive
-/// block sizing are handled per-segment for the active column.
+/// Values for any column can be written in any order. Per-(column, segment)
+/// buffers are flushed as blocks when they reach the target block size.
+/// Blocks from different columns may be interleaved in segment files;
+/// SegmentReader handles this via offset-based seeking.
 pub struct ScatterWriter {
     segment_writers: Vec<SegmentWriter<Box<dyn WritableFile>>>,
     segment_files: Vec<String>,
     column_types: Vec<FlexTypeEnum>,
+    num_columns: usize,
     num_segments: usize,
-    /// Per-segment buffer for the active column.
-    buffers: Vec<Vec<FlexType>>,
-    /// Adaptive block size (rows) for the active column.
-    rows_per_block: usize,
-    /// Type of the active column.
-    active_dtype: FlexTypeEnum,
-    /// Index of the active column, or None if no column is active.
-    active_column: Option<usize>,
+    /// Per-column, per-segment buffers: `buffers[col][seg]`.
+    buffers: Vec<Vec<Vec<FlexType>>>,
+    /// Per-column target block size (rows).
+    rows_per_block: Vec<usize>,
     /// Per-segment, per-column row counts: `column_counts[seg][col]`.
     column_counts: Vec<Vec<u64>>,
 }
@@ -55,6 +54,7 @@ impl ScatterWriter {
         column_types: &[FlexTypeEnum],
         num_segments: usize,
     ) -> Result<Self> {
+        let num_columns = column_types.len();
         let mut segment_writers = Vec::with_capacity(num_segments);
         let mut segment_files = Vec::with_capacity(num_segments);
 
@@ -62,73 +62,45 @@ impl ScatterWriter {
             let seg_file = segment_filename(data_prefix, seg_idx);
             let seg_path = format!("{base_path}/{seg_file}");
             let file = vfs.open_write(&seg_path)?;
-            segment_writers.push(SegmentWriter::new(file, column_types.len()));
+            segment_writers.push(SegmentWriter::new(file, num_columns));
             segment_files.push(seg_file);
         }
 
-        let column_counts = vec![vec![0u64; column_types.len()]; num_segments];
+        let column_counts = vec![vec![0u64; num_columns]; num_segments];
+
+        let rows_per_block: Vec<usize> = column_types
+            .iter()
+            .map(|&dt| {
+                let est = estimate_bytes_per_value(dt).max(1);
+                (TARGET_BLOCK_SIZE / est).clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK)
+            })
+            .collect();
+
+        let buffers = (0..num_columns)
+            .map(|_| (0..num_segments).map(|_| Vec::new()).collect())
+            .collect();
 
         Ok(ScatterWriter {
             segment_writers,
             segment_files,
             column_types: column_types.to_vec(),
+            num_columns,
             num_segments,
-            buffers: vec![Vec::new(); num_segments],
-            rows_per_block: MIN_ROWS_PER_BLOCK,
-            active_dtype: FlexTypeEnum::Undefined,
-            active_column: None,
+            buffers,
+            rows_per_block,
             column_counts,
         })
     }
 
-    /// Begin writing a new column. Validates ordering and flushes the previous column.
-    fn begin_column(&mut self, column_id: usize) -> Result<()> {
-        // Validate column order: must be strictly greater than previous
-        if let Some(prev) = self.active_column {
-            if column_id <= prev {
-                return Err(SFrameError::Format(format!(
-                    "ScatterWriter: column {column_id} is not after previous column {prev}; \
-                     columns must be written in strictly increasing order"
-                )));
-            }
-            // Flush the previous column
-            self.flush_active_column()?;
-        }
-
-        // Set up for the new column
-        let dtype = self.column_types[column_id];
-        let est = estimate_bytes_per_value(dtype).max(1);
-        let rows_per_block = (TARGET_BLOCK_SIZE / est).clamp(MIN_ROWS_PER_BLOCK, MAX_ROWS_PER_BLOCK);
-
-        self.active_column = Some(column_id);
-        self.active_dtype = dtype;
-        self.rows_per_block = rows_per_block;
-
-        // Clear buffers (should already be empty after flush, but be safe)
-        for buf in &mut self.buffers {
-            buf.clear();
-        }
-
-        Ok(())
-    }
-
-    /// Write a value to a specific segment for the given column.
+    /// Write a value to a specific (column, segment) pair.
     ///
-    /// Auto-begins the column if it is not yet active. Columns must be written
-    /// in strictly increasing order.
+    /// Values for any column can be written in any order.
     pub fn write_to_segment(
         &mut self,
         column_id: usize,
         segment_id: usize,
         value: FlexType,
     ) -> Result<()> {
-        // Auto-begin column if needed
-        match self.active_column {
-            None => self.begin_column(column_id)?,
-            Some(active) if active != column_id => self.begin_column(column_id)?,
-            _ => {}
-        }
-
         if segment_id >= self.num_segments {
             return Err(SFrameError::Format(format!(
                 "ScatterWriter: segment_id {segment_id} out of range ({})",
@@ -136,42 +108,31 @@ impl ScatterWriter {
             )));
         }
 
-        self.buffers[segment_id].push(value);
+        self.buffers[column_id][segment_id].push(value);
 
-        // Flush if buffer reaches rows_per_block
-        if self.buffers[segment_id].len() >= self.rows_per_block {
-            self.flush_segment_buffer(column_id, segment_id)?;
+        if self.buffers[column_id][segment_id].len() >= self.rows_per_block[column_id] {
+            self.flush_buffer(column_id, segment_id)?;
         }
 
         Ok(())
     }
 
-    /// Flush all remaining buffers for the active column and deactivate it.
+    /// Flush all remaining buffers for a specific column across all segments.
     pub fn flush_column(&mut self, column_id: usize) -> Result<()> {
-        match self.active_column {
-            Some(active) if active == column_id => {
-                self.flush_active_column()?;
-                self.active_column = None;
-                Ok(())
-            }
-            Some(active) => Err(SFrameError::Format(format!(
-                "ScatterWriter::flush_column({column_id}) but active column is {active}"
-            ))),
-            None => {
-                // No active column; nothing to flush. This is not an error.
-                Ok(())
-            }
+        for seg_id in 0..self.num_segments {
+            self.flush_buffer(column_id, seg_id)?;
         }
+        Ok(())
     }
 
-    /// Finalize: flush the active column, finish all segment writers, return results.
+    /// Finalize: flush all buffers, finish all segment writers, return results.
     pub fn finish(mut self) -> Result<ScatterResult> {
-        // Flush active column if any
-        if self.active_column.is_some() {
-            self.flush_active_column()?;
+        for col_id in 0..self.num_columns {
+            for seg_id in 0..self.num_segments {
+                self.flush_buffer(col_id, seg_id)?;
+            }
         }
 
-        // Finish all segment writers and collect segment sizes
         let mut all_segment_sizes = Vec::with_capacity(self.num_segments);
         for seg_writer in self.segment_writers {
             let segment_sizes = seg_writer.finish()?;
@@ -184,9 +145,9 @@ impl ScatterWriter {
         })
     }
 
-    /// Flush one segment's buffer for the active column.
-    fn flush_segment_buffer(&mut self, column_id: usize, segment_id: usize) -> Result<()> {
-        let values: Vec<FlexType> = self.buffers[segment_id].drain(..).collect();
+    /// Flush one (column, segment) buffer.
+    fn flush_buffer(&mut self, column_id: usize, segment_id: usize) -> Result<()> {
+        let values: Vec<FlexType> = self.buffers[column_id][segment_id].drain(..).collect();
         if values.is_empty() {
             return Ok(());
         }
@@ -194,23 +155,9 @@ impl ScatterWriter {
         self.segment_writers[segment_id].write_column_block(
             column_id,
             &values,
-            self.active_dtype,
+            self.column_types[column_id],
         )?;
         self.column_counts[segment_id][column_id] += count;
-        Ok(())
-    }
-
-    /// Flush all segment buffers for the active column.
-    fn flush_active_column(&mut self) -> Result<()> {
-        let column_id = match self.active_column {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-
-        for seg_id in 0..self.num_segments {
-            self.flush_segment_buffer(column_id, seg_id)?;
-        }
-
         Ok(())
     }
 }
@@ -231,7 +178,6 @@ mod tests {
         let num_segments = 3;
         let data_prefix = "scatter_test";
 
-        // Create ScatterWriter
         let mut sw = ScatterWriter::new(
             &vfs,
             base_path,
@@ -256,51 +202,79 @@ mod tests {
 
         let result = sw.finish().unwrap();
 
-        // Verify segment files
         assert_eq!(result.segment_files.len(), 3);
         assert_eq!(result.all_segment_sizes.len(), 3);
 
-        // Each segment should have 3 values per column
         for seg_sizes in &result.all_segment_sizes {
             assert_eq!(seg_sizes[0], 3, "Expected 3 integers per segment");
             assert_eq!(seg_sizes[1], 3, "Expected 3 strings per segment");
         }
 
-        // Read back and verify with SegmentReader
         for seg_idx in 0..num_segments {
-            let seg_path = format!(
-                "{}/{}",
-                base_path, result.segment_files[seg_idx]
-            );
+            let seg_path = format!("{}/{}", base_path, result.segment_files[seg_idx]);
             let file = vfs.open_read(&seg_path).unwrap();
             let file_size = file.size().unwrap();
             let mut reader =
                 SegmentReader::open(Box::new(file), file_size, column_types.to_vec()).unwrap();
 
-            // Check integers
             let ints = reader.read_column(0).unwrap();
             assert_eq!(ints.len(), 3);
             for (j, val) in ints.iter().enumerate() {
                 let expected = (seg_idx + j * 3) as i64;
-                assert_eq!(
-                    *val,
-                    FlexType::Integer(expected),
-                    "Segment {seg_idx}, int index {j}: expected {expected}"
-                );
+                assert_eq!(*val, FlexType::Integer(expected));
             }
 
-            // Check strings
             let strs = reader.read_column(1).unwrap();
             assert_eq!(strs.len(), 3);
             for (j, val) in strs.iter().enumerate() {
                 let expected_i = seg_idx + j * 3;
                 let expected = FlexType::String(Arc::from(format!("val_{expected_i}")));
-                assert_eq!(
-                    *val, expected,
-                    "Segment {seg_idx}, string index {j}"
-                );
+                assert_eq!(*val, expected);
             }
         }
+    }
+
+    #[test]
+    fn test_scatter_interleaved_columns() {
+        // Write columns in interleaved order (col0, col1, col0, col1, ...)
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().to_str().unwrap();
+        let vfs = LocalFileSystem;
+        let column_types = [FlexTypeEnum::Integer, FlexTypeEnum::String];
+
+        let mut sw =
+            ScatterWriter::new(&vfs, base_path, "scatter_interleave", &column_types, 2).unwrap();
+
+        // Interleave writes: for each "row", write both columns
+        for i in 0..6i64 {
+            let seg = (i % 2) as usize;
+            sw.write_to_segment(0, seg, FlexType::Integer(i)).unwrap();
+            sw.write_to_segment(1, seg, FlexType::String(Arc::from(format!("s{i}"))))
+                .unwrap();
+        }
+
+        let result = sw.finish().unwrap();
+
+        // Each segment should have 3 rows per column
+        assert_eq!(result.all_segment_sizes[0][0], 3);
+        assert_eq!(result.all_segment_sizes[0][1], 3);
+
+        // Verify readback
+        let seg_path = format!("{}/{}", base_path, result.segment_files[0]);
+        let file = vfs.open_read(&seg_path).unwrap();
+        let file_size = file.size().unwrap();
+        let mut reader =
+            SegmentReader::open(Box::new(file), file_size, column_types.to_vec()).unwrap();
+
+        let ints = reader.read_column(0).unwrap();
+        assert_eq!(ints, vec![FlexType::Integer(0), FlexType::Integer(2), FlexType::Integer(4)]);
+
+        let strs = reader.read_column(1).unwrap();
+        assert_eq!(strs, vec![
+            FlexType::String(Arc::from("s0")),
+            FlexType::String(Arc::from("s2")),
+            FlexType::String(Arc::from("s4")),
+        ]);
     }
 
     #[test]
@@ -309,77 +283,18 @@ mod tests {
         let base_path = dir.path().to_str().unwrap();
         let vfs = LocalFileSystem;
         let column_types = [FlexTypeEnum::Integer];
-        let num_segments = 3;
-        let data_prefix = "scatter_empty";
 
-        let mut sw = ScatterWriter::new(
-            &vfs,
-            base_path,
-            data_prefix,
-            &column_types,
-            num_segments,
-        )
-        .unwrap();
+        let mut sw =
+            ScatterWriter::new(&vfs, base_path, "scatter_empty", &column_types, 3).unwrap();
 
-        // Write all values to segment 1 only
         for i in 0..10i64 {
             sw.write_to_segment(0, 1, FlexType::Integer(i)).unwrap();
         }
 
         let result = sw.finish().unwrap();
 
-        // Segment 0 and 2 should have 0 rows
         assert_eq!(result.all_segment_sizes[0][0], 0);
         assert_eq!(result.all_segment_sizes[1][0], 10);
         assert_eq!(result.all_segment_sizes[2][0], 0);
-
-        // Verify segment 1 has the right values
-        let seg_path = format!("{}/{}", base_path, result.segment_files[1]);
-        let file = vfs.open_read(&seg_path).unwrap();
-        let file_size = file.size().unwrap();
-        let mut reader =
-            SegmentReader::open(Box::new(file), file_size, column_types.to_vec()).unwrap();
-
-        let ints = reader.read_column(0).unwrap();
-        assert_eq!(ints.len(), 10);
-        for (i, val) in ints.iter().enumerate() {
-            assert_eq!(*val, FlexType::Integer(i as i64));
-        }
-    }
-
-    #[test]
-    fn test_scatter_column_order_enforced() {
-        let dir = tempfile::tempdir().unwrap();
-        let base_path = dir.path().to_str().unwrap();
-        let vfs = LocalFileSystem;
-        let column_types = [FlexTypeEnum::Integer, FlexTypeEnum::String];
-        let num_segments = 2;
-        let data_prefix = "scatter_order";
-
-        let mut sw = ScatterWriter::new(
-            &vfs,
-            base_path,
-            data_prefix,
-            &column_types,
-            num_segments,
-        )
-        .unwrap();
-
-        // Write to column 1 first
-        sw.write_to_segment(1, 0, FlexType::String(Arc::from("hello")))
-            .unwrap();
-
-        // Now try to write to column 0 — should fail
-        let result = sw.write_to_segment(0, 0, FlexType::Integer(42));
-        assert!(
-            result.is_err(),
-            "Writing column 0 after column 1 should fail"
-        );
-
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("not after previous column"),
-            "Error should mention column ordering: {err_msg}"
-        );
     }
 }
