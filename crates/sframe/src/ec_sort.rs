@@ -96,9 +96,9 @@ fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread:
 
 /// Scatter all input columns (plus the forward map) into segment files.
 ///
-/// Streams all columns + forward_map in a single pass. For each row,
-/// all column values are written to the bucket determined by
-/// `forward_map[row] / rows_per_bucket`.
+/// Reads the forward map in chunks, then processes columns in parallel
+/// within each chunk using plan slicing (`try_slice`). No materialization
+/// needed — row-range reads are projected through the lazy plan.
 fn scatter_columns(
     vfs: &dyn VirtualFileSystem,
     base_path: &str,
@@ -107,14 +107,18 @@ fn scatter_columns(
     forward_map: &SArray,
     num_buckets: usize,
     rows_per_bucket: u64,
+    num_rows: u64,
+    budget: usize,
 ) -> Result<sframe_storage::scatter_writer::ScatterResult> {
+    use sframe_query::execute::materialize_sync;
+
     let input_dtypes = input.column_types();
     let num_input_cols = input_dtypes.len();
+    let fmap_col_idx = num_input_cols;
 
     // Output columns: input columns + forward_map as the last column
     let mut scatter_dtypes = input_dtypes.clone();
     scatter_dtypes.push(FlexTypeEnum::Integer);
-    let fmap_col_idx = num_input_cols;
 
     let mut scatter_writer = ScatterWriter::new(
         vfs,
@@ -124,44 +128,82 @@ fn scatter_columns(
         num_buckets,
     )?;
 
-    // Build an SFrame with all input columns + forward_map, stream in one pass
-    let mut all_cols: Vec<SArray> = input.columns().to_vec();
-    all_cols.push(forward_map.clone());
-    let mut all_names: Vec<String> = input.column_names().to_vec();
-    all_names.push("__fmap__".to_string());
-    let full_sf = SFrame::new_with_columns(all_cols, all_names);
+    // Forward map chunk size: how many forward_map entries fit in memory.
+    // Each entry is an i64 (8 bytes) but stored as FlexType (~24 bytes).
+    let fmap_chunk_size = (budget / 24).max(1024) as u64;
 
-    let mut stream = full_sf.compile_stream()?;
-    while let Some(batch_result) = stream.next_batch() {
-        let batch = batch_result?;
-        let fmap_col = batch.column(fmap_col_idx);
+    // Build a single-column SFrame for the forward_map (for slicing)
+    let fmap_sf = SFrame::new_with_columns(
+        vec![forward_map.clone()],
+        vec!["__fmap__".to_string()],
+    );
 
-        for r in 0..batch.num_rows() {
-            let fmap_val = match fmap_col.get(r) {
+    let mut chunk_start = 0u64;
+    while chunk_start < num_rows {
+        let chunk_end = (chunk_start + fmap_chunk_size).min(num_rows);
+
+        // Read forward_map values for this chunk
+        let fmap_slice = fmap_sf.try_slice(chunk_start, chunk_end)?;
+        let fmap_batch = materialize_sync(fmap_slice.compile_stream()?)?;
+        let fmap_col = fmap_batch.column(0);
+        let chunk_len = fmap_batch.num_rows();
+
+        // Decode forward_map values into a shared Vec<u64>
+        let fmap_values: Vec<u64> = (0..chunk_len)
+            .map(|i| match fmap_col.get(i) {
                 FlexType::Integer(v) => v as u64,
-                _ => {
-                    return Err(SFrameError::Type(
-                        "forward_map must contain Integer values".into(),
-                    ))
+                _ => 0, // validated below
+            })
+            .collect();
+
+        // Process columns in parallel: each thread reads its column's
+        // data for this chunk via try_slice and classifies into buckets.
+        let input_columns = input.columns();
+        let per_col_results: Vec<Result<Vec<Vec<FlexType>>>> = (0..num_input_cols)
+            .into_par_iter()
+            .map(|col_idx| {
+                // Slice this column to the chunk range
+                let col_sa = input_columns[col_idx].try_slice(chunk_start, chunk_end)?;
+                let col_sf = SFrame::new_with_columns(
+                    vec![col_sa],
+                    vec!["__c__".to_string()],
+                );
+                let col_batch = materialize_sync(col_sf.compile_stream()?)?;
+                let col_data = col_batch.column(0);
+
+                // Classify each value into its bucket
+                let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
+                for r in 0..col_batch.num_rows() {
+                    let bucket =
+                        (fmap_values[r] / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
+                    seg_bufs[bucket].push(col_data.get(r));
                 }
-            };
+                Ok(seg_bufs)
+            })
+            .collect();
 
-            let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-
-            // Scatter all input columns + forward_map for this row
-            for col_idx in 0..num_input_cols {
-                scatter_writer.write_to_segment(
-                    col_idx,
-                    bucket,
-                    batch.column(col_idx).get(r),
-                )?;
+        // Write per-column per-segment buffers to ScatterWriter (sequential)
+        for (col_idx, result) in per_col_results.into_iter().enumerate() {
+            let seg_bufs = result?;
+            for (seg_idx, values) in seg_bufs.into_iter().enumerate() {
+                for value in values {
+                    scatter_writer.write_to_segment(col_idx, seg_idx, value)?;
+                }
             }
+        }
+
+        // Also scatter the forward_map values as the last column
+        for r in 0..chunk_len {
+            let fmap_val = fmap_values[r];
+            let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
             scatter_writer.write_to_segment(
                 fmap_col_idx,
                 bucket,
                 FlexType::Integer(fmap_val as i64),
             )?;
         }
+
+        chunk_start = chunk_end;
     }
 
     scatter_writer.finish()
@@ -442,7 +484,7 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
     scatter_vfs.mkdir_p(&scatter_path)?;
     let scatter_prefix = format!("s_{}", generate_hash(&scatter_path));
 
-    // Phase 1: Scatter
+    // Phase 1: Scatter (column-parallel via plan slicing)
     eprintln!("[sframe] ec_sort phase 1/2: scattering...");
     let scatter_result = scatter_columns(
         &*scatter_vfs,
@@ -452,6 +494,8 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
         forward_map,
         num_buckets,
         rows_per_bucket,
+        num_rows,
+        budget,
     )?;
 
     // Allocate output directory
