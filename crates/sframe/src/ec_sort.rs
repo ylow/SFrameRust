@@ -590,7 +590,9 @@ pub(crate) fn ec_sort(
         num_columns - key_column_indices.len(),
     );
 
-    let sorted_keys_sf = keys_sf.sort(&sort_spec)?;
+    // Use standard_sort to bypass the decision layer (which would route
+    // back to ec_sort, causing infinite recursion).
+    let sorted_keys_sf = keys_sf.standard_sort(&sort_spec)?;
 
     // Extract the inverse_map (the row number column from the sorted result)
     let inverse_map = sorted_keys_sf.column(row_number_name)?.clone();

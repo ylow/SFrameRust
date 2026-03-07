@@ -777,8 +777,9 @@ impl SFrame {
     }
 
     /// Standard sort: chooses between in-memory and external sort based on
-    /// memory budget. Used for small, simple datasets.
-    fn standard_sort(&self, keys: &[(&str, SortOrder)]) -> Result<SFrame> {
+    /// memory budget. Used for small, simple datasets and also called by
+    /// ec_sort internally to sort key columns (bypasses the decision layer).
+    pub(crate) fn standard_sort(&self, keys: &[(&str, SortOrder)]) -> Result<SFrame> {
         let sort_keys: Vec<SortKey> = keys
             .iter()
             .map(|(name, order)| {
