@@ -22,7 +22,7 @@ use sframe_query::planner::{LogicalOp, PlannerNode};
 use sframe_storage::scatter_writer::ScatterWriter;
 use sframe_storage::segment_reader::SegmentReader;
 use sframe_storage::segment_writer::{BufferedSegmentWriter, SegmentWriter};
-use sframe_storage::sframe_reader::SFrameReader;
+use sframe_storage::sframe_reader::{SFrameMetadata, SFrameReader};
 use sframe_storage::sframe_writer::{assemble_sframe_from_segments, generate_hash, segment_filename};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -192,9 +192,9 @@ fn scatter_columns(
 /// Direct scatter path for materialized inputs.
 ///
 /// Uses Mutex-wrapped SegmentWriters so rayon threads can write directly.
-/// Each thread reads blocks from its column, classifies values, and flushes
-/// to per-column per-segment buffers that drain to the segment writers.
-/// Memory per thread: one block + per-segment classification buffers.
+/// Each thread reads its column block-by-block, classifying and flushing
+/// to per-segment buffers as it goes. Memory per thread is bounded to
+/// one decoded block + per-segment flush buffers (~64KB each).
 fn scatter_columns_direct(
     vfs: &dyn VirtualFileSystem,
     base_path: &str,
@@ -232,7 +232,7 @@ fn scatter_columns_direct(
     // Reserve half the budget for fmap, the other half is for per-thread work.
     let fmap_chunk_size = (budget / 2 / 8).max(1024) as u64;
 
-    // Per-column target block size for flush thresholds
+    // Per-column flush threshold (rows per output block)
     let flush_threshold: Vec<usize> = scatter_dtypes
         .iter()
         .map(|&dt| {
@@ -241,45 +241,102 @@ fn scatter_columns_direct(
         })
         .collect();
 
+    // Pre-compute the segment layout for the input SFrame so threads
+    // don't need to re-parse metadata. Each entry is (seg_idx, num_blocks,
+    // per-block elem counts) for the physical column.
+    let input_meta = SFrameMetadata::open_with_fs(&*input_source.vfs, &input_source.path)?;
+    let input_seg_files = &input_meta.group_index.segment_files;
+    let input_seg_sizes = &input_meta.group_index.columns;
+
     let mut chunk_start = 0u64;
     while chunk_start < num_rows {
         let chunk_end = (chunk_start + fmap_chunk_size).min(num_rows);
 
         // Read forward_map chunk
-        let fmap_values = read_fmap_chunk(fmap_sf, &Some(fmap_source.clone()), chunk_start, chunk_end)?;
+        let fmap_values = read_fmap_chunk(
+            fmap_sf, &Some(fmap_source.clone()), chunk_start, chunk_end,
+        )?;
 
-        // Process input columns in parallel — each thread reads blocks and
-        // writes directly to the Mutex-wrapped segment writers.
+        // Process input columns in parallel — each thread opens only the
+        // segment files it needs, reads block-by-block, and scatters
+        // values immediately without accumulating the full chunk.
         let col_errors: Vec<Result<()>> = (0..num_input_cols)
             .into_par_iter()
             .map(|col_idx| {
-                let mut reader = SFrameReader::open_with_fs(&*input_source.vfs, &input_source.path)?;
                 let phys_col = input_source.column_map[col_idx];
                 let dtype = input_dtypes[col_idx];
                 let thresh = flush_threshold[col_idx];
+                let col_types: Vec<FlexTypeEnum> = input_meta.group_index.columns
+                    .iter().map(|c| c.dtype).collect();
 
-                // Per-segment buffers (thread-local, not shared)
+                // Thread-local per-segment classification buffers
                 let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
 
-                let values = reader.read_column_range(phys_col, chunk_start, chunk_end)?;
-                for (r, value) in values.into_iter().enumerate() {
-                    let bucket = (fmap_values[r] / rows_per_bucket)
-                        .min(num_buckets as u64 - 1) as usize;
-                    seg_bufs[bucket].push(value);
+                // Walk segments and blocks, tracking global row position
+                let mut global_row = 0u64;
+                for (seg_idx, seg_file) in input_seg_files.iter().enumerate() {
+                    let seg_rows = input_seg_sizes[phys_col].segment_sizes[seg_idx];
+                    let seg_end = global_row + seg_rows;
 
-                    // Flush when buffer reaches block size
-                    if seg_bufs[bucket].len() >= thresh {
-                        let buf = std::mem::take(&mut seg_bufs[bucket]);
-                        let mut sw = segment_writers[bucket].lock().unwrap();
-                        sw.write_column_block(col_idx, &buf, dtype)?;
+                    // Skip segments entirely before or after the chunk
+                    if seg_end <= chunk_start || global_row >= chunk_end {
+                        global_row = seg_end;
+                        continue;
                     }
+
+                    // Open this segment's reader
+                    let seg_path = format!("{}/{seg_file}", input_source.path);
+                    let file = input_source.vfs.open_read(&seg_path)?;
+                    let file_size = file.size()?;
+                    let mut seg_reader = SegmentReader::open(
+                        Box::new(file), file_size, col_types.clone(),
+                    )?;
+
+                    // Walk blocks within the segment
+                    let mut block_row = global_row;
+                    for blk_idx in 0..seg_reader.num_blocks(phys_col) {
+                        let blk_len = seg_reader.block_num_elem(phys_col, blk_idx);
+                        let blk_end = block_row + blk_len;
+
+                        if blk_end <= chunk_start {
+                            block_row = blk_end;
+                            continue;
+                        }
+                        if block_row >= chunk_end {
+                            break;
+                        }
+
+                        // Decode this block
+                        let block_data = seg_reader.read_block(phys_col, blk_idx)?;
+
+                        // Determine which rows within the block fall in [chunk_start, chunk_end)
+                        let local_begin = chunk_start.saturating_sub(block_row) as usize;
+                        let local_end = (chunk_end - block_row).min(blk_len) as usize;
+
+                        for i in local_begin..local_end {
+                            let fmap_idx = (block_row + i as u64 - chunk_start) as usize;
+                            let bucket = (fmap_values[fmap_idx] / rows_per_bucket)
+                                .min(num_buckets as u64 - 1) as usize;
+                            seg_bufs[bucket].push(block_data[i].clone());
+
+                            if seg_bufs[bucket].len() >= thresh {
+                                let buf = std::mem::take(&mut seg_bufs[bucket]);
+                                segment_writers[bucket].lock().unwrap()
+                                    .write_column_block(col_idx, &buf, dtype)?;
+                            }
+                        }
+
+                        block_row = blk_end;
+                    }
+
+                    global_row = seg_end;
                 }
 
-                // Flush remaining
+                // Flush remaining buffers
                 for (seg_idx, buf) in seg_bufs.into_iter().enumerate() {
                     if !buf.is_empty() {
-                        let mut sw = segment_writers[seg_idx].lock().unwrap();
-                        sw.write_column_block(col_idx, &buf, dtype)?;
+                        segment_writers[seg_idx].lock().unwrap()
+                            .write_column_block(col_idx, &buf, dtype)?;
                     }
                 }
 
@@ -291,7 +348,8 @@ fn scatter_columns_direct(
             err?;
         }
 
-        // Scatter the forward_map as the last column (sequential, fast)
+        // Scatter the forward_map as the last column (sequential, fast —
+        // just integer classification, no I/O reads)
         let fmap_dtype = FlexTypeEnum::Integer;
         let fmap_thresh = flush_threshold[fmap_col_idx];
         let mut fmap_seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
