@@ -746,8 +746,9 @@ impl SFrame {
     /// Sort by one or more columns.
     ///
     /// Automatically selects the best sort algorithm:
-    /// - **Standard sort** (in-memory or external) for small, simple datasets:
-    ///   fewer than 100K rows, fewer than 5 columns, and all numeric types.
+    /// - **Standard sort** (in-memory or external) when:
+    ///   - All numeric types with 3 or fewer columns (any row count), OR
+    ///   - Fewer than 100K rows, fewer than 5 columns, and all numeric types.
     /// - **EC Sort** (External Columnar Sort) for everything else: separates
     ///   key sorting from value permutation, more efficient for wide SFrames
     ///   or SFrames with large non-numeric columns.
@@ -759,7 +760,9 @@ impl SFrame {
             FlexTypeEnum::Integer | FlexTypeEnum::Float | FlexTypeEnum::DateTime
         ));
 
-        let use_standard_sort = num_rows < 100_000 && num_cols < 5 && all_numeric;
+        let use_standard_sort =
+            (num_rows < 100_000 && num_cols < 5 && all_numeric)
+            || (all_numeric && num_cols <= 3);
 
         if use_standard_sort {
             self.standard_sort(keys)
