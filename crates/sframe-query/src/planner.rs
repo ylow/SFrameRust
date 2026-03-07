@@ -816,6 +816,11 @@ pub fn clone_plan_with_row_range(
                 source_id: source_id.clone(),
                 source_fn: source_fn.clone(),
             },
+            LogicalOp::Range { start, step, .. } => LogicalOp::Range {
+                start: start + begin_row as i64 * step,
+                step: *step,
+                count: end_row - begin_row,
+            },
             other => other.clone_op(),
         };
 

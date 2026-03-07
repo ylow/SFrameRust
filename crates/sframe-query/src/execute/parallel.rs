@@ -24,7 +24,7 @@ const MIN_ROWS_FOR_PARALLEL: u64 = 10_000;
 /// - Every leaf node is `SFrameSource`
 /// - All `SFrameSource` leaves have the same path (or are the same Arc)
 /// - All `SFrameSource` leaves read the full range (begin_row=0, end_row=num_rows)
-/// - No `Reduce`, `Append`, `Union`, `MaterializedSource`, or `Range` operators
+/// - No `Reduce`, `Append`, `Union`, or `MaterializedSource` operators
 pub fn parallel_slice_row_count(plan: &Arc<PlannerNode>) -> Option<u64> {
     let mut total_rows: Option<u64> = None;
     let mut source_path: Option<String> = None;
@@ -102,12 +102,22 @@ fn check_sliceable(
             true
         }
 
+        // Range is a sliceable leaf — it produces `count` rows that can be
+        // split across workers just like SFrameSource.
+        LogicalOp::Range { count, .. } => {
+            match *total_rows {
+                None => *total_rows = Some(*count),
+                Some(existing) if existing != *count => return false,
+                _ => {}
+            }
+            true
+        }
+
         // These operators cannot be sliced
         LogicalOp::Reduce { .. }
         | LogicalOp::Append
         | LogicalOp::Union
-        | LogicalOp::MaterializedSource { .. }
-        | LogicalOp::Range { .. } => false,
+        | LogicalOp::MaterializedSource { .. } => false,
 
         // These operators are fine — recurse into inputs
         LogicalOp::Project { .. }
@@ -290,10 +300,25 @@ mod tests {
     }
 
     #[test]
-    fn test_not_sliceable_range() {
+    fn test_sliceable_range() {
         let range = PlannerNode::range(0, 1, 100);
-        assert_eq!(parallel_slice_row_count(&range), None);
+        assert_eq!(parallel_slice_row_count(&range), Some(100));
     }
+
+    #[test]
+    fn test_sliceable_column_union_with_range() {
+        // This is the pattern ec_sort uses: SFrameSource + Range in a ColumnUnion
+        let source = PlannerNode::sframe_source(
+            "test.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            100_000,
+        );
+        let range = PlannerNode::range(0, 1, 100_000);
+        let union = PlannerNode::column_union(vec![source, range]);
+        assert_eq!(parallel_slice_row_count(&union), Some(100_000));
+    }
+
 
     #[test]
     fn test_not_sliceable_different_paths() {
