@@ -771,6 +771,22 @@ impl SFrame {
         }
     }
 
+    /// Sort using External Columnar Sort.
+    ///
+    /// More memory-efficient than `sort` for SFrames with many or large value
+    /// columns, because only the key columns are fully sorted; value columns
+    /// are permuted in a streaming fashion.
+    ///
+    /// `keys` is a list of `(column_name, ascending)` pairs.
+    pub fn ec_sort(&self, keys: &[(&str, bool)]) -> Result<SFrame> {
+        let key_indices: Vec<usize> = keys
+            .iter()
+            .map(|(name, _)| self.column_index(name))
+            .collect::<Result<_>>()?;
+        let sort_orders: Vec<bool> = keys.iter().map(|(_, asc)| *asc).collect();
+        crate::ec_sort::ec_sort(self, &key_indices, &sort_orders)
+    }
+
     /// Sort entirely in memory. Used when data fits within the sort memory budget.
     pub(crate) fn sort_in_memory(&self, sort_keys: &[SortKey]) -> Result<SFrame> {
         let stream = self.compile_stream()?;

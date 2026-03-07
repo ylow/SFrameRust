@@ -509,13 +509,177 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
     Ok(result)
 }
 
-/// Sort an SFrame using EC Sort.
+/// Sort an SFrame using External Columnar Sort.
 ///
-/// This is a placeholder for the full EC Sort algorithm that first generates
-/// a forward map from the sort keys, then calls `permute_sframe`.
-#[allow(dead_code)]
-pub(crate) fn ec_sort(_sf: &SFrame, _sort_keys: &[sframe_query::algorithms::sort::SortKey]) -> Result<SFrame> {
-    todo!("ec_sort: generate forward map from sort keys, then call permute_sframe")
+/// This algorithm is more memory-efficient than a full sort when the SFrame
+/// has many or large value (non-key) columns. It works by:
+///
+/// 1. Sorting only the key columns (plus a row-number column) to produce the
+///    inverse map and sorted key columns.
+/// 2. Computing the forward map by permuting `[0..N)` with the inverse map.
+/// 3. Permuting only the value columns using the forward map.
+/// 4. Reassembling the final SFrame in original column order.
+///
+/// # Arguments
+/// * `input` - The SFrame to sort.
+/// * `key_column_indices` - Indices of columns to sort by.
+/// * `sort_orders` - For each key column, `true` = ascending, `false` = descending.
+pub(crate) fn ec_sort(
+    input: &SFrame,
+    key_column_indices: &[usize],
+    sort_orders: &[bool],
+) -> Result<SFrame> {
+    use sframe_query::algorithms::sort::SortOrder;
+
+    let num_rows = input.num_rows()?;
+    if num_rows == 0 {
+        return input.head(0);
+    }
+
+    let column_names = input.column_names();
+    let num_columns = column_names.len();
+
+    // Validate indices
+    for &idx in key_column_indices {
+        if idx >= num_columns {
+            return Err(SFrameError::Format(format!(
+                "Key column index {idx} out of range (SFrame has {num_columns} columns)"
+            )));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1: Sort key columns + row-number column to get inverse_map
+    // -----------------------------------------------------------------------
+
+    // Build a sub-SFrame with only the key columns + a row number column
+    let row_number_name = "__ec_row_number__";
+    let range_plan = PlannerNode::range(0, 1, num_rows);
+    let row_number_sarray =
+        SArray::from_plan(range_plan, FlexTypeEnum::Integer, Some(num_rows), 0);
+
+    let mut key_columns: Vec<SArray> = Vec::with_capacity(key_column_indices.len() + 1);
+    let mut key_names: Vec<String> = Vec::with_capacity(key_column_indices.len() + 1);
+    for &idx in key_column_indices {
+        key_columns.push(input.columns()[idx].clone());
+        key_names.push(column_names[idx].clone());
+    }
+    key_columns.push(row_number_sarray);
+    key_names.push(row_number_name.to_string());
+
+    let keys_sf = SFrame::new_with_columns(key_columns, key_names.clone());
+
+    // Build sort specification: sort by each key column in its specified order
+    let sort_spec: Vec<(&str, SortOrder)> = key_column_indices
+        .iter()
+        .zip(sort_orders.iter())
+        .map(|(&idx, &asc)| {
+            let name = column_names[idx].as_str();
+            let order = if asc {
+                SortOrder::Ascending
+            } else {
+                SortOrder::Descending
+            };
+            (name, order)
+        })
+        .collect();
+
+    eprintln!(
+        "[sframe] ec_sort: {num_rows} rows, {} key cols, {} value cols",
+        key_column_indices.len(),
+        num_columns - key_column_indices.len(),
+    );
+
+    let sorted_keys_sf = keys_sf.sort(&sort_spec)?;
+
+    // Extract the inverse_map (the row number column from the sorted result)
+    let inverse_map = sorted_keys_sf.column(row_number_name)?.clone();
+
+    // Extract sorted key columns (without the row number column)
+    let sorted_key_names: Vec<&str> = key_names[..key_column_indices.len()]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let sorted_keys = sorted_keys_sf.select(&sorted_key_names)?;
+
+    // -----------------------------------------------------------------------
+    // Step 2: Compute forward_map by permuting [0..N) with the inverse_map
+    // -----------------------------------------------------------------------
+    // forward_map[inverse_map[i]] = i, so permuting [0..N) by inverse_map
+    // gives the forward_map.
+
+    let range_plan2 = PlannerNode::range(0, 1, num_rows);
+    let range_sarray =
+        SArray::from_plan(range_plan2, FlexTypeEnum::Integer, Some(num_rows), 0);
+    let range_sf = SFrame::new_with_columns(
+        vec![range_sarray],
+        vec!["__idx__".to_string()],
+    );
+
+    let permuted_range_sf = permute_sframe(&range_sf, &inverse_map)?;
+    let forward_map = permuted_range_sf.columns()[0].clone();
+
+    // -----------------------------------------------------------------------
+    // Step 3: Permute value columns using the forward_map
+    // -----------------------------------------------------------------------
+
+    // Identify value column indices (everything not in key_column_indices)
+    let key_set: std::collections::HashSet<usize> =
+        key_column_indices.iter().copied().collect();
+    let value_column_indices: Vec<usize> = (0..num_columns)
+        .filter(|i| !key_set.contains(i))
+        .collect();
+
+    let sorted_value_columns: Option<SFrame> = if !value_column_indices.is_empty() {
+        // Build a sub-SFrame of just the value columns
+        let value_cols: Vec<SArray> = value_column_indices
+            .iter()
+            .map(|&idx| input.columns()[idx].clone())
+            .collect();
+        let value_names: Vec<String> = value_column_indices
+            .iter()
+            .map(|&idx| column_names[idx].clone())
+            .collect();
+        let value_sf = SFrame::new_with_columns(value_cols, value_names);
+
+        Some(permute_sframe(&value_sf, &forward_map)?)
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 4: Reassemble in original column order
+    // -----------------------------------------------------------------------
+
+    let mut final_columns: Vec<SArray> = Vec::with_capacity(num_columns);
+    let mut final_names: Vec<String> = Vec::with_capacity(num_columns);
+
+    for col_idx in 0..num_columns {
+        final_names.push(column_names[col_idx].clone());
+        if key_set.contains(&col_idx) {
+            // Find which position in key_column_indices this column is
+            let key_pos = key_column_indices
+                .iter()
+                .position(|&k| k == col_idx)
+                .unwrap();
+            final_columns.push(sorted_keys.columns()[key_pos].clone());
+        } else {
+            // Find which position in value_column_indices this column is
+            let val_pos = value_column_indices
+                .iter()
+                .position(|&v| v == col_idx)
+                .unwrap();
+            final_columns.push(
+                sorted_value_columns
+                    .as_ref()
+                    .unwrap()
+                    .columns()[val_pos]
+                    .clone(),
+            );
+        }
+    }
+
+    Ok(SFrame::new_with_columns(final_columns, final_names))
 }
 
 // ---------------------------------------------------------------------------
@@ -646,5 +810,335 @@ mod tests {
         assert_eq!(rows[0], vec![FlexType::Integer(10)]);
         assert_eq!(rows[1], vec![FlexType::Integer(20)]);
         assert_eq!(rows[2], vec![FlexType::Integer(30)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ec_sort integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ec_sort_basic() {
+        let ids = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let names = SArray::from_vec(
+            vec![
+                FlexType::String(Arc::from("three")),
+                FlexType::String(Arc::from("one")),
+                FlexType::String(Arc::from("two")),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", ids), ("name", names)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 3);
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
+
+        // Column names should be preserved in order
+        assert_eq!(result.column_names(), &["id", "name"]);
+    }
+
+    #[test]
+    fn test_ec_sort_descending() {
+        let ids = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let names = SArray::from_vec(
+            vec![
+                FlexType::String(Arc::from("three")),
+                FlexType::String(Arc::from("one")),
+                FlexType::String(Arc::from("two")),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", ids), ("name", names)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[false]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 3);
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
+    }
+
+    #[test]
+    fn test_ec_sort_matches_standard_sort() {
+        use sframe_query::algorithms::sort::SortOrder;
+
+        let n = 1000;
+        let int_vals: Vec<FlexType> = (0..n)
+            .rev()
+            .map(|i| FlexType::Integer(i as i64))
+            .collect();
+        let str_vals: Vec<FlexType> = (0..n)
+            .rev()
+            .map(|i| FlexType::String(Arc::from(format!("str_{:04}", i))))
+            .collect();
+        let float_vals: Vec<FlexType> = (0..n)
+            .rev()
+            .map(|i| FlexType::Float(i as f64 * 1.5))
+            .collect();
+
+        let col_i = SArray::from_vec(int_vals, FlexTypeEnum::Integer).unwrap();
+        let col_s = SArray::from_vec(str_vals, FlexTypeEnum::String).unwrap();
+        let col_f = SArray::from_vec(float_vals, FlexTypeEnum::Float).unwrap();
+
+        let sf = SFrame::from_columns(vec![
+            ("ints", col_i),
+            ("strs", col_s),
+            ("floats", col_f),
+        ]).unwrap();
+
+        let ec_result = ec_sort(&sf, &[0], &[true]).unwrap();
+        let std_result = sf.sort(&[("ints", SortOrder::Ascending)]).unwrap();
+
+        assert_eq!(ec_result.num_rows().unwrap(), std_result.num_rows().unwrap());
+
+        let ec_rows = ec_result.iter_rows().unwrap();
+        let std_rows = std_result.iter_rows().unwrap();
+
+        for i in 0..n {
+            assert_eq!(
+                ec_rows[i], std_rows[i],
+                "Row {i} mismatch: ec_sort={:?}, sort={:?}",
+                ec_rows[i], std_rows[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_ec_sort_single_row() {
+        let ids = SArray::from_vec(
+            vec![FlexType::Integer(42)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let vals = SArray::from_vec(
+            vec![FlexType::String(Arc::from("hello"))],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", ids), ("val", vals)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 1);
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(42), FlexType::String(Arc::from("hello"))]);
+    }
+
+    #[test]
+    fn test_ec_sort_already_sorted() {
+        let n = 100;
+        let int_vals: Vec<FlexType> = (0..n).map(|i| FlexType::Integer(i as i64)).collect();
+        let str_vals: Vec<FlexType> = (0..n)
+            .map(|i| FlexType::String(Arc::from(format!("row_{:03}", i))))
+            .collect();
+
+        let col_i = SArray::from_vec(int_vals.clone(), FlexTypeEnum::Integer).unwrap();
+        let col_s = SArray::from_vec(str_vals.clone(), FlexTypeEnum::String).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", col_i), ("label", col_s)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), n as u64);
+        let rows = result.iter_rows().unwrap();
+        for i in 0..n {
+            assert_eq!(rows[i][0], int_vals[i]);
+            assert_eq!(rows[i][1], str_vals[i]);
+        }
+    }
+
+    #[test]
+    fn test_ec_sort_all_identical_keys() {
+        let n = 10;
+        let int_vals: Vec<FlexType> = (0..n).map(|_| FlexType::Integer(7)).collect();
+        let str_vals: Vec<FlexType> = (0..n)
+            .map(|i| FlexType::String(Arc::from(format!("item_{}", i))))
+            .collect();
+
+        let col_i = SArray::from_vec(int_vals, FlexTypeEnum::Integer).unwrap();
+        let col_s = SArray::from_vec(str_vals, FlexTypeEnum::String).unwrap();
+
+        let sf = SFrame::from_columns(vec![("key", col_i), ("val", col_s)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        // Should not crash; all 10 rows present
+        assert_eq!(result.num_rows().unwrap(), 10);
+
+        // All keys should be 7
+        let rows = result.iter_rows().unwrap();
+        for row in &rows {
+            assert_eq!(row[0], FlexType::Integer(7));
+        }
+
+        // All value strings should be present (order among ties is unspecified)
+        let mut vals: Vec<String> = rows.iter().map(|r| {
+            match &r[1] {
+                FlexType::String(s) => s.to_string(),
+                _ => panic!("expected string"),
+            }
+        }).collect();
+        vals.sort();
+        let mut expected: Vec<String> = (0..n).map(|i| format!("item_{}", i)).collect();
+        expected.sort();
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn test_ec_sort_multi_key() {
+        // 4 rows with two key columns: sort by (group ASC, priority DESC)
+        let groups = SArray::from_vec(
+            vec![
+                FlexType::Integer(2),
+                FlexType::Integer(1),
+                FlexType::Integer(1),
+                FlexType::Integer(2),
+            ],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let priorities = SArray::from_vec(
+            vec![
+                FlexType::Integer(10),
+                FlexType::Integer(20),
+                FlexType::Integer(30),
+                FlexType::Integer(40),
+            ],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let labels = SArray::from_vec(
+            vec![
+                FlexType::String(Arc::from("g2p10")),
+                FlexType::String(Arc::from("g1p20")),
+                FlexType::String(Arc::from("g1p30")),
+                FlexType::String(Arc::from("g2p40")),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![
+            ("group", groups),
+            ("priority", priorities),
+            ("label", labels),
+        ]).unwrap();
+
+        // Sort by group ASC, priority DESC
+        let result = ec_sort(&sf, &[0, 1], &[true, false]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 4);
+        let rows = result.iter_rows().unwrap();
+
+        // Expected order: group=1,pri=30 -> group=1,pri=20 -> group=2,pri=40 -> group=2,pri=10
+        assert_eq!(rows[0][0], FlexType::Integer(1));
+        assert_eq!(rows[0][1], FlexType::Integer(30));
+        assert_eq!(rows[0][2], FlexType::String(Arc::from("g1p30")));
+
+        assert_eq!(rows[1][0], FlexType::Integer(1));
+        assert_eq!(rows[1][1], FlexType::Integer(20));
+        assert_eq!(rows[1][2], FlexType::String(Arc::from("g1p20")));
+
+        assert_eq!(rows[2][0], FlexType::Integer(2));
+        assert_eq!(rows[2][1], FlexType::Integer(40));
+        assert_eq!(rows[2][2], FlexType::String(Arc::from("g2p40")));
+
+        assert_eq!(rows[3][0], FlexType::Integer(2));
+        assert_eq!(rows[3][1], FlexType::Integer(10));
+        assert_eq!(rows[3][2], FlexType::String(Arc::from("g2p10")));
+    }
+
+    #[test]
+    fn test_ec_sort_many_columns() {
+        let n = 200;
+        // 1 key column + 20 value string columns
+        let key_vals: Vec<FlexType> = (0..n)
+            .rev()
+            .map(|i| FlexType::Integer(i as i64))
+            .collect();
+        let key_col = SArray::from_vec(key_vals, FlexTypeEnum::Integer).unwrap();
+
+        let col_names: Vec<String> = std::iter::once("key".to_string())
+            .chain((0..20).map(|i| format!("val_{}", i)))
+            .collect();
+
+        let mut all_columns: Vec<SArray> = vec![key_col];
+        for i in 0..20 {
+            let str_vals: Vec<FlexType> = (0..n)
+                .rev()
+                .map(|j| FlexType::String(Arc::from(format!("c{}_r{}", i, j))))
+                .collect();
+            all_columns.push(SArray::from_vec(str_vals, FlexTypeEnum::String).unwrap());
+        }
+
+        let sf = SFrame::new_with_columns(all_columns, col_names);
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), n as u64);
+        let rows = result.iter_rows().unwrap();
+
+        // First row should have key=0 (originally last row)
+        assert_eq!(rows[0][0], FlexType::Integer(0));
+        // Its value columns should reference row 0
+        for i in 0..20 {
+            assert_eq!(rows[0][1 + i], FlexType::String(Arc::from(format!("c{}_r0", i))));
+        }
+
+        // Last row should have key=199 (originally first row)
+        assert_eq!(rows[n - 1][0], FlexType::Integer((n - 1) as i64));
+        for i in 0..20 {
+            assert_eq!(
+                rows[n - 1][1 + i],
+                FlexType::String(Arc::from(format!("c{}_r{}", i, n - 1)))
+            );
+        }
+    }
+
+    #[test]
+    fn test_ec_sort_via_sframe_api() {
+        // Test the public SFrame::ec_sort method
+        let ids = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+        let names = SArray::from_vec(
+            vec![
+                FlexType::String(Arc::from("three")),
+                FlexType::String(Arc::from("one")),
+                FlexType::String(Arc::from("two")),
+            ],
+            FlexTypeEnum::String,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", ids), ("name", names)]).unwrap();
+        let result = sf.ec_sort(&[("id", true)]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 3);
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
+    }
+
+    #[test]
+    fn test_ec_sort_all_key_columns() {
+        // Edge case: all columns are key columns (no value columns to permute)
+        let ids = SArray::from_vec(
+            vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+            FlexTypeEnum::Integer,
+        ).unwrap();
+
+        let sf = SFrame::from_columns(vec![("id", ids)]).unwrap();
+        let result = ec_sort(&sf, &[0], &[true]).unwrap();
+
+        assert_eq!(result.num_rows().unwrap(), 3);
+        let rows = result.iter_rows().unwrap();
+        assert_eq!(rows[0], vec![FlexType::Integer(1)]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2)]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3)]);
     }
 }
