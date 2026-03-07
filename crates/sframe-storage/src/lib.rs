@@ -9,6 +9,7 @@ pub mod encoded_block_range;
 pub mod dir_archive;
 pub mod index;
 pub mod segment_reader;
+pub mod scatter_writer;
 pub mod segment_writer;
 pub mod sframe_reader;
 pub mod sframe_writer;

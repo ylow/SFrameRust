@@ -172,16 +172,16 @@ impl<W: Write> SegmentWriter<W> {
 // ============================================================================
 
 /// Target on-disk block size in bytes (64 KiB).
-const TARGET_BLOCK_SIZE: usize = 64 * 1024;
+pub(crate) const TARGET_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Minimum rows per block (lower bound for adaptive sizing).
-const MIN_ROWS_PER_BLOCK: usize = 8;
+pub(crate) const MIN_ROWS_PER_BLOCK: usize = 8;
 
 /// Maximum rows per block (upper bound for adaptive sizing).
-const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
+pub(crate) const MAX_ROWS_PER_BLOCK: usize = 256 * 1024;
 
 /// Rough estimate of bytes per value for initial block sizing.
-fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
+pub(crate) fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
     match dtype {
         FlexTypeEnum::Integer => 8,
         FlexTypeEnum::Float => 8,
