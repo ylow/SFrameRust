@@ -745,10 +745,40 @@ impl SFrame {
 
     /// Sort by one or more columns.
     ///
-    /// Uses `sort_indices` to compute the sort permutation without copying
-    /// the full dataset, then writes the reordered rows in chunks via
-    /// `CacheSFrameBuilder::write_indexed_chunked`.
+    /// Automatically selects the best sort algorithm:
+    /// - **Standard sort** (in-memory or external) for small, simple datasets:
+    ///   fewer than 100K rows, fewer than 5 columns, and all numeric types.
+    /// - **EC Sort** (External Columnar Sort) for everything else: separates
+    ///   key sorting from value permutation, more efficient for wide SFrames
+    ///   or SFrames with large non-numeric columns.
     pub fn sort(&self, keys: &[(&str, SortOrder)]) -> Result<SFrame> {
+        let num_rows = self.num_rows().unwrap_or(0);
+        let num_cols = self.num_columns();
+        let all_numeric = self.column_types().iter().all(|dt| matches!(
+            dt,
+            FlexTypeEnum::Integer | FlexTypeEnum::Float | FlexTypeEnum::DateTime
+        ));
+
+        let use_standard_sort = num_rows < 100_000 && num_cols < 5 && all_numeric;
+
+        if use_standard_sort {
+            self.standard_sort(keys)
+        } else {
+            let key_indices: Vec<usize> = keys
+                .iter()
+                .map(|(name, _)| self.column_index(name))
+                .collect::<Result<_>>()?;
+            let sort_orders: Vec<bool> = keys
+                .iter()
+                .map(|(_, order)| matches!(order, SortOrder::Ascending))
+                .collect();
+            crate::ec_sort::ec_sort(self, &key_indices, &sort_orders)
+        }
+    }
+
+    /// Standard sort: chooses between in-memory and external sort based on
+    /// memory budget. Used for small, simple datasets.
+    fn standard_sort(&self, keys: &[(&str, SortOrder)]) -> Result<SFrame> {
         let sort_keys: Vec<SortKey> = keys
             .iter()
             .map(|(name, order)| {
@@ -760,7 +790,6 @@ impl SFrame {
             })
             .collect::<Result<_>>()?;
 
-        // Estimate data size and decide between in-memory vs external sort
         let estimated_size = self.estimate_size();
         let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
 
