@@ -450,6 +450,11 @@ impl SFrame {
         self.columns.len()
     }
 
+    /// Access the underlying column SArrays.
+    pub(crate) fn columns(&self) -> &[SArray] {
+        &self.columns
+    }
+
     /// Compile the plan and stream batches through a bounded channel.
     ///
     /// A background thread compiles and drives the BatchIterator, sending

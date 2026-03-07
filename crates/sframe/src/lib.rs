@@ -1,3 +1,4 @@
+mod ec_sort;
 mod external_sort;
 pub mod sarray;
 pub mod sframe;
