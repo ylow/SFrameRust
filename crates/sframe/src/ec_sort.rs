@@ -269,10 +269,6 @@ fn scatter_columns_direct(
             })
             .collect::<Result<_>>()?;
 
-    // Forward map chunk size: budget for the fmap array in memory.
-    // Reserve half the budget for fmap, the other half is for per-thread work.
-    let fmap_chunk_size = (budget / 2 / 8).max(1024) as u64;
-
     // Per-column flush threshold (rows per output block)
     let flush_threshold: Vec<usize> = scatter_dtypes
         .iter()
@@ -284,12 +280,11 @@ fn scatter_columns_direct(
 
     // Pre-compute segment layout: cumulative row offsets per input segment.
     let input_meta = SFrameMetadata::open_with_fs(&*input_source.vfs, &input_source.path)?;
-    let input_seg_files = &input_meta.group_index.segment_files;
+    let input_seg_files: Vec<String> = input_meta.group_index.segment_files.clone();
     let col_types: Vec<FlexTypeEnum> = input_meta.group_index.columns
         .iter().map(|c| c.dtype).collect();
     let num_input_segs = input_seg_files.len();
 
-    // Cumulative row offsets per segment (using column 0 as reference)
     let ref_col = input_source.column_map[0];
     let seg_row_offsets: Vec<u64> = {
         let mut offsets = Vec::with_capacity(num_input_segs + 1);
@@ -301,80 +296,119 @@ fn scatter_columns_direct(
         offsets
     };
 
-    let mut chunk_start = 0u64;
-    while chunk_start < num_rows {
-        let chunk_end = (chunk_start + fmap_chunk_size).min(num_rows);
+    // Size fmap chunks so we can process multiple concurrently.
+    // We want enough work items (chunk × column × segment) to keep all
+    // threads busy. Each concurrent chunk holds fmap data in memory.
+    let num_threads = rayon::current_num_threads().max(1);
+    let items_per_chunk = (num_input_cols * num_input_segs).max(1);
+    let concurrent_chunks = ((num_threads * 2) / items_per_chunk).max(1);
+    let fmap_chunk_size = {
+        let by_budget = budget / 2 / 8 / concurrent_chunks;
+        let by_count = ((num_rows as usize + concurrent_chunks - 1) / concurrent_chunks).max(1);
+        (by_budget.min(by_count)).max(1024) as u64
+    };
 
-        // Read forward_map chunk
-        let fmap_values = read_fmap_chunk(
-            fmap_sf, &Some(fmap_source.clone()), chunk_start, chunk_end,
-        )?;
+    // Process in batches of concurrent_chunks fmap chunks at a time.
+    let mut batch_start_row = 0u64;
+    while batch_start_row < num_rows {
+        // Determine which fmap chunks are in this batch
+        let mut batch_chunks: Vec<(u64, u64)> = Vec::new(); // (chunk_start, chunk_end)
+        let mut row = batch_start_row;
+        for _ in 0..concurrent_chunks {
+            if row >= num_rows {
+                break;
+            }
+            let end = (row + fmap_chunk_size).min(num_rows);
+            batch_chunks.push((row, end));
+            row = end;
+        }
+        batch_start_row = row;
 
-        // Build work items: (col_idx, input_seg_idx) pairs that overlap
-        // the current fmap chunk. This gives parallelism =
-        // num_columns × num_overlapping_segments instead of just num_columns.
-        let mut work_items: Vec<(usize, usize)> = Vec::new();
-        for col_idx in 0..num_input_cols {
-            for seg_idx in 0..num_input_segs {
-                let seg_start = seg_row_offsets[seg_idx];
-                let seg_end = seg_row_offsets[seg_idx + 1];
-                if seg_end > chunk_start && seg_start < chunk_end {
-                    work_items.push((col_idx, seg_idx));
+        // Read all fmap chunks for this batch (can be parallelized too)
+        let fmap_arcs: Vec<Arc<Vec<u64>>> = batch_chunks
+            .iter()
+            .map(|&(cs, ce)| {
+                let vals = read_fmap_chunk(
+                    fmap_sf, &Some(fmap_source.clone()), cs, ce,
+                )?;
+                Ok(Arc::new(vals))
+            })
+            .collect::<Result<_>>()?;
+
+        // Build work items across all chunks in the batch:
+        // (chunk_idx, col_idx, input_seg_idx)
+        struct WorkItem {
+            fmap: Arc<Vec<u64>>,
+            chunk_start: u64,
+            chunk_end: u64,
+            col_idx: usize,
+            seg_idx: usize,
+        }
+
+        let mut work_items: Vec<WorkItem> = Vec::new();
+        for (ci, &(cs, ce)) in batch_chunks.iter().enumerate() {
+            for col_idx in 0..num_input_cols {
+                for seg_idx in 0..num_input_segs {
+                    let seg_start = seg_row_offsets[seg_idx];
+                    let seg_end = seg_row_offsets[seg_idx + 1];
+                    if seg_end > cs && seg_start < ce {
+                        work_items.push(WorkItem {
+                            fmap: fmap_arcs[ci].clone(),
+                            chunk_start: cs,
+                            chunk_end: ce,
+                            col_idx,
+                            seg_idx,
+                        });
+                    }
                 }
             }
         }
 
-        // Process work items in parallel. Each work item opens one segment
-        // file, reads blocks for one column, and scatters to output segments.
+        // Process all work items in parallel across all chunks.
         let work_errors: Vec<Result<()>> = work_items
             .par_iter()
-            .map(|&(col_idx, seg_idx)| {
-                let phys_col = input_source.column_map[col_idx];
-                let dtype = input_dtypes[col_idx];
-                let thresh = flush_threshold[col_idx];
+            .map(|item| {
+                let phys_col = input_source.column_map[item.col_idx];
+                let dtype = input_dtypes[item.col_idx];
+                let thresh = flush_threshold[item.col_idx];
+                let seg_start = seg_row_offsets[item.seg_idx];
 
-                let seg_start = seg_row_offsets[seg_idx];
-
-                // Open this segment's reader
-                let seg_path = format!("{}/{}", input_source.path, input_seg_files[seg_idx]);
+                let seg_path = format!("{}/{}", input_source.path, input_seg_files[item.seg_idx]);
                 let file = input_source.vfs.open_read(&seg_path)?;
                 let file_size = file.size()?;
                 let mut seg_reader = SegmentReader::open(
                     Box::new(file), file_size, col_types.clone(),
                 )?;
 
-                // Work-item-local per-output-segment buffers
                 let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
 
-                // Walk blocks within this segment
                 let mut block_row = seg_start;
                 for blk_idx in 0..seg_reader.num_blocks(phys_col) {
                     let blk_len = seg_reader.block_num_elem(phys_col, blk_idx);
                     let blk_end = block_row + blk_len;
 
-                    if blk_end <= chunk_start {
+                    if blk_end <= item.chunk_start {
                         block_row = blk_end;
                         continue;
                     }
-                    if block_row >= chunk_end {
+                    if block_row >= item.chunk_end {
                         break;
                     }
 
                     let block_data = seg_reader.read_block(phys_col, blk_idx)?;
-
-                    let local_begin = chunk_start.saturating_sub(block_row) as usize;
-                    let local_end = (chunk_end - block_row).min(blk_len) as usize;
+                    let local_begin = item.chunk_start.saturating_sub(block_row) as usize;
+                    let local_end = (item.chunk_end - block_row).min(blk_len) as usize;
 
                     for i in local_begin..local_end {
-                        let fmap_idx = (block_row + i as u64 - chunk_start) as usize;
-                        let bucket = (fmap_values[fmap_idx] / rows_per_bucket)
+                        let fmap_idx = (block_row + i as u64 - item.chunk_start) as usize;
+                        let bucket = (item.fmap[fmap_idx] / rows_per_bucket)
                             .min(num_buckets as u64 - 1) as usize;
                         seg_bufs[bucket].push(block_data[i].clone());
 
                         if seg_bufs[bucket].len() >= thresh {
                             let buf = std::mem::take(&mut seg_bufs[bucket]);
                             flush_to_segment_writer(
-                                &segment_writers, bucket, col_idx, &buf, dtype,
+                                &segment_writers, bucket, item.col_idx, &buf, dtype,
                             )?;
                         }
                     }
@@ -382,11 +416,10 @@ fn scatter_columns_direct(
                     block_row = blk_end;
                 }
 
-                // Flush remaining
                 for (out_seg, buf) in seg_bufs.into_iter().enumerate() {
                     if !buf.is_empty() {
                         flush_to_segment_writer(
-                            &segment_writers, out_seg, col_idx, &buf, dtype,
+                            &segment_writers, out_seg, item.col_idx, &buf, dtype,
                         )?;
                     }
                 }
@@ -399,21 +432,21 @@ fn scatter_columns_direct(
             err?;
         }
 
-        // Scatter the forward_map as the last column (sequential, fast —
-        // just integer classification, no I/O reads needed)
+        // Scatter the forward_map as the last column for all chunks in batch
         let fmap_dtype = FlexTypeEnum::Integer;
         let fmap_thresh = flush_threshold[fmap_col_idx];
         let mut fmap_seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
+        for fmap_arc in &fmap_arcs {
+            for &fmap_val in fmap_arc.iter() {
+                let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
+                fmap_seg_bufs[bucket].push(FlexType::Integer(fmap_val as i64));
 
-        for &fmap_val in &fmap_values {
-            let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-            fmap_seg_bufs[bucket].push(FlexType::Integer(fmap_val as i64));
-
-            if fmap_seg_bufs[bucket].len() >= fmap_thresh {
-                let buf = std::mem::take(&mut fmap_seg_bufs[bucket]);
-                flush_to_segment_writer(
-                    &segment_writers, bucket, fmap_col_idx, &buf, fmap_dtype,
-                )?;
+                if fmap_seg_bufs[bucket].len() >= fmap_thresh {
+                    let buf = std::mem::take(&mut fmap_seg_bufs[bucket]);
+                    flush_to_segment_writer(
+                        &segment_writers, bucket, fmap_col_idx, &buf, fmap_dtype,
+                    )?;
+                }
             }
         }
         for (seg_idx, buf) in fmap_seg_bufs.into_iter().enumerate() {
@@ -423,8 +456,6 @@ fn scatter_columns_direct(
                 )?;
             }
         }
-
-        chunk_start = chunk_end;
     }
 
     // Finish all segment writers
