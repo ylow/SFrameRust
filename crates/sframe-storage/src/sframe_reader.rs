@@ -176,6 +176,43 @@ impl SFrameReader {
     pub fn metadata(&self) -> &std::collections::HashMap<String, String> {
         &self.frame_index.metadata
     }
+
+    /// Read a row range `[begin, end)` from a single column.
+    ///
+    /// Locates the segments that overlap the range, reads the relevant
+    /// column data from each, and slices to the exact row boundaries.
+    pub fn read_column_range(
+        &mut self,
+        column: usize,
+        begin: u64,
+        end: u64,
+    ) -> Result<Vec<sframe_types::flex_type::FlexType>> {
+        if begin >= end {
+            return Ok(Vec::new());
+        }
+        let seg_sizes = &self.group_index.columns[column].segment_sizes;
+        let mut result = Vec::with_capacity((end - begin) as usize);
+        let mut row_offset = 0u64;
+
+        for (seg_idx, &seg_len) in seg_sizes.iter().enumerate() {
+            let seg_end = row_offset + seg_len;
+            if row_offset >= end {
+                break;
+            }
+            if seg_end <= begin {
+                row_offset = seg_end;
+                continue;
+            }
+            let local_begin = begin.saturating_sub(row_offset) as usize;
+            let local_end = (end - row_offset).min(seg_len) as usize;
+
+            let all_values = self.segment_readers[seg_idx].read_column(column)?;
+            result.extend_from_slice(&all_values[local_begin..local_end]);
+
+            row_offset = seg_end;
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

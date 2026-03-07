@@ -18,10 +18,11 @@ use rayon::prelude::*;
 
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
-use sframe_query::planner::PlannerNode;
+use sframe_query::planner::{LogicalOp, PlannerNode};
 use sframe_storage::scatter_writer::ScatterWriter;
 use sframe_storage::segment_reader::SegmentReader;
 use sframe_storage::segment_writer::BufferedSegmentWriter;
+use sframe_storage::sframe_reader::SFrameReader;
 use sframe_storage::sframe_writer::{assemble_sframe_from_segments, generate_hash, segment_filename};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -94,11 +95,67 @@ fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread:
 // Scatter phase
 // ---------------------------------------------------------------------------
 
+/// Physical source info extracted from a plan.
+struct PhysicalSource {
+    path: String,
+    vfs: Arc<dyn VirtualFileSystem>,
+    /// Maps SFrame column index → physical column index in the SFrameSource.
+    /// E.g., if the plan is `Project(SFrameSource, [3, 1])`, then
+    /// `column_map = [3, 1]`: SFrame column 0 reads physical column 3.
+    column_map: Vec<usize>,
+}
+
+/// Try to extract the physical SFrame path and column mapping from a plan.
+///
+/// Returns `Some` if the plan is an SFrameSource (possibly wrapped in
+/// a Project), meaning the SFrame is already materialized on disk/CacheFs.
+fn extract_physical_source(sf: &SFrame) -> Option<PhysicalSource> {
+    let plan = sf.fuse_plan().ok()?;
+    let mut node = &plan;
+    let mut column_map: Option<Vec<usize>> = None;
+
+    loop {
+        match &node.op {
+            LogicalOp::SFrameSource { path, column_types, .. } => {
+                let vfs: Arc<dyn VirtualFileSystem> = if path.starts_with("cache://") {
+                    Arc::new(ArcCacheFsVfs(global_cache_fs().clone()))
+                } else {
+                    Arc::new(sframe_io::local_fs::LocalFileSystem)
+                };
+                let col_map = column_map
+                    .unwrap_or_else(|| (0..column_types.len()).collect());
+                return Some(PhysicalSource {
+                    path: path.clone(),
+                    vfs,
+                    column_map: col_map,
+                });
+            }
+            LogicalOp::Project { column_indices } if node.inputs.len() == 1 => {
+                // Compose projections: if we already have a mapping, apply it
+                column_map = Some(match column_map {
+                    Some(existing) => {
+                        column_indices.iter().map(|&i| existing[i]).collect()
+                    }
+                    None => column_indices.clone(),
+                });
+                node = &node.inputs[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Scatter all input columns (plus the forward map) into segment files.
 ///
-/// Reads the forward map in chunks, then processes columns in parallel
-/// within each chunk using plan slicing (`try_slice`). No materialization
-/// needed — row-range reads are projected through the lazy plan.
+/// Two strategies:
+/// - **Materialized path**: If both input and forward_map are backed by
+///   physical SFrameSource files, opens per-thread `SFrameReader`s for
+///   direct row-range reads — no plan compilation per chunk.
+/// - **Lazy path**: Uses plan slicing (`try_slice`) to project row ranges
+///   through the lazy plan. Works for any plan type.
+///
+/// Both paths read the forward map in chunks and process columns in
+/// parallel within each chunk.
 fn scatter_columns(
     vfs: &dyn VirtualFileSystem,
     base_path: &str,
@@ -110,8 +167,6 @@ fn scatter_columns(
     num_rows: u64,
     budget: usize,
 ) -> Result<sframe_storage::scatter_writer::ScatterResult> {
-    use sframe_query::execute::materialize_sync;
-
     let input_dtypes = input.column_types();
     let num_input_cols = input_dtypes.len();
     let fmap_col_idx = num_input_cols;
@@ -129,60 +184,77 @@ fn scatter_columns(
     )?;
 
     // Forward map chunk size: how many forward_map entries fit in memory.
-    // Each entry is an i64 (8 bytes) but stored as FlexType (~24 bytes).
     let fmap_chunk_size = (budget / 24).max(1024) as u64;
 
-    // Build a single-column SFrame for the forward_map (for slicing)
+    // Check if we can use direct SFrameReader access
+    let input_source = extract_physical_source(input);
     let fmap_sf = SFrame::new_with_columns(
         vec![forward_map.clone()],
         vec!["__fmap__".to_string()],
     );
+    let fmap_source = extract_physical_source(&fmap_sf);
+
+    let use_direct_readers = input_source.is_some() && fmap_source.is_some();
+    if use_direct_readers {
+        eprintln!("[sframe] ec_sort scatter: using direct reader path");
+    }
 
     let mut chunk_start = 0u64;
     while chunk_start < num_rows {
         let chunk_end = (chunk_start + fmap_chunk_size).min(num_rows);
 
         // Read forward_map values for this chunk
-        let fmap_slice = fmap_sf.try_slice(chunk_start, chunk_end)?;
-        let fmap_batch = materialize_sync(fmap_slice.compile_stream()?)?;
-        let fmap_col = fmap_batch.column(0);
-        let chunk_len = fmap_batch.num_rows();
+        let fmap_values = read_fmap_chunk(
+            &fmap_sf, &fmap_source, chunk_start, chunk_end,
+        )?;
+        let chunk_len = fmap_values.len();
 
-        // Decode forward_map values into a shared Vec<u64>
-        let fmap_values: Vec<u64> = (0..chunk_len)
-            .map(|i| match fmap_col.get(i) {
-                FlexType::Integer(v) => v as u64,
-                _ => 0, // validated below
-            })
-            .collect();
+        // Process columns in parallel
+        let per_col_results: Vec<Result<Vec<Vec<FlexType>>>> = if use_direct_readers {
+            let src = input_source.as_ref().unwrap();
 
-        // Process columns in parallel: each thread reads its column's
-        // data for this chunk via try_slice and classifies into buckets.
-        let input_columns = input.columns();
-        let per_col_results: Vec<Result<Vec<Vec<FlexType>>>> = (0..num_input_cols)
-            .into_par_iter()
-            .map(|col_idx| {
-                // Slice this column to the chunk range
-                let col_sa = input_columns[col_idx].try_slice(chunk_start, chunk_end)?;
-                let col_sf = SFrame::new_with_columns(
-                    vec![col_sa],
-                    vec!["__c__".to_string()],
-                );
-                let col_batch = materialize_sync(col_sf.compile_stream()?)?;
-                let col_data = col_batch.column(0);
+            (0..num_input_cols)
+                .into_par_iter()
+                .map(|col_idx| {
+                    // Each thread opens its own SFrameReader
+                    let mut reader =
+                        SFrameReader::open_with_fs(&*src.vfs, &src.path)?;
+                    let phys_col = src.column_map[col_idx];
+                    let values =
+                        reader.read_column_range(phys_col, chunk_start, chunk_end)?;
 
-                // Classify each value into its bucket
-                let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
-                for r in 0..col_batch.num_rows() {
-                    let bucket =
-                        (fmap_values[r] / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-                    seg_bufs[bucket].push(col_data.get(r));
-                }
-                Ok(seg_bufs)
-            })
-            .collect();
+                    classify_into_buckets(
+                        &values, &fmap_values, num_buckets, rows_per_bucket,
+                    )
+                })
+                .collect()
+        } else {
+            // Lazy path: use plan slicing
+            let input_columns = input.columns();
 
-        // Write per-column per-segment buffers to ScatterWriter (sequential)
+            (0..num_input_cols)
+                .into_par_iter()
+                .map(|col_idx| {
+                    let col_sa =
+                        input_columns[col_idx].try_slice(chunk_start, chunk_end)?;
+                    let col_sf = SFrame::new_with_columns(
+                        vec![col_sa],
+                        vec!["__c__".to_string()],
+                    );
+                    let col_batch =
+                        sframe_query::execute::materialize_sync(col_sf.compile_stream()?)?;
+                    let col_data = col_batch.column(0);
+                    let values: Vec<FlexType> =
+                        (0..col_batch.num_rows()).map(|r| col_data.get(r)).collect();
+
+                    classify_into_buckets(
+                        &values, &fmap_values, num_buckets, rows_per_bucket,
+                    )
+                })
+                .collect()
+        };
+
+        // Write per-column per-segment buffers to ScatterWriter
         for (col_idx, result) in per_col_results.into_iter().enumerate() {
             let seg_bufs = result?;
             for (seg_idx, values) in seg_bufs.into_iter().enumerate() {
@@ -192,7 +264,7 @@ fn scatter_columns(
             }
         }
 
-        // Also scatter the forward_map values as the last column
+        // Scatter the forward_map values as the last column
         for r in 0..chunk_len {
             let fmap_val = fmap_values[r];
             let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
@@ -207,6 +279,52 @@ fn scatter_columns(
     }
 
     scatter_writer.finish()
+}
+
+/// Read a chunk of the forward_map, either via direct reader or plan slicing.
+fn read_fmap_chunk(
+    fmap_sf: &SFrame,
+    fmap_source: &Option<PhysicalSource>,
+    begin: u64,
+    end: u64,
+) -> Result<Vec<u64>> {
+    let raw_values = if let Some(src) = fmap_source {
+        let mut reader = SFrameReader::open_with_fs(&*src.vfs, &src.path)?;
+        // Use the column_map to read the correct physical column
+        let phys_col = src.column_map[0];
+        reader.read_column_range(phys_col, begin, end)?
+    } else {
+        let slice = fmap_sf.try_slice(begin, end)?;
+        let batch = sframe_query::execute::materialize_sync(slice.compile_stream()?)?;
+        let col = batch.column(0);
+        (0..batch.num_rows()).map(|r| col.get(r)).collect()
+    };
+
+    raw_values
+        .into_iter()
+        .map(|v| match v {
+            FlexType::Integer(i) => Ok(i as u64),
+            _ => Err(SFrameError::Type(
+                "forward_map must contain Integer values".into(),
+            )),
+        })
+        .collect()
+}
+
+/// Classify values into per-segment buckets based on forward_map values.
+fn classify_into_buckets(
+    values: &[FlexType],
+    fmap_values: &[u64],
+    num_buckets: usize,
+    rows_per_bucket: u64,
+) -> Result<Vec<Vec<FlexType>>> {
+    let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
+    for (r, value) in values.iter().enumerate() {
+        let bucket =
+            (fmap_values[r] / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
+        seg_bufs[bucket].push(value.clone());
+    }
+    Ok(seg_bufs)
 }
 
 // ---------------------------------------------------------------------------
