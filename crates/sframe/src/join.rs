@@ -24,13 +24,13 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 use crate::sframe::{SFrame, SFrameBuilder};
 
 /// Result of probing the hash table with a batch of probe rows.
-pub struct ProbeResult {
+struct ProbeResult {
     /// Build-side row indices of matched pairs (parallel with `matched_probe`).
-    pub matched_build: Vec<usize>,
+    matched_build: Vec<usize>,
     /// Probe-side row indices of matched pairs (parallel with `matched_build`).
-    pub matched_probe: Vec<usize>,
+    matched_probe: Vec<usize>,
     /// Probe-side row indices that found no match in the build table.
-    pub unmatched_probe: Vec<usize>,
+    unmatched_probe: Vec<usize>,
 }
 
 /// A hash table built from the key columns of a build-side `SFrameRows` batch.
@@ -38,7 +38,7 @@ pub struct ProbeResult {
 /// Maps composite key values to the list of build-row indices sharing that key.
 /// Supports parallel probing and optional tracking of which build rows were
 /// ever matched (for full/right outer joins).
-pub struct JoinHashTable {
+struct JoinHashTable {
     /// key -> list of build row indices with that key.
     map: HashMap<Vec<FlexType>, Vec<usize>>,
     /// One flag per build row; set to `true` when matched during probe.
@@ -52,7 +52,7 @@ impl JoinHashTable {
     /// If `track_matched` is true, an `AtomicBool` array is allocated so that
     /// `unmatched_build_indices` can later report build rows that were never
     /// matched by any probe call.
-    pub fn new(build: &SFrameRows, key_cols: &[usize], track_matched: bool) -> Self {
+    fn new(build: &SFrameRows, key_cols: &[usize], track_matched: bool) -> Self {
         let n = build.num_rows();
         let mut map: HashMap<Vec<FlexType>, Vec<usize>> = HashMap::new();
 
@@ -83,7 +83,7 @@ impl JoinHashTable {
     /// When `track_matched` was enabled at construction, every matched build
     /// row has its flag set (via `AtomicBool`), so `unmatched_build_indices`
     /// can later report the complement.
-    pub fn probe_parallel(
+    fn probe_parallel(
         &self,
         probe: &SFrameRows,
         probe_key_cols: &[usize],
@@ -160,7 +160,7 @@ impl JoinHashTable {
     ///
     /// Only meaningful when the table was constructed with `track_matched = true`;
     /// otherwise returns an empty vector.
-    pub fn unmatched_build_indices(&self) -> Vec<usize> {
+    fn unmatched_build_indices(&self) -> Vec<usize> {
         self.matched
             .iter()
             .enumerate()
@@ -179,7 +179,7 @@ impl JoinHashTable {
 ///
 /// For typed columns (Integer, Float, etc.) this produces `vec![None; n]`.
 /// For Undefined/Flexible, it produces `vec![FlexType::Undefined; n]`.
-pub fn null_column(dtype: FlexTypeEnum, n: usize) -> ColumnData {
+fn null_column(dtype: FlexTypeEnum, n: usize) -> ColumnData {
     match dtype {
         FlexTypeEnum::Integer => ColumnData::Integer(vec![None; n]),
         FlexTypeEnum::Float => ColumnData::Float(vec![None; n]),
@@ -200,7 +200,7 @@ pub fn null_column(dtype: FlexTypeEnum, n: usize) -> ColumnData {
 ///   (derived from `JoinOn.pairs`). For unmatched-right rows, left key columns are
 ///   filled from the corresponding right key column instead of nulls.
 /// - `right_key_set`: the set of right-side key column indices (excluded from output).
-pub fn build_join_output(
+fn build_join_output(
     left: &SFrameRows,
     right: &SFrameRows,
     matched_left: &[usize],
@@ -273,7 +273,7 @@ pub fn build_join_output(
 /// Create an empty output batch with the correct schema for a join.
 ///
 /// Schema: all left dtypes followed by right non-key dtypes.
-pub fn make_empty_output(
+fn make_empty_output(
     left_dtypes: &[FlexTypeEnum],
     right_dtypes: &[FlexTypeEnum],
     on: &JoinOn,
@@ -295,7 +295,7 @@ pub fn make_empty_output(
 /// the right side is built and the left probes.
 ///
 /// The output schema is always: all left columns + right non-key columns.
-pub fn join_batches(
+fn join_batches(
     left: &SFrameRows,
     right: &SFrameRows,
     on: &JoinOn,
@@ -396,9 +396,6 @@ pub fn join_batches(
 
 const DEFAULT_CHUNK_SIZE: usize = 8192;
 
-/// Default budget in "cells" (rows * cols) for the streaming hash join.
-/// If the build side fits within this many cells, we use streaming; otherwise GRACE.
-const DEFAULT_BUDGET: usize = 50_000_000; // ~50M cells
 
 /// Consume a `BatchStream` fully, merging all batches into a single `SFrameRows`.
 fn materialize_batch_stream(sf: &SFrame) -> Result<SFrameRows> {
@@ -721,7 +718,7 @@ pub(crate) fn hash_join(
     output_names: &[String],
     output_dtypes: &[FlexTypeEnum],
 ) -> Result<SFrame> {
-    let budget = DEFAULT_BUDGET;
+    let budget = sframe_config::global().join_buffer_num_cells;
 
     // Try known_len first (free, no materialization).
     let left_known = left.known_len().map(|n| n * left.num_columns() as u64);
@@ -729,8 +726,8 @@ pub(crate) fn hash_join(
 
     match (left_known, right_known) {
         (Some(lc), Some(rc)) => {
-            if lc <= budget as u64 {
-                // Left fits in memory — use it as build side.
+            if lc <= budget as u64 && (rc > budget as u64 || lc <= rc) {
+                // Left fits and is smaller (or right doesn't fit) — build on left.
                 streaming_hash_join(left, right, on, join_type, true, output_names, output_dtypes)
             } else if rc <= budget as u64 {
                 // Right fits in memory — use it as build side.
@@ -750,7 +747,7 @@ pub(crate) fn hash_join(
             // Sizes unknown or known but neither fits — estimate to decide.
             let lc = estimate_cells(left)?;
             let rc = estimate_cells(right)?;
-            if lc <= budget as u64 {
+            if lc <= budget as u64 && (rc > budget as u64 || lc <= rc) {
                 streaming_hash_join(left, right, on, join_type, true, output_names, output_dtypes)
             } else if rc <= budget as u64 {
                 streaming_hash_join(left, right, on, join_type, false, output_names, output_dtypes)
