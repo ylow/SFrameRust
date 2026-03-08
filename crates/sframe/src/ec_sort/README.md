@@ -91,24 +91,16 @@ forward_map = [3, 0, 5, 2, 1, 4]
 The `forward_map` answers "where does input row i go?" Row 0 (Charlie)
 goes to output position 3. Row 1 (Alice) goes to output position 0.
 
-**Step 3** — Permute the value columns using the forward map:
+**Step 3** — Permute the value columns using `output[forward_map[i]] = input[i]`:
 
 ```
 score column:  input = [80, 95, 70, 88, 92, 76]
-  forward_map[0]=3 → output[3] = 80
-  forward_map[1]=0 → output[0] = 95
-  forward_map[2]=5 → output[2] = 70  (wait, this is wrong... let me re-derive)
-```
-
-Actually: `output[forward_map[i]] = input[i]`
-
-```
-  output[3] = input[0] = 80
-  output[0] = input[1] = 95
-  output[5] = input[2] = 70
-  output[2] = input[3] = 88
-  output[1] = input[4] = 92
-  output[4] = input[5] = 76
+  output[forward_map[0]] = output[3] = input[0] = 80
+  output[forward_map[1]] = output[0] = input[1] = 95
+  output[forward_map[2]] = output[5] = input[2] = 70
+  output[forward_map[3]] = output[2] = input[3] = 88
+  output[forward_map[4]] = output[1] = input[4] = 92
+  output[forward_map[5]] = output[4] = input[5] = 76
   → output = [95, 92, 88, 80, 76, 70]
 ```
 
@@ -291,6 +283,13 @@ Permute phase:
     Write permuted to output
 ```
 
+The scatter phase processes chunks in parallel. Since two columns are
+written, they must stay paired: `flush_paired_to_segment_writer` encodes
+both columns outside the lock, then writes both under a single lock
+acquisition. This guarantees that column 0 (value) and column 1 (fmap)
+are always atomically paired within each bucket, regardless of thread
+interleaving.
+
 The result is the forward_map stored as an SArray on CacheFs.
 
 
@@ -323,10 +322,10 @@ the permutation array during the permute phase.
 During scatter, memory is bounded per thread to:
 - One decoded block from the input (~64KB of values)
 - Per-bucket flush buffers (one per column, ~64KB each, flushed at threshold)
-- One forward_map chunk (shared across work items in the batch)
 
-The forward_map is read in chunks sized by `budget / (2 * 8 * concurrent_chunks)`,
-where `8` is bytes per integer.
+One forward_map chunk is held in memory at a time (shared across all
+column work items). The chunk size is `budget / (2 * 8)`, where `8` is
+bytes per integer.
 
 ### Permute Phase Memory
 
@@ -345,14 +344,21 @@ batched with it.
 
 ### Scatter Phase (Direct Path)
 
-Work items are `(fmap_chunk, column, input_segment)` triples. Multiple
-fmap chunks are batched so that fmap data can be shared across work items
-for different columns and segments. All work items in a batch are processed
-by rayon in parallel.
+One forward_map chunk is processed at a time. Within each chunk, work
+items are **one per column** — each column is a rayon parallel task that
+processes all input segments sequentially (in segment order). This
+guarantees that within each bucket, all columns have rows in the same
+deterministic input-row order.
 
-Each thread opens its own `SegmentReader` (no sharing). The output
-`SegmentWriter`s are `Mutex`-wrapped, but encoding and compression happen
-*outside* the lock — only the file write is serialized.
+After the parallel column scatter completes, the forward_map is scattered
+sequentially in the same input-row order. Because both the data columns
+and forward_map iterate rows in the same order (segments 0, 1, 2, ...
+within the chunk), alignment across all columns within each bucket is
+preserved.
+
+Each thread opens its own `SegmentReader` per segment (no sharing). The
+output `SegmentWriter`s are `Mutex`-wrapped, but encoding and compression
+happen *outside* the lock — only the file write is serialized.
 
 ### Permute Phase
 
@@ -399,7 +405,11 @@ Processes columns in parallel within each chunk via rayon.
 3. **Scatter** routes every input row to exactly one bucket (since
    `forward_map` is a permutation). No row is lost or duplicated. The
    forward_map value is stored alongside each row's data, preserving
-   the information needed for the permute phase.
+   the information needed for the permute phase. All columns (data +
+   forward_map) have the same row ordering within each bucket because:
+   (a) each column processes input segments in the same sequential order,
+   (b) forward_map is scattered in the same input-row order after the
+   parallel column scatter, and (c) chunks are processed one at a time.
 
 4. **Permute** reorders each bucket's rows into their final positions.
    Within a bucket, the forward_map values (minus bucket_start) form a
