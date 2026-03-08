@@ -568,8 +568,8 @@ pub fn estimate_batch_size(batch: &SFrameRows) -> usize {
         let per_elem = match col.dtype() {
             sframe_types::flex_type::FlexTypeEnum::Integer => 9,  // Option<i64>
             sframe_types::flex_type::FlexTypeEnum::Float => 9,    // Option<f64>
-            sframe_types::flex_type::FlexTypeEnum::String => 32,  // Option<Arc<str>>
-            sframe_types::flex_type::FlexTypeEnum::Vector => 64,  // Option<Arc<[f64]>>
+            sframe_types::flex_type::FlexTypeEnum::String => 32,  // Option<FlexString>
+            sframe_types::flex_type::FlexTypeEnum::Vector => 64,  // Option<FlexVec>
             sframe_types::flex_type::FlexTypeEnum::List => 64,
             sframe_types::flex_type::FlexTypeEnum::Dict => 64,
             sframe_types::flex_type::FlexTypeEnum::DateTime => 16,

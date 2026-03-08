@@ -425,11 +425,15 @@ mod tests {
     #[test]
     fn test_flexlist_nested() {
         let inner = FlexList::from(vec![FlexType::Integer(42)]);
-        // FlexType still uses Arc<[FlexType]> for List at this point,
-        // so we can't test nested FlexList inside FlexType yet.
-        // Just test that FlexList itself works.
-        assert_eq!(inner.len(), 1);
-        assert_eq!(inner[0], FlexType::Integer(42));
+        let outer = FlexList::from(vec![FlexType::List(inner)]);
+        assert_eq!(outer.len(), 1);
+        match &outer[0] {
+            FlexType::List(l) => {
+                assert_eq!(l.len(), 1);
+                assert_eq!(l[0], FlexType::Integer(42));
+            }
+            other => panic!("Expected List, got {other:?}"),
+        }
     }
 
     // --- FlexDict ---
