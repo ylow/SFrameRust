@@ -166,13 +166,13 @@ fn generate_and_write(path: &str, total_rows: u64) {
         }
 
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(user_ids),
-            ColumnData::Integer(product_ids),
-            ColumnData::String(categories),
-            ColumnData::Float(amounts),
-            ColumnData::Integer(quantities),
-            ColumnData::Float(scores),
-            ColumnData::String(regions),
+            ColumnData::Integer(user_ids.into()),
+            ColumnData::Integer(product_ids.into()),
+            ColumnData::String(categories.into()),
+            ColumnData::Float(amounts.into()),
+            ColumnData::Integer(quantities.into()),
+            ColumnData::Float(scores.into()),
+            ColumnData::String(regions.into()),
         ])
         .expect("batch creation failed");
 

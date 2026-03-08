@@ -297,8 +297,8 @@ mod tests {
     #[test]
     fn test_write_json_string() {
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2)]),
-            ColumnData::String(vec![Some("alice".into()), Some("bob".into())]),
+            ColumnData::Integer(vec![Some(1), Some(2)].into()),
+            ColumnData::String(vec![Some("alice".into()), Some("bob".into())].into()),
         ]).unwrap();
 
         let names = vec!["id".to_string(), "name".to_string()];
@@ -326,9 +326,9 @@ mod tests {
     #[test]
     fn test_json_roundtrip() {
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2)]),
-            ColumnData::Float(vec![Some(1.5), Some(2.5)]),
-            ColumnData::String(vec![Some("a".into()), Some("b".into())]),
+            ColumnData::Integer(vec![Some(1), Some(2)].into()),
+            ColumnData::Float(vec![Some(1.5), Some(2.5)].into()),
+            ColumnData::String(vec![Some("a".into()), Some("b".into())].into()),
         ]).unwrap();
 
         let names = vec!["x".to_string(), "y".to_string(), "z".to_string()];

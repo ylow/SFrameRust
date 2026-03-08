@@ -261,11 +261,11 @@ fn generate_data(path: &str, n: usize) {
             .collect();
 
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(ids),
-            ColumnData::String(categories),
-            ColumnData::Float(values),
-            ColumnData::Integer(scores),
-            ColumnData::String(labels),
+            ColumnData::Integer(ids.into()),
+            ColumnData::String(categories.into()),
+            ColumnData::Float(values.into()),
+            ColumnData::Integer(scores.into()),
+            ColumnData::String(labels.into()),
         ])
         .unwrap();
 

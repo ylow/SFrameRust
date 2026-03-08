@@ -212,8 +212,8 @@ mod tests {
     #[test]
     fn test_basic_csv_write() {
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2), Some(3)]),
-            ColumnData::String(vec![Some("alice".into()), Some("bob".into()), Some("charlie".into())]),
+            ColumnData::Integer(vec![Some(1), Some(2), Some(3)].into()),
+            ColumnData::String(vec![Some("alice".into()), Some("bob".into()), Some("charlie".into())].into()),
         ]).unwrap();
 
         let names = vec!["id".to_string(), "name".to_string()];
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn test_csv_quoting() {
         let batch = SFrameRows::new(vec![
-            ColumnData::String(vec![Some("hello, world".into()), Some("no comma".into())]),
+            ColumnData::String(vec![Some("hello, world".into()), Some("no comma".into())].into()),
         ]).unwrap();
 
         let names = vec!["text".to_string()];
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn test_csv_na_values() {
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), None, Some(3)]),
+            ColumnData::Integer(vec![Some(1), None, Some(3)].into()),
         ]).unwrap();
 
         let names = vec!["x".to_string()];
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn test_csv_no_header() {
         let batch = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1)]),
+            ColumnData::Integer(vec![Some(1)].into()),
         ]).unwrap();
 
         let names = vec!["x".to_string()];

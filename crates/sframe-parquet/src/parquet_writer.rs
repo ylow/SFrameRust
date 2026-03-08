@@ -157,12 +157,12 @@ mod tests {
         let path = dir.path().join("output.parquet");
 
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2), Some(3)]),
+            ColumnData::Integer(vec![Some(1), Some(2), Some(3)].into()),
             ColumnData::String(vec![
                 Some(Arc::from("alpha")),
                 Some(Arc::from("beta")),
                 Some(Arc::from("gamma")),
-            ]),
+            ].into()),
         ])
         .unwrap();
 
@@ -204,7 +204,7 @@ mod tests {
             Some(1.5),
             None,
             Some(3.14),
-        ])])
+        ].into())])
         .unwrap();
 
         let names = vec!["value".to_string()];
@@ -243,9 +243,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("multi.parquet");
 
-        let batch1 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(1), Some(2)])])
+        let batch1 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(1), Some(2)].into())])
             .unwrap();
-        let batch2 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(3), Some(4), Some(5)])])
+        let batch2 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(3), Some(4), Some(5)].into())])
             .unwrap();
 
         let names = vec!["x".to_string()];
@@ -287,8 +287,8 @@ mod tests {
         let path = dir.path().join("nulls.parquet");
 
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(10), None, Some(30)]),
-            ColumnData::String(vec![None, Some(Arc::from("hello")), None]),
+            ColumnData::Integer(vec![Some(10), None, Some(30)].into()),
+            ColumnData::String(vec![None, Some(Arc::from("hello")), None].into()),
         ])
         .unwrap();
 
@@ -316,7 +316,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("data").to_str().unwrap().to_string();
 
-        let rows = SFrameRows::new(vec![ColumnData::Integer(vec![Some(42)])])
+        let rows = SFrameRows::new(vec![ColumnData::Integer(vec![Some(42)].into())])
             .unwrap();
 
         let names = vec!["val".to_string()];
@@ -347,12 +347,12 @@ mod tests {
         let types = vec![FlexTypeEnum::Integer];
 
         // Write shard 0
-        let rows0 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(1), Some(2)])])
+        let rows0 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(1), Some(2)].into())])
             .unwrap();
         write_parquet_shard(single_batch_iter(rows0), &names, &types, &prefix, 0, 2).unwrap();
 
         // Write shard 1
-        let rows1 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(3), Some(4)])])
+        let rows1 = SFrameRows::new(vec![ColumnData::Integer(vec![Some(3), Some(4)].into())])
             .unwrap();
         write_parquet_shard(single_batch_iter(rows1), &names, &types, &prefix, 1, 2).unwrap();
 
@@ -388,9 +388,9 @@ mod tests {
         let path = dir.path().join("all_types.parquet");
 
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(100), Some(200)]),
-            ColumnData::Float(vec![Some(1.1), Some(2.2)]),
-            ColumnData::String(vec![Some(Arc::from("foo")), Some(Arc::from("bar"))]),
+            ColumnData::Integer(vec![Some(100), Some(200)].into()),
+            ColumnData::Float(vec![Some(1.1), Some(2.2)].into()),
+            ColumnData::String(vec![Some(Arc::from("foo")), Some(Arc::from("bar"))].into()),
         ])
         .unwrap();
 

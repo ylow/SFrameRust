@@ -181,13 +181,13 @@ impl JoinHashTable {
 /// For Undefined/Flexible, it produces `vec![FlexType::Undefined; n]`.
 fn null_column(dtype: FlexTypeEnum, n: usize) -> ColumnData {
     match dtype {
-        FlexTypeEnum::Integer => ColumnData::Integer(vec![None; n]),
-        FlexTypeEnum::Float => ColumnData::Float(vec![None; n]),
-        FlexTypeEnum::String => ColumnData::String(vec![None; n]),
-        FlexTypeEnum::Vector => ColumnData::Vector(vec![None; n]),
-        FlexTypeEnum::List => ColumnData::List(vec![None; n]),
-        FlexTypeEnum::Dict => ColumnData::Dict(vec![None; n]),
-        FlexTypeEnum::DateTime => ColumnData::DateTime(vec![None; n]),
+        FlexTypeEnum::Integer => ColumnData::Integer(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::Float => ColumnData::Float(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::String => ColumnData::String(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::Vector => ColumnData::Vector(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::List => ColumnData::List(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::Dict => ColumnData::Dict(std::iter::repeat_n(None, n).collect()),
+        FlexTypeEnum::DateTime => ColumnData::DateTime(std::iter::repeat_n(None, n).collect()),
         FlexTypeEnum::Undefined => ColumnData::Flexible(vec![FlexType::Undefined; n]),
     }
 }

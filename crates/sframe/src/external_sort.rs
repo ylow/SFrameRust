@@ -18,7 +18,9 @@ use sframe_query::algorithms::sort::{self, compare_flex_type, SortKey, SortOrder
 use sframe_query::execute::{compile, parallel_slice_row_count};
 use sframe_query::planner::{clone_plan_with_row_range, PlannerNode};
 use sframe_storage::segment_writer::BufferedSegmentWriter;
-use sframe_storage::sframe_writer::{assemble_sframe_from_segments, generate_hash, segment_filename};
+use sframe_storage::sframe_writer::{
+    assemble_sframe_from_segments, generate_hash, segment_filename,
+};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::FlexType;
 
@@ -43,7 +45,7 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
 
     let primary_key = &sort_keys[0];
     let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
-    let estimated_size = sf.estimate_size();
+    let mut estimated_size = sf.estimate_size();
 
     // Check if parallel execution is possible
     let plan = sf.fuse_plan()?;
@@ -66,7 +68,8 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     if sketch.count() == 0 {
         return sf.head(0);
     }
-
+    // add the size of the permute indices
+    estimated_size += (sf.num_rows().unwrap_or(0) * 8) as usize;
     // Phase 2: Determine partition cut points
     let num_partitions = (estimated_size / budget).max(2);
     let cut_points = sketch.quantiles(num_partitions);
@@ -81,7 +84,9 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     };
 
     // Phase 4+5: Sort partitions in parallel + assemble output
-    eprintln!("[sframe] sort phase 4/4: sorting {num_partitions} partitions and assembling output...");
+    eprintln!(
+        "[sframe] sort phase 4/4: sorting {num_partitions} partitions and assembling output..."
+    );
     sort_partitions_and_assemble(partitions, sort_keys, primary_key, sf)
 }
 
@@ -220,11 +225,9 @@ fn partition_data_parallel(
                             &mut bufs[part_idx],
                             (0..ncols).map(|_| Vec::new()).collect(),
                         );
-                        my_senders[part_idx]
-                            .send(buf)
-                            .map_err(|_| SFrameError::Format(
-                                "Partition writer closed unexpectedly".into(),
-                            ))?;
+                        my_senders[part_idx].send(buf).map_err(|_| {
+                            SFrameError::Format("Partition writer closed unexpectedly".into())
+                        })?;
                     }
                 }
             }
@@ -232,11 +235,9 @@ fn partition_data_parallel(
             // Flush remaining buffers
             for (part_idx, buf) in bufs.into_iter().enumerate() {
                 if !buf.is_empty() && !buf[0].is_empty() {
-                    my_senders[part_idx]
-                        .send(buf)
-                        .map_err(|_| SFrameError::Format(
-                            "Partition writer closed unexpectedly".into(),
-                        ))?;
+                    my_senders[part_idx].send(buf).map_err(|_| {
+                        SFrameError::Format("Partition writer closed unexpectedly".into())
+                    })?;
                 }
             }
             drop(my_senders);
@@ -602,22 +603,10 @@ mod tests {
         let rows = sorted.iter_rows().unwrap();
         assert_eq!(rows.len(), 4);
         // (1,20), (1,10), (2,20), (2,10) — asc on a, desc on b
-        assert_eq!(
-            rows[0],
-            vec![FlexType::Integer(1), FlexType::Integer(20)]
-        );
-        assert_eq!(
-            rows[1],
-            vec![FlexType::Integer(1), FlexType::Integer(10)]
-        );
-        assert_eq!(
-            rows[2],
-            vec![FlexType::Integer(2), FlexType::Integer(20)]
-        );
-        assert_eq!(
-            rows[3],
-            vec![FlexType::Integer(2), FlexType::Integer(10)]
-        );
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::Integer(20)]);
+        assert_eq!(rows[1], vec![FlexType::Integer(1), FlexType::Integer(10)]);
+        assert_eq!(rows[2], vec![FlexType::Integer(2), FlexType::Integer(20)]);
+        assert_eq!(rows[3], vec![FlexType::Integer(2), FlexType::Integer(10)]);
     }
 
     #[test]
@@ -732,7 +721,11 @@ mod tests {
         let p0 = SFrame::from_columns(vec![(
             "x",
             SArray::from_vec(
-                vec![FlexType::Integer(3), FlexType::Integer(1), FlexType::Integer(2)],
+                vec![
+                    FlexType::Integer(3),
+                    FlexType::Integer(1),
+                    FlexType::Integer(2),
+                ],
                 FlexTypeEnum::Integer,
             )
             .unwrap(),
@@ -741,7 +734,11 @@ mod tests {
         let p1 = SFrame::from_columns(vec![(
             "x",
             SArray::from_vec(
-                vec![FlexType::Integer(6), FlexType::Integer(4), FlexType::Integer(5)],
+                vec![
+                    FlexType::Integer(6),
+                    FlexType::Integer(4),
+                    FlexType::Integer(5),
+                ],
                 FlexTypeEnum::Integer,
             )
             .unwrap(),
@@ -750,7 +747,11 @@ mod tests {
         let p2 = SFrame::from_columns(vec![(
             "x",
             SArray::from_vec(
-                vec![FlexType::Integer(9), FlexType::Integer(7), FlexType::Integer(8)],
+                vec![
+                    FlexType::Integer(9),
+                    FlexType::Integer(7),
+                    FlexType::Integer(8),
+                ],
                 FlexTypeEnum::Integer,
             )
             .unwrap(),
@@ -848,14 +849,8 @@ mod tests {
         }
 
         let sf = SFrame::from_columns(vec![
-            (
-                "a",
-                SArray::from_vec(col_a, FlexTypeEnum::Integer).unwrap(),
-            ),
-            (
-                "b",
-                SArray::from_vec(col_b, FlexTypeEnum::Integer).unwrap(),
-            ),
+            ("a", SArray::from_vec(col_a, FlexTypeEnum::Integer).unwrap()),
+            ("b", SArray::from_vec(col_b, FlexTypeEnum::Integer).unwrap()),
         ])
         .unwrap();
 

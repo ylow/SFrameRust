@@ -8,6 +8,8 @@ use std::sync::Arc;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
 
+use crate::nullable_vec::NullableVec;
+
 /// A batch of rows stored in columnar format with typed vectors.
 #[derive(Debug, Clone)]
 pub struct SFrameRows {
@@ -15,19 +17,20 @@ pub struct SFrameRows {
     num_rows: usize,
 }
 
-/// Shared reference to a dictionary (list of key-value pairs).
-pub type DictRef = Option<Arc<[(FlexType, FlexType)]>>;
-
 /// Typed column vector. `None` represents UNDEFINED/NULL.
+///
+/// Typed variants use `NullableVec<T>` which stores values densely with a
+/// separate validity bitmap, saving ~50% memory for non-niche types like
+/// `i64` and `f64`.
 #[derive(Debug, Clone)]
 pub enum ColumnData {
-    Integer(Vec<Option<i64>>),
-    Float(Vec<Option<f64>>),
-    String(Vec<Option<Arc<str>>>),
-    Vector(Vec<Option<Arc<[f64]>>>),
-    List(Vec<Option<Arc<[FlexType]>>>),
-    Dict(Vec<DictRef>),
-    DateTime(Vec<Option<FlexDateTime>>),
+    Integer(NullableVec<i64>),
+    Float(NullableVec<f64>),
+    String(NullableVec<Arc<str>>),
+    Vector(NullableVec<Arc<[f64]>>),
+    List(NullableVec<Arc<[FlexType]>>),
+    Dict(NullableVec<Arc<[(FlexType, FlexType)]>>),
+    DateTime(NullableVec<FlexDateTime>),
     /// Mixed-type column for UNDEFINED/per-value-parsed data.
     /// Uses `FlexType::Undefined` for null instead of `Option` wrapping.
     Flexible(Vec<FlexType>),
@@ -78,13 +81,13 @@ impl ColumnData {
     /// Create an empty column of the given type.
     pub fn empty(dtype: FlexTypeEnum) -> Self {
         match dtype {
-            FlexTypeEnum::Integer => ColumnData::Integer(Vec::new()),
-            FlexTypeEnum::Float => ColumnData::Float(Vec::new()),
-            FlexTypeEnum::String => ColumnData::String(Vec::new()),
-            FlexTypeEnum::Vector => ColumnData::Vector(Vec::new()),
-            FlexTypeEnum::List => ColumnData::List(Vec::new()),
-            FlexTypeEnum::Dict => ColumnData::Dict(Vec::new()),
-            FlexTypeEnum::DateTime => ColumnData::DateTime(Vec::new()),
+            FlexTypeEnum::Integer => ColumnData::Integer(NullableVec::new()),
+            FlexTypeEnum::Float => ColumnData::Float(NullableVec::new()),
+            FlexTypeEnum::String => ColumnData::String(NullableVec::new()),
+            FlexTypeEnum::Vector => ColumnData::Vector(NullableVec::new()),
+            FlexTypeEnum::List => ColumnData::List(NullableVec::new()),
+            FlexTypeEnum::Dict => ColumnData::Dict(NullableVec::new()),
+            FlexTypeEnum::DateTime => ColumnData::DateTime(NullableVec::new()),
             FlexTypeEnum::Undefined => ColumnData::Flexible(Vec::new()),
         }
     }
@@ -144,31 +147,31 @@ impl ColumnData {
     /// Get a value at the given index as a FlexType.
     pub fn get(&self, index: usize) -> FlexType {
         match self {
-            ColumnData::Integer(v) => match &v[index] {
+            ColumnData::Integer(v) => match v.get(index) {
                 Some(i) => FlexType::Integer(*i),
                 None => FlexType::Undefined,
             },
-            ColumnData::Float(v) => match &v[index] {
+            ColumnData::Float(v) => match v.get(index) {
                 Some(f) => FlexType::Float(*f),
                 None => FlexType::Undefined,
             },
-            ColumnData::String(v) => match &v[index] {
+            ColumnData::String(v) => match v.get(index) {
                 Some(s) => FlexType::String(s.clone()),
                 None => FlexType::Undefined,
             },
-            ColumnData::Vector(v) => match &v[index] {
+            ColumnData::Vector(v) => match v.get(index) {
                 Some(vec) => FlexType::Vector(vec.clone()),
                 None => FlexType::Undefined,
             },
-            ColumnData::List(v) => match &v[index] {
+            ColumnData::List(v) => match v.get(index) {
                 Some(l) => FlexType::List(l.clone()),
                 None => FlexType::Undefined,
             },
-            ColumnData::Dict(v) => match &v[index] {
+            ColumnData::Dict(v) => match v.get(index) {
                 Some(d) => FlexType::Dict(d.clone()),
                 None => FlexType::Undefined,
             },
-            ColumnData::DateTime(v) => match &v[index] {
+            ColumnData::DateTime(v) => match v.get(index) {
                 Some(dt) => FlexType::DateTime(dt.clone()),
                 None => FlexType::Undefined,
             },
@@ -233,20 +236,22 @@ impl ColumnData {
     ///
     /// Avoids the FlexType round-trip that `get()` + `push()` incurs.
     pub fn gather(&self, indices: &[usize]) -> Self {
-        macro_rules! gather_typed {
+        macro_rules! gather_nullable {
             ($variant:ident, $v:expr) => {
-                ColumnData::$variant(indices.iter().map(|&i| $v[i].clone()).collect())
+                ColumnData::$variant(indices.iter().map(|&i| $v.get(i).cloned()).collect())
             };
         }
         match self {
-            ColumnData::Integer(v) => gather_typed!(Integer, v),
-            ColumnData::Float(v) => gather_typed!(Float, v),
-            ColumnData::String(v) => gather_typed!(String, v),
-            ColumnData::Vector(v) => gather_typed!(Vector, v),
-            ColumnData::List(v) => gather_typed!(List, v),
-            ColumnData::Dict(v) => gather_typed!(Dict, v),
-            ColumnData::DateTime(v) => gather_typed!(DateTime, v),
-            ColumnData::Flexible(v) => gather_typed!(Flexible, v),
+            ColumnData::Integer(v) => gather_nullable!(Integer, v),
+            ColumnData::Float(v) => gather_nullable!(Float, v),
+            ColumnData::String(v) => gather_nullable!(String, v),
+            ColumnData::Vector(v) => gather_nullable!(Vector, v),
+            ColumnData::List(v) => gather_nullable!(List, v),
+            ColumnData::Dict(v) => gather_nullable!(Dict, v),
+            ColumnData::DateTime(v) => gather_nullable!(DateTime, v),
+            ColumnData::Flexible(v) => {
+                ColumnData::Flexible(indices.iter().map(|&i| v[i].clone()).collect())
+            }
         }
     }
 
@@ -273,7 +278,7 @@ impl ColumnData {
             ColumnData::List(v) => map_opt!(v, List),
             ColumnData::Dict(v) => map_opt!(v, Dict),
             ColumnData::DateTime(v) => map_opt!(v, DateTime),
-            ColumnData::Flexible(v) => v.iter().map(func).collect(),
+            ColumnData::Flexible(v) => v.iter().map(|v| func(v)).collect(),
         }
     }
 
@@ -329,7 +334,7 @@ impl ColumnData {
             ColumnData::List(v) => convert_opt!(v, List),
             ColumnData::Dict(v) => convert_opt!(v, Dict),
             ColumnData::DateTime(v) => convert_opt!(v, DateTime),
-            ColumnData::Flexible(v) => v.clone(),
+            ColumnData::Flexible(v) => v.to_vec(),
         }
     }
 
@@ -759,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_to_flex_vec_integer() {
-        let col = ColumnData::Integer(vec![Some(1), None, Some(3)]);
+        let col = ColumnData::Integer(NullableVec::from(vec![Some(1), None, Some(3)]));
         let result = col.to_flex_vec();
         assert_eq!(result, vec![
             FlexType::Integer(1),
@@ -770,14 +775,14 @@ mod tests {
 
     #[test]
     fn test_to_flex_vec_float() {
-        let col = ColumnData::Float(vec![Some(1.5), None]);
+        let col = ColumnData::Float(NullableVec::from(vec![Some(1.5), None]));
         let result = col.to_flex_vec();
         assert_eq!(result, vec![FlexType::Float(1.5), FlexType::Undefined]);
     }
 
     #[test]
     fn test_to_flex_vec_string() {
-        let col = ColumnData::String(vec![Some("hello".into()), None]);
+        let col = ColumnData::String(NullableVec::from(vec![Some("hello".into()), None]));
         let result = col.to_flex_vec();
         assert_eq!(result, vec![FlexType::String("hello".into()), FlexType::Undefined]);
     }

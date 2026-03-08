@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 
 use sframe_query::algorithms::json::flex_to_json;
 use sframe_query::batch::{ColumnData, SFrameRows};
+use sframe_query::nullable_vec::NullableVec;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
 
@@ -85,14 +86,14 @@ pub fn arrow_array_to_column(array: &dyn Array, sframe_type: FlexTypeEnum) -> Re
     }
 }
 
-/// Helper macro to convert a primitive Arrow array to Vec<Option<i64>>.
+/// Helper macro to convert a primitive Arrow array to NullableVec<i64>.
 macro_rules! cast_int_array {
     ($array:expr, $arrow_type:ty) => {{
         let arr = $array
             .as_any()
             .downcast_ref::<$arrow_type>()
             .ok_or_else(|| SFrameError::Type(format!("Expected {} array", stringify!($arrow_type))))?;
-        let mut out = Vec::with_capacity(arr.len());
+        let mut out = NullableVec::with_capacity(arr.len());
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 out.push(None);
@@ -118,7 +119,7 @@ fn convert_to_integer(array: &dyn Array) -> Result<ColumnData> {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| SFrameError::Type("Expected UInt64Array".to_string()))?;
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = NullableVec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     out.push(None);
@@ -139,7 +140,7 @@ fn convert_to_integer(array: &dyn Array) -> Result<ColumnData> {
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| SFrameError::Type("Expected BooleanArray".to_string()))?;
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = NullableVec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     out.push(None);
@@ -162,7 +163,7 @@ fn convert_to_float(array: &dyn Array) -> Result<ColumnData> {
                 .as_any()
                 .downcast_ref::<Float16Array>()
                 .ok_or_else(|| SFrameError::Type("Expected Float16Array".to_string()))?;
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = NullableVec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     out.push(None);
@@ -177,7 +178,7 @@ fn convert_to_float(array: &dyn Array) -> Result<ColumnData> {
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| SFrameError::Type("Expected Float32Array".to_string()))?;
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = NullableVec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     out.push(None);
@@ -192,7 +193,7 @@ fn convert_to_float(array: &dyn Array) -> Result<ColumnData> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| SFrameError::Type("Expected Float64Array".to_string()))?;
-            let mut out = Vec::with_capacity(arr.len());
+            let mut out = NullableVec::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
                     out.push(None);
@@ -210,7 +211,7 @@ fn convert_to_float(array: &dyn Array) -> Result<ColumnData> {
 
 fn convert_to_string(array: &dyn Array) -> Result<ColumnData> {
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-        let mut out = Vec::with_capacity(arr.len());
+        let mut out = NullableVec::with_capacity(arr.len());
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 out.push(None);
@@ -220,7 +221,7 @@ fn convert_to_string(array: &dyn Array) -> Result<ColumnData> {
         }
         Ok(ColumnData::String(out))
     } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-        let mut out = Vec::with_capacity(arr.len());
+        let mut out = NullableVec::with_capacity(arr.len());
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 out.push(None);
@@ -406,7 +407,7 @@ fn convert_to_vector(array: &dyn Array) -> Result<ColumnData> {
             SFrameError::Type("Expected Float64 inner array for Vector conversion".to_string())
         })?;
 
-    let mut out = Vec::with_capacity(list_arr.len());
+    let mut out = NullableVec::with_capacity(list_arr.len());
     for i in 0..list_arr.len() {
         if list_arr.is_null(i) {
             out.push(None);
@@ -438,7 +439,7 @@ fn convert_list_array_to_list(list_arr: &ListArray) -> Result<ColumnData> {
     let inner_sframe_type = arrow_type_to_sframe(&inner_type)?;
     let values = list_arr.values();
 
-    let mut out = Vec::with_capacity(list_arr.len());
+    let mut out = NullableVec::with_capacity(list_arr.len());
     for i in 0..list_arr.len() {
         if list_arr.is_null(i) {
             out.push(None);
@@ -460,7 +461,7 @@ fn convert_large_list_array_to_list(list_arr: &LargeListArray) -> Result<ColumnD
     let inner_sframe_type = arrow_type_to_sframe(&inner_type)?;
     let values = list_arr.values();
 
-    let mut out = Vec::with_capacity(list_arr.len());
+    let mut out = NullableVec::with_capacity(list_arr.len());
     for i in 0..list_arr.len() {
         if list_arr.is_null(i) {
             out.push(None);
@@ -495,7 +496,7 @@ fn convert_to_dict(array: &dyn Array) -> Result<ColumnData> {
         field_cols.push((field.name().clone(), col));
     }
 
-    let mut out = Vec::with_capacity(struct_arr.len());
+    let mut out = NullableVec::with_capacity(struct_arr.len());
     for i in 0..struct_arr.len() {
         if struct_arr.is_null(i) {
             out.push(None);
@@ -537,21 +538,17 @@ pub fn sframe_type_to_arrow(ft: FlexTypeEnum) -> DataType {
 pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
     match col {
         ColumnData::Integer(v) => {
-            let arr = Int64Array::from(
-                v.to_vec(),
-            );
+            let arr = Int64Array::from(v.to_option_vec());
             Ok(Arc::new(arr) as ArrayRef)
         }
         ColumnData::Float(v) => {
-            let arr = Float64Array::from(
-                v.to_vec(),
-            );
+            let arr = Float64Array::from(v.to_option_vec());
             Ok(Arc::new(arr) as ArrayRef)
         }
         ColumnData::String(v) => {
             let arr = StringArray::from(
                 v.iter()
-                    .map(|opt| opt.as_ref().map(|s| s.as_ref()))
+                    .map(|opt| opt.map(|s| s.as_ref()))
                     .collect::<Vec<Option<&str>>>(),
             );
             Ok(Arc::new(arr) as ArrayRef)
@@ -560,7 +557,7 @@ pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
             let values: Vec<Option<i64>> = v
                 .iter()
                 .map(|opt| {
-                    opt.as_ref().map(|dt| {
+                    opt.map(|dt| {
                         dt.posix_timestamp * 1_000_000 + dt.microsecond as i64
                     })
                 })
@@ -614,7 +611,7 @@ pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
             let strings: Vec<Option<String>> = v
                 .iter()
                 .map(|opt| {
-                    opt.as_ref().map(|items| {
+                    opt.map(|items| {
                         let flex = FlexType::List(items.clone());
                         let json_val = flex_to_json(&flex);
                         serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string())
@@ -634,7 +631,7 @@ pub fn column_to_arrow_array(col: &ColumnData) -> Result<ArrayRef> {
             let strings: Vec<Option<String>> = v
                 .iter()
                 .map(|opt| {
-                    opt.as_ref().map(|entries| {
+                    opt.map(|entries| {
                         let flex = FlexType::Dict(entries.clone());
                         let json_val = flex_to_json(&flex);
                         serde_json::to_string(&json_val).unwrap_or_else(|_| "null".to_string())
@@ -958,9 +955,9 @@ mod tests {
         match &col {
             ColumnData::Float(v) => {
                 assert_eq!(v.len(), 3);
-                assert!((v[0].unwrap() - 1.5).abs() < 1e-6);
-                assert!(v[1].is_none());
-                assert!((v[2].unwrap() - 3.14).abs() < 1e-4);
+                assert!((*v.get(0).unwrap() - 1.5).abs() < 1e-6);
+                assert!(v.get(1).is_none());
+                assert!((*v.get(2).unwrap() - 3.14).abs() < 1e-4);
             }
             _ => panic!("Expected Float column"),
         }
@@ -972,9 +969,9 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::Float).unwrap();
         match &col {
             ColumnData::Float(v) => {
-                assert_eq!(v[0], Some(1.5));
-                assert_eq!(v[1], None);
-                assert!(v[2].unwrap().is_nan());
+                assert_eq!(v.get(0), Some(&1.5));
+                assert!(v.get(1).is_none());
+                assert!(v.get(2).unwrap().is_nan());
             }
             _ => panic!("Expected Float column"),
         }
@@ -986,9 +983,9 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::String).unwrap();
         match &col {
             ColumnData::String(v) => {
-                assert_eq!(v[0].as_deref(), Some("hello"));
-                assert_eq!(v[1], None);
-                assert_eq!(v[2].as_deref(), Some("world"));
+                assert_eq!(v.get(0).map(|s| s.as_ref()), Some("hello"));
+                assert!(v.get(1).is_none());
+                assert_eq!(v.get(2).map(|s| s.as_ref()), Some("world"));
             }
             _ => panic!("Expected String column"),
         }
@@ -1000,8 +997,8 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::String).unwrap();
         match &col {
             ColumnData::String(v) => {
-                assert_eq!(v[0].as_deref(), Some("large"));
-                assert_eq!(v[1], None);
+                assert_eq!(v.get(0).map(|s| s.as_ref()), Some("large"));
+                assert!(v.get(1).is_none());
             }
             _ => panic!("Expected String column"),
         }
@@ -1014,11 +1011,11 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 1500);
                 assert_eq!(dt.microsecond, 123);
                 assert_eq!(dt.tz_offset_quarter_hours, 0);
-                assert!(v[1].is_none());
+                assert!(v.get(1).is_none());
             }
             _ => panic!("Expected DateTime column"),
         }
@@ -1030,7 +1027,7 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 1609459200);
                 assert_eq!(dt.microsecond, 0);
             }
@@ -1045,7 +1042,7 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 1500);
                 assert_eq!(dt.microsecond, 123_000);
             }
@@ -1061,7 +1058,7 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 1500);
                 assert_eq!(dt.microsecond, 123);
             }
@@ -1076,11 +1073,11 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 86400);
                 assert_eq!(dt.microsecond, 0);
-                assert!(v[1].is_none());
-                let dt0 = v[2].as_ref().unwrap();
+                assert!(v.get(1).is_none());
+                let dt0 = v.get(2).unwrap();
                 assert_eq!(dt0.posix_timestamp, 0);
             }
             _ => panic!("Expected DateTime column"),
@@ -1094,7 +1091,7 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, 86400);
                 assert_eq!(dt.microsecond, 123_000);
             }
@@ -1111,7 +1108,7 @@ mod tests {
         let col = arrow_array_to_column(&arr, FlexTypeEnum::DateTime).unwrap();
         match &col {
             ColumnData::DateTime(v) => {
-                let dt = v[0].as_ref().unwrap();
+                let dt = v.get(0).unwrap();
                 assert_eq!(dt.posix_timestamp, -2);
                 assert_eq!(dt.microsecond, 499_877);
                 // Verify roundtrip: -2 * 1_000_000 + 499_877 = -1_500_123
@@ -1138,9 +1135,9 @@ mod tests {
         match &col {
             ColumnData::Vector(v) => {
                 assert_eq!(v.len(), 3);
-                assert_eq!(v[0].as_ref().unwrap().as_ref(), &[1.0, 2.0]);
-                assert!(v[1].is_none());
-                assert_eq!(v[2].as_ref().unwrap().as_ref(), &[3.0]);
+                assert_eq!(v.get(0).unwrap().as_ref(), &[1.0, 2.0]);
+                assert!(v.get(1).is_none());
+                assert_eq!(v.get(2).unwrap().as_ref(), &[3.0]);
             }
             _ => panic!("Expected Vector column"),
         }
@@ -1160,12 +1157,12 @@ mod tests {
         match &col {
             ColumnData::List(v) => {
                 assert_eq!(v.len(), 3);
-                let first = v[0].as_ref().unwrap();
+                let first = v.get(0).unwrap();
                 assert_eq!(first.len(), 2);
                 assert_eq!(first[0], FlexType::Integer(10));
                 assert_eq!(first[1], FlexType::Integer(20));
-                assert!(v[1].is_none());
-                let third = v[2].as_ref().unwrap();
+                assert!(v.get(1).is_none());
+                let third = v.get(2).unwrap();
                 assert_eq!(third.len(), 1);
                 assert_eq!(third[0], FlexType::Integer(30));
             }
@@ -1189,7 +1186,7 @@ mod tests {
         match &col {
             ColumnData::Dict(v) => {
                 assert_eq!(v.len(), 2);
-                let first = v[0].as_ref().unwrap();
+                let first = v.get(0).unwrap();
                 assert_eq!(first.len(), 2);
                 assert_eq!(first[0].0, FlexType::String(Arc::from("x")));
                 assert_eq!(first[0].1, FlexType::Integer(1));
@@ -1229,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_column_to_arrow_integer() {
-        let col = ColumnData::Integer(vec![Some(1), None, Some(42)]);
+        let col = ColumnData::Integer(vec![Some(1), None, Some(42)].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let int_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(int_arr.len(), 3);
@@ -1240,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_column_to_arrow_float() {
-        let col = ColumnData::Float(vec![Some(1.5), None, Some(3.14)]);
+        let col = ColumnData::Float(vec![Some(1.5), None, Some(3.14)].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let f_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(f_arr.len(), 3);
@@ -1251,7 +1248,7 @@ mod tests {
 
     #[test]
     fn test_column_to_arrow_string() {
-        let col = ColumnData::String(vec![Some(Arc::from("hello")), None, Some(Arc::from(""))]);
+        let col = ColumnData::String(vec![Some(Arc::from("hello")), None, Some(Arc::from(""))].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s_arr.value(0), "hello");
@@ -1268,7 +1265,7 @@ mod tests {
                 microsecond: 123,
             }),
             None,
-        ]);
+        ].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let ts_arr = arr
             .as_any()
@@ -1284,7 +1281,7 @@ mod tests {
             Some(Arc::from(vec![1.0, 2.0].as_slice())),
             None,
             Some(Arc::from(vec![3.0].as_slice())),
-        ]);
+        ].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(list_arr.len(), 3);
@@ -1315,7 +1312,7 @@ mod tests {
                 vec![FlexType::Integer(1), FlexType::Integer(2)].as_slice(),
             )),
             None,
-        ]);
+        ].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s_arr.value(0), "[1,2]");
@@ -1330,7 +1327,7 @@ mod tests {
                 FlexType::Integer(42),
             )]
             .as_slice(),
-        ))]);
+        ))].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s_arr.value(0), "{\"key\":42}");
@@ -1385,8 +1382,8 @@ mod tests {
     #[test]
     fn test_sframe_rows_to_record_batch() {
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(10), Some(20)]),
-            ColumnData::String(vec![Some(Arc::from("x")), None]),
+            ColumnData::Integer(vec![Some(10), Some(20)].into()),
+            ColumnData::String(vec![Some(Arc::from("x")), None].into()),
         ])
         .unwrap();
         let names = vec!["id".to_string(), "label".to_string()];
@@ -1463,7 +1460,7 @@ mod tests {
     #[test]
     fn test_sframe_rows_to_record_batch_mismatched_names_length() {
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1)]),
+            ColumnData::Integer(vec![Some(1)].into()),
         ])
         .unwrap();
         let result = sframe_rows_to_record_batch(
@@ -1477,7 +1474,7 @@ mod tests {
     #[test]
     fn test_sframe_rows_to_record_batch_mismatched_types_length() {
         let rows = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1)]),
+            ColumnData::Integer(vec![Some(1)].into()),
         ])
         .unwrap();
         let result = sframe_rows_to_record_batch(
@@ -1527,7 +1524,7 @@ mod tests {
                 tz_offset_quarter_hours: 0,
                 microsecond: 0,
             }),
-        ]);
+        ].into());
 
         let arrow_arr = column_to_arrow_array(&orig).unwrap();
         let back = arrow_array_to_column(arrow_arr.as_ref(), FlexTypeEnum::DateTime).unwrap();
@@ -1556,7 +1553,7 @@ mod tests {
             Some(Arc::from(vec![1.0, 2.0, 3.0].as_slice())),
             None,
             Some(Arc::from(Vec::<f64>::new().as_slice())),
-        ]);
+        ].into());
 
         let arrow_arr = column_to_arrow_array(&orig).unwrap();
         let back = arrow_array_to_column(arrow_arr.as_ref(), FlexTypeEnum::Vector).unwrap();
@@ -1564,9 +1561,9 @@ mod tests {
         match (&orig, &back) {
             (ColumnData::Vector(a), ColumnData::Vector(b)) => {
                 assert_eq!(a.len(), b.len());
-                assert_eq!(a[0].as_ref().unwrap().as_ref(), b[0].as_ref().unwrap().as_ref());
-                assert!(a[1].is_none() && b[1].is_none());
-                assert_eq!(a[2].as_ref().unwrap().as_ref(), b[2].as_ref().unwrap().as_ref());
+                assert_eq!(a.get(0).unwrap().as_ref(), b.get(0).unwrap().as_ref());
+                assert!(a.get(1).is_none() && b.get(1).is_none());
+                assert_eq!(a.get(2).unwrap().as_ref(), b.get(2).unwrap().as_ref());
             }
             _ => panic!("Expected Vector columns"),
         }

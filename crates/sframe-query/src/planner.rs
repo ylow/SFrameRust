@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn test_length_materialized() {
-        let col = ColumnData::Integer(vec![Some(1), Some(2), Some(3)]);
+        let col = ColumnData::Integer(vec![Some(1), Some(2), Some(3)].into());
         let batch = SFrameRows::new(vec![col]).unwrap();
         assert_eq!(PlannerNode::materialized(batch).length(), Some(3));
     }
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_slice_materialized() {
-        let col = ColumnData::Integer(vec![Some(10), Some(20), Some(30), Some(40), Some(50)]);
+        let col = ColumnData::Integer(vec![Some(10), Some(20), Some(30), Some(40), Some(50)].into());
         let batch = SFrameRows::new(vec![col]).unwrap();
         let src = PlannerNode::materialized(batch);
         let sliced = slice_plan(&src, 1, 4).unwrap();

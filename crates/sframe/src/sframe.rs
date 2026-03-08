@@ -2248,14 +2248,14 @@ mod tests {
 
         // Write two batches
         let batch1 = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2)]),
-            ColumnData::String(vec![Some("alice".into()), Some("bob".into())]),
+            ColumnData::Integer(vec![Some(1), Some(2)].into()),
+            ColumnData::String(vec![Some("alice".into()), Some("bob".into())].into()),
         ]).unwrap();
         writer.write_batch(&batch1).unwrap();
 
         let batch2 = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(3)]),
-            ColumnData::String(vec![Some("charlie".into())]),
+            ColumnData::Integer(vec![Some(3)].into()),
+            ColumnData::String(vec![Some("charlie".into())].into()),
         ]).unwrap();
         writer.write_batch(&batch2).unwrap();
 

@@ -18,10 +18,9 @@ pub(super) fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchIt
             let end = (offset + batch_size).min(total);
             match cmd {
                 BatchCommand::NextBatch => {
-                    let values: Vec<Option<i64>> = (offset..end)
+                    let col = ColumnData::Integer((offset..end)
                         .map(|i| Some(start + (i as i64) * step))
-                        .collect();
-                    let col = ColumnData::Integer(values);
+                        .collect());
                     let batch = SFrameRows::new(vec![col]);
                     cmd = co.yield_(BatchResponse::Batch(batch)).await;
                 }

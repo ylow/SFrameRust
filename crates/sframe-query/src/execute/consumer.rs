@@ -53,13 +53,13 @@ mod tests {
     fn test_consume_to_segment_basic() {
         // Create two batches
         let batch1 = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(1), Some(2)]),
-            ColumnData::String(vec![Some("a".into()), Some("b".into())]),
+            ColumnData::Integer(vec![Some(1), Some(2)].into()),
+            ColumnData::String(vec![Some("a".into()), Some("b".into())].into()),
         ])
         .unwrap();
         let batch2 = SFrameRows::new(vec![
-            ColumnData::Integer(vec![Some(3)]),
-            ColumnData::String(vec![Some("c".into())]),
+            ColumnData::Integer(vec![Some(3)].into()),
+            ColumnData::String(vec![Some("c".into())].into()),
         ])
         .unwrap();
 
