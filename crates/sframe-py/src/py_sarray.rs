@@ -30,11 +30,45 @@ fn allow<T: Send>(py: Python<'_>, f: impl FnOnce() -> sframe_types::error::Resul
 
 #[pymethods]
 impl PySArray {
-    /// Construct an SArray from a Python list with optional dtype.
+    /// Construct an SArray from a Python list or range, with optional dtype.
+    ///
+    /// Accepts:
+    ///   - `list`: materializes the values immediately.
+    ///   - `range`: creates a lazy integer range (no materialization).
     #[new]
     #[pyo3(signature = (data, dtype=None))]
-    fn py_new(data: &Bound<'_, PyList>, dtype: Option<&str>) -> PyResult<Self> {
-        let values: Vec<FlexType> = data
+    fn py_new(data: &Bound<'_, PyAny>, dtype: Option<&str>) -> PyResult<Self> {
+        // Check for range objects first — these become lazy plans.
+        if data.get_type().name()? == "range" {
+            let start: i64 = data.getattr("start")?.extract()?;
+            let stop: i64 = data.getattr("stop")?.extract()?;
+            let step: i64 = data.getattr("step")?.extract()?;
+            if step == 0 {
+                return Err(PyValueError::new_err("range() arg 3 must not be zero"));
+            }
+            let count = if (step > 0 && stop > start) || (step < 0 && stop < start) {
+                ((stop - start).unsigned_abs() + step.unsigned_abs() - 1) / step.unsigned_abs()
+            } else {
+                0
+            };
+            let sa = SArray::from_range(start, step, count);
+            return match dtype {
+                Some(s) => {
+                    let dt = py_str_to_dtype(s)?;
+                    if dt != FlexTypeEnum::Integer {
+                        Ok(PySArray { inner: sa.astype(dt, false) })
+                    } else {
+                        Ok(PySArray { inner: sa })
+                    }
+                }
+                None => Ok(PySArray { inner: sa }),
+            };
+        }
+
+        // Fall back to list construction.
+        let list: &Bound<'_, PyList> = data.downcast()
+            .map_err(|_| PyTypeError::new_err("SArray() expects a list or range"))?;
+        let values: Vec<FlexType> = list
             .iter()
             .map(|item| py_to_flextype(&item))
             .collect::<PyResult<_>>()?;

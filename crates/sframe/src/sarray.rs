@@ -56,6 +56,19 @@ impl SArray {
         })
     }
 
+    /// Create a lazy SArray that generates a range of integers.
+    ///
+    /// Equivalent to Python's `range(start, start + step * count, step)`.
+    pub fn from_range(start: i64, step: i64, count: u64) -> Self {
+        let plan = PlannerNode::range(start, step, count);
+        SArray {
+            plan,
+            dtype: FlexTypeEnum::Integer,
+            len: Some(count),
+            column_index: 0,
+        }
+    }
+
     /// Create an SArray backed by a planner node and column index.
     pub(crate) fn from_plan(
         plan: Arc<PlannerNode>,
