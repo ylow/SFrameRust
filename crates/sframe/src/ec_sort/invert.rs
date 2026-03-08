@@ -16,7 +16,7 @@ use crate::sarray::SArray;
 use crate::sframe::{AnonymousStore, SFrame};
 
 use super::{
-    compute_num_buckets, extract_physical_source, flush_to_segment_writer, read_fmap_chunk,
+    compute_num_buckets, encode_and_compress, extract_physical_source, read_fmap_chunk,
     CHUNK_SIZE,
 };
 
@@ -102,8 +102,9 @@ pub(super) fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<
             .collect::<Result<_>>()?;
 
         // Process all chunks in parallel — each work item handles one chunk.
-        // With a single column there's no column dimension, but we still
-        // get parallelism across chunks.
+        // Both columns are flushed under a single lock acquisition to
+        // guarantee that column 0 (value) and column 1 (fmap) stay aligned
+        // even when multiple threads write to the same bucket.
         let errors: Vec<Result<()>> = batch_chunks
             .par_iter()
             .enumerate()
@@ -125,11 +126,8 @@ pub(super) fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<
                     if seg_bufs_val[bucket].len() >= flush_thresh {
                         let buf_v = std::mem::take(&mut seg_bufs_val[bucket]);
                         let buf_f = std::mem::take(&mut seg_bufs_fmap[bucket]);
-                        flush_to_segment_writer(
-                            &segment_writers, bucket, 0, &buf_v, FlexTypeEnum::Integer,
-                        )?;
-                        flush_to_segment_writer(
-                            &segment_writers, bucket, 1, &buf_f, FlexTypeEnum::Integer,
+                        flush_paired_to_segment_writer(
+                            &segment_writers, bucket, &buf_v, &buf_f,
                         )?;
                     }
                 }
@@ -139,11 +137,8 @@ pub(super) fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<
                     let buf_v = std::mem::take(&mut seg_bufs_val[seg]);
                     let buf_f = std::mem::take(&mut seg_bufs_fmap[seg]);
                     if !buf_v.is_empty() {
-                        flush_to_segment_writer(
-                            &segment_writers, seg, 0, &buf_v, FlexTypeEnum::Integer,
-                        )?;
-                        flush_to_segment_writer(
-                            &segment_writers, seg, 1, &buf_f, FlexTypeEnum::Integer,
+                        flush_paired_to_segment_writer(
+                            &segment_writers, seg, &buf_v, &buf_f,
                         )?;
                     }
                 }
@@ -248,4 +243,28 @@ pub(super) fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<
     );
 
     Ok(SArray::from_plan(plan, FlexTypeEnum::Integer, Some(total_rows_out), 0))
+}
+
+/// Flush two paired columns (value + fmap) under a single lock acquisition.
+///
+/// Encoding and compression happen outside the lock. The lock is held only
+/// for the two sequential writes, guaranteeing that the pair is atomic with
+/// respect to other threads writing to the same bucket.
+fn flush_paired_to_segment_writer(
+    segment_writers: &[Mutex<SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>>],
+    bucket: usize,
+    values: &[FlexType],
+    fmap_values: &[FlexType],
+) -> sframe_types::error::Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let num_v = values.len() as u64;
+    let num_f = fmap_values.len() as u64;
+    let (data_v, size_v, comp_v) = encode_and_compress(values)?;
+    let (data_f, size_f, comp_f) = encode_and_compress(fmap_values)?;
+    let mut sw = segment_writers[bucket].lock().unwrap();
+    sw.write_pre_encoded_block(0, &data_v, size_v, num_v, comp_v, FlexTypeEnum::Integer)?;
+    sw.write_pre_encoded_block(1, &data_f, size_f, num_f, comp_f, FlexTypeEnum::Integer)?;
+    Ok(())
 }
