@@ -4,11 +4,13 @@ use pyo3::prelude::*;
 
 mod conversion;
 mod error;
+mod py_config;
 mod py_sarray;
 mod py_sframe;
 mod py_stream_writer;
 
 use error::IntoPyResult;
+use py_config::PyConfig;
 use py_sarray::{PySArray, PySArrayIter};
 use py_sframe::{PySFrame, PySFrameIter};
 use py_stream_writer::PySFrameStreamWriter;
@@ -167,6 +169,7 @@ fn _sframe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySArrayIter>()?;
     m.add_class::<PySFrameIter>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add("config", PyConfig)?;
 
     // aggregate submodule
     let aggregate = PyModule::new(m.py(), "aggregate")?;

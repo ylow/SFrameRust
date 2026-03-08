@@ -67,7 +67,7 @@ pub fn join(
 
     let left_cells = left.num_rows() * left.num_columns().max(1);
     let right_cells = right.num_rows() * right.num_columns().max(1);
-    let budget = sframe_config::global().join_buffer_num_cells;
+    let budget = sframe_config::global().join_buffer_num_cells();
 
     let smaller_cells = left_cells.min(right_cells);
 

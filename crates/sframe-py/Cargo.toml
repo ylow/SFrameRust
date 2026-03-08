@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sframe_core = { path = "../sframe", package = "sframe" }
+sframe-config = { path = "../sframe-config" }
 sframe-types = { path = "../sframe-types" }
 sframe-query = { path = "../sframe-query" }
 pyo3 = { version = "0.28", features = ["extension-module"] }

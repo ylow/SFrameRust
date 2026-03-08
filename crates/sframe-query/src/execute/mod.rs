@@ -350,7 +350,7 @@ fn compile_node(
                 .copied();
 
             if data_rate != mask_rate {
-                let target = sframe_config::global().source_batch_size;
+                let target = sframe_config::global().source_batch_size();
                 data_input = rebatch::rebatch(data_input, target);
                 mask_input = rebatch::rebatch(mask_input, target);
             }
@@ -569,7 +569,7 @@ fn compile_node(
                     .get(&(Arc::as_ptr(&node.inputs[0]) as usize))
                     .copied();
                 if input_rate != first_rate {
-                    let target = sframe_config::global().source_batch_size;
+                    let target = sframe_config::global().source_batch_size();
                     s = rebatch::rebatch(s, target);
                 }
 
@@ -584,7 +584,7 @@ fn compile_node(
                     rate_ids.get(&(Arc::as_ptr(inp) as usize)).copied() != first_rate
                 });
                 if any_mismatch {
-                    let target = sframe_config::global().source_batch_size;
+                    let target = sframe_config::global().source_batch_size();
                     let first = inputs.remove(0);
                     inputs.insert(0, rebatch::rebatch(first, target));
                 }

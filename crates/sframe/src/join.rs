@@ -718,7 +718,7 @@ pub(crate) fn hash_join(
     output_names: &[String],
     output_dtypes: &[FlexTypeEnum],
 ) -> Result<SFrame> {
-    let budget = sframe_config::global().join_buffer_num_cells;
+    let budget = sframe_config::global().join_buffer_num_cells();
 
     // Try known_len first (free, no materialization).
     let left_known = left.known_len().map(|n| n * left.num_columns() as u64);

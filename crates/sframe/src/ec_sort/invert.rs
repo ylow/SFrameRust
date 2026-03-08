@@ -33,7 +33,7 @@ pub(super) fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<
         return SArray::from_vec(Vec::new(), FlexTypeEnum::Integer);
     }
 
-    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
+    let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
     let column_bytes = &[8usize]; // single integer column
     let num_buckets = compute_num_buckets(num_rows, column_bytes, budget);
     let rows_per_bucket = ((num_rows + num_buckets as u64 - 1) / num_buckets as u64).max(1);

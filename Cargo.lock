@@ -2566,6 +2566,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "futures",
+ "lz4_flex 0.11.5",
  "parquet",
  "rayon",
  "sframe-config",
@@ -2614,6 +2615,7 @@ version = "0.1.0"
 dependencies = [
  "pyo3",
  "sframe",
+ "sframe-config",
  "sframe-query",
  "sframe-types",
 ]

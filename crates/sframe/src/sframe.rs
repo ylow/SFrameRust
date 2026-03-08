@@ -795,7 +795,7 @@ impl SFrame {
             .collect::<Result<_>>()?;
 
         let estimated_size = self.estimate_size();
-        let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
+        let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
 
         if estimated_size <= budget {
             self.sort_in_memory(&sort_keys)

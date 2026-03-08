@@ -8,7 +8,7 @@ use super::batch_iter::{BatchCommand, BatchCo, BatchIterator, BatchResponse};
 
 /// Compile a range source.
 pub(super) fn compile_range(start: i64, step: i64, count: u64) -> Result<BatchIterator> {
-    let batch_size = sframe_config::global().source_batch_size;
+    let batch_size = sframe_config::global().source_batch_size();
     let total = count as usize;
 
     Ok(BatchIterator::new(move |co: BatchCo| async move {

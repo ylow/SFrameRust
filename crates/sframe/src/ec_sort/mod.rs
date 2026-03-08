@@ -256,7 +256,7 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
     let column_names = input.column_names().to_vec();
     let column_bytes = estimate_column_bytes(&column_types);
 
-    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
+    let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
     let num_buckets = compute_num_buckets(num_rows, &column_bytes, budget);
     let rows_per_bucket = ((num_rows + num_buckets as u64 - 1) / num_buckets as u64).max(1);
 

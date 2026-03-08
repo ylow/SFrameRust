@@ -88,7 +88,7 @@ fn spill_sorted_run(
     let file = vfs.open_write(&seg_path)?;
     let mut seg_writer = SegmentWriter::new(file, dtypes.len());
 
-    let chunk_size = sframe_config::global().source_batch_size;
+    let chunk_size = sframe_config::global().source_batch_size();
     for chunk in indices.chunks(chunk_size) {
         for (col_idx, col) in buffer.columns().iter().enumerate() {
             let values: Vec<FlexType> = chunk.iter().map(|&i| col.get(i)).collect();
@@ -129,7 +129,7 @@ impl RunCursor {
         let file = vfs.open_read(path)?;
         let file_size = file.size()?;
         let seg_reader = SegmentReader::open(Box::new(file), file_size, dtypes.to_vec())?;
-        let max_blocks = sframe_config::global().max_blocks_in_cache;
+        let max_blocks = sframe_config::global().max_blocks_in_cache();
         let reader = CachedSegmentReader::new(seg_reader, max_blocks);
         let ncols = dtypes.len();
 
@@ -245,7 +245,7 @@ fn merge_sorted_runs(
     let keys = keys.to_vec();
     let dtypes = dtypes.to_vec();
     let ncols = dtypes.len();
-    let batch_size = sframe_config::global().source_batch_size;
+    let batch_size = sframe_config::global().source_batch_size();
 
     let descending: Vec<bool> = keys
         .iter()
@@ -361,7 +361,7 @@ fn merge_sorted_runs(
 /// After all input, either returns sorted data directly (fast path)
 /// or k-way merges the sorted runs (external sort path).
 pub fn sort(input: BatchIterator, keys: &[SortKey]) -> Result<BatchIterator> {
-    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
+    let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
     sort_with_budget(input, keys, budget)
 }
 
@@ -443,7 +443,7 @@ fn sort_with_budget(
             return Ok(single_batch_iter(buf));
         }
         let indices = build_sort_indices(&buf, keys);
-        let batch_size = sframe_config::global().source_batch_size;
+        let batch_size = sframe_config::global().source_batch_size();
         return Ok(BatchIterator::new(move |co: BatchCo| async move {
             let mut cmd = co.yield_(BatchResponse::Ready).await;
             for chunk in indices.chunks(batch_size) {

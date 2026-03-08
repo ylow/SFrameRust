@@ -182,8 +182,8 @@ fn make_pull_source(
     dtypes: Vec<FlexTypeEnum>,
     slices: Vec<SegmentSlice>,
 ) -> BatchIterator {
-    let batch_size = sframe_config::global().source_batch_size;
-    let max_blocks = sframe_config::global().max_blocks_in_cache;
+    let batch_size = sframe_config::global().source_batch_size();
+    let max_blocks = sframe_config::global().max_blocks_in_cache();
 
     let mut state = PullSourceState {
         vfs,

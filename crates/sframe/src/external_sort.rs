@@ -42,7 +42,7 @@ pub(crate) fn external_sort(sf: &SFrame, sort_keys: &[SortKey]) -> Result<SFrame
     }
 
     let primary_key = &sort_keys[0];
-    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
+    let budget = sframe_config::global().sort_max_memory() / rayon::current_num_threads().max(1);
     let estimated_size = sf.estimate_size();
 
     // Check if parallel execution is possible

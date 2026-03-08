@@ -7,6 +7,7 @@ from _sframe import (
     SFrame,
     SArray,
     SFrameStreamWriter,
+    config,
     load,
 )
 from _sframe import aggregate
@@ -15,6 +16,7 @@ __all__ = [
     "SFrame",
     "SArray",
     "SFrameStreamWriter",
+    "config",
     "load",
     "aggregate",
 ]
