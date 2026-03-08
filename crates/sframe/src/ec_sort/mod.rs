@@ -11,25 +11,26 @@
 //!    forward map, then permute values into their final positions within the
 //!    bucket. Assemble the buckets into an output SFrame.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+mod invert;
+mod permute;
+mod scatter;
 
-use rayon::prelude::*;
+use std::sync::Mutex;
 
 use sframe_io::cache_fs::global_cache_fs;
 use sframe_io::vfs::{ArcCacheFsVfs, VirtualFileSystem};
 use sframe_query::planner::{LogicalOp, PlannerNode};
 use sframe_storage::block_encode::encode_typed_block;
-use sframe_storage::scatter_writer::ScatterWriter;
-use sframe_storage::segment_reader::SegmentReader;
-use sframe_storage::segment_writer::{BufferedSegmentWriter, SegmentWriter};
-use sframe_storage::sframe_reader::{SFrameMetadata, SFrameReader};
-use sframe_storage::sframe_writer::{assemble_sframe_from_segments, generate_hash, segment_filename};
+use sframe_storage::segment_writer::SegmentWriter;
+use sframe_storage::sframe_reader::SFrameReader;
+use sframe_storage::sframe_writer::generate_hash;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
+use std::sync::Arc;
+
 use crate::sarray::SArray;
-use crate::sframe::{AnonymousStore, SFrame};
+use crate::sframe::SFrame;
 
 const CHUNK_SIZE: usize = 8192;
 
@@ -41,7 +42,7 @@ const CHUNK_SIZE: usize = 8192;
 ///
 /// Mirrors `sframe_storage::segment_writer::estimate_bytes_per_value`
 /// (which is `pub(crate)` in that crate and not accessible here).
-fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
+pub(super) fn estimate_bytes_per_value(dtype: FlexTypeEnum) -> usize {
     match dtype {
         FlexTypeEnum::Integer => 8,
         FlexTypeEnum::Float => 8,
@@ -68,7 +69,7 @@ fn estimate_column_bytes(column_types: &[FlexTypeEnum]) -> Vec<usize> {
 /// (`bytes_per_value * num_rows`), divide by half the per-thread budget,
 /// and multiply by the number of CPUs. Clamp to 1 if there would be
 /// more buckets than rows.
-fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread: usize) -> usize {
+pub(super) fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread: usize) -> usize {
     if num_rows == 0 || column_bytes.is_empty() {
         return 1;
     }
@@ -93,7 +94,7 @@ fn compute_num_buckets(num_rows: u64, column_bytes: &[usize], budget_per_thread:
 }
 
 // ---------------------------------------------------------------------------
-// Scatter phase
+// Scatter phase utilities
 // ---------------------------------------------------------------------------
 
 /// LZ4 compression threshold — skip if compressed >= 90% of original.
@@ -102,7 +103,7 @@ const COMPRESSION_DISABLE_THRESHOLD: f64 = 0.9;
 /// Encode a block and LZ4-compress it, returning the encoded bytes and
 /// metadata needed by `SegmentWriter::write_pre_encoded_block`.
 /// All CPU work happens here, outside any lock.
-fn encode_and_compress(
+pub(super) fn encode_and_compress(
     values: &[FlexType],
 ) -> Result<(Vec<u8>, u64, bool)> {
     let encoded = encode_typed_block(values)?;
@@ -119,7 +120,7 @@ fn encode_and_compress(
 /// Flush a buffer to a Mutex-wrapped SegmentWriter.
 /// Encoding + compression happens OUTSIDE the lock; only the sequential
 /// file write is serialized.
-fn flush_to_segment_writer(
+pub(super) fn flush_to_segment_writer(
     segment_writers: &[Mutex<SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>>],
     bucket: usize,
     col_idx: usize,
@@ -138,20 +139,20 @@ fn flush_to_segment_writer(
 
 /// Physical source info extracted from a plan.
 #[derive(Clone)]
-struct PhysicalSource {
-    path: String,
-    vfs: Arc<dyn VirtualFileSystem>,
-    /// Maps SFrame column index → physical column index in the SFrameSource.
+pub(super) struct PhysicalSource {
+    pub(super) path: String,
+    pub(super) vfs: Arc<dyn VirtualFileSystem>,
+    /// Maps SFrame column index -> physical column index in the SFrameSource.
     /// E.g., if the plan is `Project(SFrameSource, [3, 1])`, then
     /// `column_map = [3, 1]`: SFrame column 0 reads physical column 3.
-    column_map: Vec<usize>,
+    pub(super) column_map: Vec<usize>,
 }
 
 /// Try to extract the physical SFrame path and column mapping from a plan.
 ///
 /// Returns `Some` if the plan is an SFrameSource (possibly wrapped in
 /// a Project), meaning the SFrame is already materialized on disk/CacheFs.
-fn extract_physical_source(sf: &SFrame) -> Option<PhysicalSource> {
+pub(super) fn extract_physical_source(sf: &SFrame) -> Option<PhysicalSource> {
     let plan = sf.fuse_plan().ok()?;
     let mut node = &plan;
     let mut column_map: Option<Vec<usize>> = None;
@@ -187,374 +188,8 @@ fn extract_physical_source(sf: &SFrame) -> Option<PhysicalSource> {
     }
 }
 
-/// Scatter all input columns (plus the forward map) into segment files.
-///
-/// Two strategies:
-/// - **Direct path** (materialized inputs): Per-thread `SFrameReader`s
-///   read column blocks and scatter directly to `Mutex`-wrapped segment
-///   writers. No intermediate accumulation — memory is bounded to one
-///   block per thread plus the forward_map chunk.
-/// - **Lazy path**: Uses plan slicing (`try_slice`) + ScatterWriter for
-///   any plan type.
-fn scatter_columns(
-    vfs: &dyn VirtualFileSystem,
-    base_path: &str,
-    data_prefix: &str,
-    input: &SFrame,
-    forward_map: &SArray,
-    num_buckets: usize,
-    rows_per_bucket: u64,
-    num_rows: u64,
-    budget: usize,
-) -> Result<sframe_storage::scatter_writer::ScatterResult> {
-    let input_source = extract_physical_source(input);
-    let fmap_sf = SFrame::new_with_columns(
-        vec![forward_map.clone()],
-        vec!["__fmap__".to_string()],
-    );
-    let fmap_source = extract_physical_source(&fmap_sf);
-
-    if input_source.is_some() && fmap_source.is_some() {
-        eprintln!("[sframe] ec_sort scatter: using direct reader path");
-        scatter_columns_direct(
-            vfs, base_path, data_prefix, input,
-            &fmap_sf, input_source.as_ref().unwrap(), fmap_source.as_ref().unwrap(),
-            num_buckets, rows_per_bucket, num_rows, budget,
-        )
-    } else {
-        scatter_columns_lazy(
-            vfs, base_path, data_prefix, input, forward_map,
-            &fmap_sf, &fmap_source,
-            num_buckets, rows_per_bucket, num_rows, budget,
-        )
-    }
-}
-
-/// Direct scatter path for materialized inputs.
-///
-/// Uses Mutex-wrapped SegmentWriters so rayon threads can write directly.
-/// Each thread reads its column block-by-block, classifying and flushing
-/// to per-segment buffers as it goes. Memory per thread is bounded to
-/// one decoded block + per-segment flush buffers (~64KB each).
-fn scatter_columns_direct(
-    vfs: &dyn VirtualFileSystem,
-    base_path: &str,
-    data_prefix: &str,
-    input: &SFrame,
-    fmap_sf: &SFrame,
-    input_source: &PhysicalSource,
-    fmap_source: &PhysicalSource,
-    num_buckets: usize,
-    rows_per_bucket: u64,
-    num_rows: u64,
-    budget: usize,
-) -> Result<sframe_storage::scatter_writer::ScatterResult> {
-    let input_dtypes = input.column_types();
-    let num_input_cols = input_dtypes.len();
-    let fmap_col_idx = num_input_cols;
-
-    let mut scatter_dtypes = input_dtypes.clone();
-    scatter_dtypes.push(FlexTypeEnum::Integer);
-
-    // Create M Mutex-wrapped SegmentWriters
-    let mut segment_files = Vec::with_capacity(num_buckets);
-    let segment_writers: Vec<Mutex<SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>>> =
-        (0..num_buckets)
-            .map(|seg_idx| {
-                let seg_file = segment_filename(data_prefix, seg_idx);
-                let seg_path = format!("{base_path}/{seg_file}");
-                let file = vfs.open_write(&seg_path)?;
-                segment_files.push(seg_file);
-                Ok(Mutex::new(SegmentWriter::new(file, scatter_dtypes.len())))
-            })
-            .collect::<Result<_>>()?;
-
-    // Per-column flush threshold (rows per output block)
-    let flush_threshold: Vec<usize> = scatter_dtypes
-        .iter()
-        .map(|&dt| {
-            let est = estimate_bytes_per_value(dt).max(1);
-            (64 * 1024 / est).clamp(8, 256 * 1024)
-        })
-        .collect();
-
-    // Pre-compute segment layout: cumulative row offsets per input segment.
-    let input_meta = SFrameMetadata::open_with_fs(&*input_source.vfs, &input_source.path)?;
-    let input_seg_files: Vec<String> = input_meta.group_index.segment_files.clone();
-    let col_types: Vec<FlexTypeEnum> = input_meta.group_index.columns
-        .iter().map(|c| c.dtype).collect();
-    let num_input_segs = input_seg_files.len();
-
-    let ref_col = input_source.column_map[0];
-    let seg_row_offsets: Vec<u64> = {
-        let mut offsets = Vec::with_capacity(num_input_segs + 1);
-        offsets.push(0);
-        for seg_idx in 0..num_input_segs {
-            let prev = *offsets.last().unwrap();
-            offsets.push(prev + input_meta.group_index.columns[ref_col].segment_sizes[seg_idx]);
-        }
-        offsets
-    };
-
-    // Size fmap chunks so we can process multiple concurrently.
-    // We want enough work items (chunk × column × segment) to keep all
-    // threads busy. Each concurrent chunk holds fmap data in memory.
-    let num_threads = rayon::current_num_threads().max(1);
-    let items_per_chunk = (num_input_cols * num_input_segs).max(1);
-    let concurrent_chunks = ((num_threads * 2) / items_per_chunk).max(1);
-    let fmap_chunk_size = {
-        let by_budget = budget / 2 / 8 / concurrent_chunks;
-        let by_count = ((num_rows as usize + concurrent_chunks - 1) / concurrent_chunks).max(1);
-        (by_budget.min(by_count)).max(1024) as u64
-    };
-
-    // Process in batches of concurrent_chunks fmap chunks at a time.
-    let mut batch_start_row = 0u64;
-    while batch_start_row < num_rows {
-        // Determine which fmap chunks are in this batch
-        let mut batch_chunks: Vec<(u64, u64)> = Vec::new(); // (chunk_start, chunk_end)
-        let mut row = batch_start_row;
-        for _ in 0..concurrent_chunks {
-            if row >= num_rows {
-                break;
-            }
-            let end = (row + fmap_chunk_size).min(num_rows);
-            batch_chunks.push((row, end));
-            row = end;
-        }
-        batch_start_row = row;
-
-        // Read all fmap chunks for this batch (can be parallelized too)
-        let fmap_arcs: Vec<Arc<Vec<u64>>> = batch_chunks
-            .iter()
-            .map(|&(cs, ce)| {
-                let vals = read_fmap_chunk(
-                    fmap_sf, &Some(fmap_source.clone()), cs, ce,
-                )?;
-                Ok(Arc::new(vals))
-            })
-            .collect::<Result<_>>()?;
-
-        // Build work items across all chunks in the batch:
-        // (chunk_idx, col_idx, input_seg_idx)
-        struct WorkItem {
-            fmap: Arc<Vec<u64>>,
-            chunk_start: u64,
-            chunk_end: u64,
-            col_idx: usize,
-            seg_idx: usize,
-        }
-
-        let mut work_items: Vec<WorkItem> = Vec::new();
-        for (ci, &(cs, ce)) in batch_chunks.iter().enumerate() {
-            for col_idx in 0..num_input_cols {
-                for seg_idx in 0..num_input_segs {
-                    let seg_start = seg_row_offsets[seg_idx];
-                    let seg_end = seg_row_offsets[seg_idx + 1];
-                    if seg_end > cs && seg_start < ce {
-                        work_items.push(WorkItem {
-                            fmap: fmap_arcs[ci].clone(),
-                            chunk_start: cs,
-                            chunk_end: ce,
-                            col_idx,
-                            seg_idx,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Process all work items in parallel across all chunks.
-        let work_errors: Vec<Result<()>> = work_items
-            .par_iter()
-            .map(|item| {
-                let phys_col = input_source.column_map[item.col_idx];
-                let dtype = input_dtypes[item.col_idx];
-                let thresh = flush_threshold[item.col_idx];
-                let seg_start = seg_row_offsets[item.seg_idx];
-
-                let seg_path = format!("{}/{}", input_source.path, input_seg_files[item.seg_idx]);
-                let file = input_source.vfs.open_read(&seg_path)?;
-                let file_size = file.size()?;
-                let mut seg_reader = SegmentReader::open(
-                    Box::new(file), file_size, col_types.clone(),
-                )?;
-
-                let mut seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
-
-                let mut block_row = seg_start;
-                for blk_idx in 0..seg_reader.num_blocks(phys_col) {
-                    let blk_len = seg_reader.block_num_elem(phys_col, blk_idx);
-                    let blk_end = block_row + blk_len;
-
-                    if blk_end <= item.chunk_start {
-                        block_row = blk_end;
-                        continue;
-                    }
-                    if block_row >= item.chunk_end {
-                        break;
-                    }
-
-                    let block_data = seg_reader.read_block(phys_col, blk_idx)?;
-                    let local_begin = item.chunk_start.saturating_sub(block_row) as usize;
-                    let local_end = (item.chunk_end - block_row).min(blk_len) as usize;
-
-                    for i in local_begin..local_end {
-                        let fmap_idx = (block_row + i as u64 - item.chunk_start) as usize;
-                        let bucket = (item.fmap[fmap_idx] / rows_per_bucket)
-                            .min(num_buckets as u64 - 1) as usize;
-                        seg_bufs[bucket].push(block_data[i].clone());
-
-                        if seg_bufs[bucket].len() >= thresh {
-                            let buf = std::mem::take(&mut seg_bufs[bucket]);
-                            flush_to_segment_writer(
-                                &segment_writers, bucket, item.col_idx, &buf, dtype,
-                            )?;
-                        }
-                    }
-
-                    block_row = blk_end;
-                }
-
-                for (out_seg, buf) in seg_bufs.into_iter().enumerate() {
-                    if !buf.is_empty() {
-                        flush_to_segment_writer(
-                            &segment_writers, out_seg, item.col_idx, &buf, dtype,
-                        )?;
-                    }
-                }
-
-                Ok(())
-            })
-            .collect();
-
-        for err in work_errors {
-            err?;
-        }
-
-        // Scatter the forward_map as the last column for all chunks in batch
-        let fmap_dtype = FlexTypeEnum::Integer;
-        let fmap_thresh = flush_threshold[fmap_col_idx];
-        let mut fmap_seg_bufs: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
-        for fmap_arc in &fmap_arcs {
-            for &fmap_val in fmap_arc.iter() {
-                let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-                fmap_seg_bufs[bucket].push(FlexType::Integer(fmap_val as i64));
-
-                if fmap_seg_bufs[bucket].len() >= fmap_thresh {
-                    let buf = std::mem::take(&mut fmap_seg_bufs[bucket]);
-                    flush_to_segment_writer(
-                        &segment_writers, bucket, fmap_col_idx, &buf, fmap_dtype,
-                    )?;
-                }
-            }
-        }
-        for (seg_idx, buf) in fmap_seg_bufs.into_iter().enumerate() {
-            if !buf.is_empty() {
-                flush_to_segment_writer(
-                    &segment_writers, seg_idx, fmap_col_idx, &buf, fmap_dtype,
-                )?;
-            }
-        }
-    }
-
-    // Finish all segment writers
-    let mut all_segment_sizes = Vec::with_capacity(num_buckets);
-    for sw_mutex in segment_writers {
-        let sw = sw_mutex.into_inner().unwrap();
-        all_segment_sizes.push(sw.finish()?);
-    }
-
-    Ok(sframe_storage::scatter_writer::ScatterResult {
-        segment_files,
-        all_segment_sizes,
-    })
-}
-
-/// Lazy scatter path using plan slicing + ScatterWriter.
-fn scatter_columns_lazy(
-    vfs: &dyn VirtualFileSystem,
-    base_path: &str,
-    data_prefix: &str,
-    input: &SFrame,
-    forward_map: &SArray,
-    fmap_sf: &SFrame,
-    fmap_source: &Option<PhysicalSource>,
-    num_buckets: usize,
-    rows_per_bucket: u64,
-    num_rows: u64,
-    budget: usize,
-) -> Result<sframe_storage::scatter_writer::ScatterResult> {
-    use sframe_query::execute::materialize_sync;
-
-    let input_dtypes = input.column_types();
-    let num_input_cols = input_dtypes.len();
-    let fmap_col_idx = num_input_cols;
-
-    let mut scatter_dtypes = input_dtypes.clone();
-    scatter_dtypes.push(FlexTypeEnum::Integer);
-
-    let mut scatter_writer = ScatterWriter::new(
-        vfs, base_path, data_prefix, &scatter_dtypes, num_buckets,
-    )?;
-
-    let num_threads = rayon::current_num_threads().max(1);
-    let max_val_size = input.column_types().iter()
-        .map(|&dt| estimate_bytes_per_value(dt))
-        .max()
-        .unwrap_or(8);
-    // Budget: fmap chunk + num_threads × chunk_values × 2 (values + buckets)
-    let per_row_cost = 8 + num_threads * max_val_size * 2;
-    let fmap_chunk_size = (budget / per_row_cost.max(1)).max(1024) as u64;
-
-    let mut chunk_start = 0u64;
-    while chunk_start < num_rows {
-        let chunk_end = (chunk_start + fmap_chunk_size).min(num_rows);
-
-        let fmap_values = read_fmap_chunk(fmap_sf, fmap_source, chunk_start, chunk_end)?;
-        let chunk_len = fmap_values.len();
-
-        let input_columns = input.columns();
-        let per_col_results: Vec<Result<Vec<Vec<FlexType>>>> = (0..num_input_cols)
-            .into_par_iter()
-            .map(|col_idx| {
-                let col_sa = input_columns[col_idx].try_slice(chunk_start, chunk_end)?;
-                let col_sf = SFrame::new_with_columns(
-                    vec![col_sa], vec!["__c__".to_string()],
-                );
-                let col_batch = materialize_sync(col_sf.compile_stream()?)?;
-                let col_data = col_batch.column(0);
-                let values: Vec<FlexType> =
-                    (0..col_batch.num_rows()).map(|r| col_data.get(r)).collect();
-                classify_into_buckets(&values, &fmap_values, num_buckets, rows_per_bucket)
-            })
-            .collect();
-
-        for (col_idx, result) in per_col_results.into_iter().enumerate() {
-            let seg_bufs = result?;
-            for (seg_idx, values) in seg_bufs.into_iter().enumerate() {
-                for value in values {
-                    scatter_writer.write_to_segment(col_idx, seg_idx, value)?;
-                }
-            }
-        }
-
-        for r in 0..chunk_len {
-            let fmap_val = fmap_values[r];
-            let bucket = (fmap_val / rows_per_bucket).min(num_buckets as u64 - 1) as usize;
-            scatter_writer.write_to_segment(
-                fmap_col_idx, bucket, FlexType::Integer(fmap_val as i64),
-            )?;
-        }
-
-        chunk_start = chunk_end;
-    }
-
-    scatter_writer.finish()
-}
-
 /// Read a chunk of the forward_map, either via direct reader or plan slicing.
-fn read_fmap_chunk(
+pub(super) fn read_fmap_chunk(
     fmap_sf: &SFrame,
     fmap_source: &Option<PhysicalSource>,
     begin: u64,
@@ -584,7 +219,7 @@ fn read_fmap_chunk(
 }
 
 /// Classify values into per-segment buckets based on forward_map values.
-fn classify_into_buckets(
+pub(super) fn classify_into_buckets(
     values: &[FlexType],
     fmap_values: &[u64],
     num_buckets: usize,
@@ -600,474 +235,8 @@ fn classify_into_buckets(
 }
 
 // ---------------------------------------------------------------------------
-// Permute phase
-// ---------------------------------------------------------------------------
-
-/// Permute all buckets in parallel and assemble the output SFrame.
-///
-/// For each bucket (scatter segment), reads the forward map column to build
-/// the local permutation, then reads value columns in groups that fit in
-/// the memory budget, permutes them, and writes to output segments.
-fn permute_buckets(
-    scatter_vfs: &Arc<dyn VirtualFileSystem>,
-    scatter_base_path: &str,
-    scatter_result: &sframe_storage::scatter_writer::ScatterResult,
-    output_vfs: &Arc<dyn VirtualFileSystem>,
-    output_base_path: &str,
-    column_names: &[String],
-    column_types: &[FlexTypeEnum],
-    _num_rows: u64,
-    rows_per_bucket: u64,
-    column_bytes: &[usize],
-    budget_per_thread: usize,
-) -> Result<SFrame> {
-    let num_buckets = scatter_result.segment_files.len();
-    let num_input_cols = column_types.len();
-    // The scatter segments have num_input_cols + 1 columns (last is forward_map)
-    let mut scatter_col_types = column_types.to_vec();
-    scatter_col_types.push(FlexTypeEnum::Integer);
-
-    let data_prefix = format!("m_{}", generate_hash(output_base_path));
-
-    // Process each bucket in parallel
-    let results: Vec<Option<Result<(String, Vec<u64>, u64)>>> = (0..num_buckets)
-        .into_par_iter()
-        .map(|bucket_idx| {
-            // Check if this bucket has any rows
-            let bucket_rows = scatter_result.all_segment_sizes[bucket_idx]
-                .first()
-                .copied()
-                .unwrap_or(0);
-            if bucket_rows == 0 {
-                return None;
-            }
-
-            Some((|| -> Result<(String, Vec<u64>, u64)> {
-                permute_one_bucket(
-                    scatter_vfs,
-                    scatter_base_path,
-                    &scatter_result.segment_files[bucket_idx],
-                    &scatter_col_types,
-                    output_vfs,
-                    output_base_path,
-                    &data_prefix,
-                    bucket_idx,
-                    num_input_cols,
-                    column_types,
-                    rows_per_bucket,
-                    bucket_rows,
-                    column_bytes,
-                    budget_per_thread,
-                )
-            })())
-        })
-        .collect();
-
-    // Collect results, skipping empty buckets
-    let mut segment_files = Vec::new();
-    let mut all_segment_sizes = Vec::new();
-    let mut total_rows = 0u64;
-
-    for result in results.into_iter().flatten() {
-        let (seg_file, sizes, rows) = result?;
-        if rows > 0 {
-            segment_files.push(seg_file);
-            all_segment_sizes.push(sizes);
-            total_rows += rows;
-        }
-    }
-
-    if total_rows == 0 {
-        // Return empty SFrame
-        let empty_columns: Vec<SArray> = column_types
-            .iter()
-            .enumerate()
-            .map(|(_, &dt)| {
-                SArray::from_vec(Vec::new(), dt).unwrap()
-            })
-            .collect();
-        return Ok(SFrame::new_with_columns(
-            empty_columns,
-            column_names.to_vec(),
-        ));
-    }
-
-    // Assemble SFrame metadata from segments
-    let col_name_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
-    assemble_sframe_from_segments(
-        &**output_vfs,
-        output_base_path,
-        &col_name_refs,
-        column_types,
-        &segment_files,
-        &all_segment_sizes,
-        total_rows,
-        &HashMap::new(),
-    )?;
-
-    // Construct SFrame backed by the output cache directory
-    let cache_fs = global_cache_fs();
-    let store: Arc<dyn Send + Sync> = Arc::new(AnonymousStore {
-        path: output_base_path.to_string(),
-        cache_fs: cache_fs.clone(),
-    });
-    let plan = PlannerNode::sframe_source_cached(
-        output_base_path,
-        column_names.to_vec(),
-        column_types.to_vec(),
-        total_rows,
-        store,
-    );
-
-    let columns: Vec<SArray> = column_types
-        .iter()
-        .enumerate()
-        .map(|(i, &dtype)| SArray::from_plan(plan.clone(), dtype, Some(total_rows), i))
-        .collect();
-
-    Ok(SFrame::new_with_columns(columns, column_names.to_vec()))
-}
-
-/// Permute a single bucket: read scatter segment, apply permutation, write output segment.
-fn permute_one_bucket(
-    scatter_vfs: &Arc<dyn VirtualFileSystem>,
-    scatter_base_path: &str,
-    scatter_seg_file: &str,
-    scatter_col_types: &[FlexTypeEnum],
-    output_vfs: &Arc<dyn VirtualFileSystem>,
-    output_base_path: &str,
-    output_data_prefix: &str,
-    bucket_idx: usize,
-    num_input_cols: usize,
-    output_col_types: &[FlexTypeEnum],
-    rows_per_bucket: u64,
-    _bucket_rows: u64,
-    column_bytes: &[usize],
-    budget_per_thread: usize,
-) -> Result<(String, Vec<u64>, u64)> {
-    let seg_path = format!("{scatter_base_path}/{scatter_seg_file}");
-    let bucket_start = bucket_idx as u64 * rows_per_bucket;
-
-    // Open scatter segment and read the forward map column (last column)
-    let file = scatter_vfs.open_read(&seg_path)?;
-    let file_size = file.size()?;
-    let mut seg_reader =
-        SegmentReader::open(Box::new(file), file_size, scatter_col_types.to_vec())?;
-
-    let fmap_values = seg_reader.read_column(num_input_cols)?;
-    let num_rows_in_bucket = fmap_values.len();
-
-    if num_rows_in_bucket == 0 {
-        let seg_file = segment_filename(output_data_prefix, bucket_idx);
-        let seg_out_path = format!("{output_base_path}/{seg_file}");
-        let out_file = output_vfs.open_write(&seg_out_path)?;
-        let seg_writer = BufferedSegmentWriter::new(out_file, output_col_types);
-        let sizes = seg_writer.finish()?;
-        return Ok((seg_file, sizes, 0));
-    }
-
-    // Build permutation: permutation[i] = local_target for scatter row i
-    // fmap_values[i] is the global target row index.
-    // local_target = fmap_values[i] - bucket_start
-    let mut permutation = vec![0usize; num_rows_in_bucket];
-    for (i, fmap_val) in fmap_values.iter().enumerate() {
-        let global_target = match fmap_val {
-            FlexType::Integer(v) => *v as u64,
-            _ => {
-                return Err(SFrameError::Type(
-                    "forward_map must contain Integer values".into(),
-                ))
-            }
-        };
-        let local_target = (global_target - bucket_start) as usize;
-        permutation[i] = local_target;
-    }
-
-    // Create output segment writer
-    let seg_file = segment_filename(output_data_prefix, bucket_idx);
-    let seg_out_path = format!("{output_base_path}/{seg_file}");
-    let out_file = output_vfs.open_write(&seg_out_path)?;
-    let mut seg_writer = BufferedSegmentWriter::new(out_file, output_col_types);
-
-    // Process columns in groups that fit in memory budget
-    let mut col_start = 0;
-    while col_start < num_input_cols {
-        // Determine how many columns fit in budget
-        let mut col_end = col_start + 1; // At least one column per group
-        let mut memory_estimate =
-            column_bytes[col_start] * num_rows_in_bucket;
-
-        while col_end < num_input_cols {
-            let next_mem = column_bytes[col_end] * num_rows_in_bucket;
-            if memory_estimate + next_mem > budget_per_thread {
-                break;
-            }
-            memory_estimate += next_mem;
-            col_end += 1;
-        }
-
-        // Re-open the scatter segment for reading value columns
-        let file = scatter_vfs.open_read(&seg_path)?;
-        let file_size = file.size()?;
-        let mut col_reader =
-            SegmentReader::open(Box::new(file), file_size, scatter_col_types.to_vec())?;
-
-        // Read and permute each column in this group
-        for col_idx in col_start..col_end {
-            let values = col_reader.read_column(col_idx)?;
-
-            // Apply permutation
-            let mut permuted = vec![FlexType::Undefined; num_rows_in_bucket];
-            for (src_idx, &dst_idx) in permutation.iter().enumerate() {
-                permuted[dst_idx] = values[src_idx].clone();
-            }
-
-            // Write in chunks
-            for chunk in permuted.chunks(CHUNK_SIZE) {
-                seg_writer.write_column_block(col_idx, chunk, output_col_types[col_idx])?;
-            }
-        }
-
-        col_start = col_end;
-    }
-
-    let sizes = seg_writer.finish()?;
-    Ok((seg_file, sizes, num_rows_in_bucket as u64))
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// Invert a permutation SArray.
-///
-/// Given `inverse_map` where `inverse_map[output_pos] = input_row`,
-/// produces `forward_map` where `forward_map[input_row] = output_pos`.
-///
-/// Equivalent to `permute_sframe([0..N), inverse_map)` but without
-/// needing to read any input data — values are synthesized from the
-/// row index during scatter.
-fn invert_permutation(inverse_map: &SArray, num_rows: u64) -> Result<SArray> {
-    if num_rows == 0 {
-        return SArray::from_vec(Vec::new(), FlexTypeEnum::Integer);
-    }
-
-    let budget = sframe_config::global().sort_max_memory / rayon::current_num_threads().max(1);
-    let column_bytes = &[8usize]; // single integer column
-    let num_buckets = compute_num_buckets(num_rows, column_bytes, budget);
-    let rows_per_bucket = ((num_rows + num_buckets as u64 - 1) / num_buckets as u64).max(1);
-
-    eprintln!(
-        "[sframe] ec_sort invert_permutation: {num_rows} rows, {num_buckets} buckets"
-    );
-
-    let cache_fs = global_cache_fs();
-
-    // The inverse_map is physical (from standard_sort output on CacheFs).
-    // Build a single-column SFrame for plan extraction.
-    let imap_sf = SFrame::new_with_columns(
-        vec![inverse_map.clone()],
-        vec!["__imap__".to_string()],
-    );
-    let imap_source = extract_physical_source(&imap_sf);
-
-    // Scatter phase: for each row i, scatter value=i to bucket inverse_map[i]/rows_per_bucket.
-    // Output has 2 columns: [value (the row index), forward_map (inverse_map value)].
-    let scatter_dtypes = vec![FlexTypeEnum::Integer, FlexTypeEnum::Integer];
-
-    let scatter_path = cache_fs.alloc_dir();
-    let scatter_vfs: Arc<dyn VirtualFileSystem> = Arc::new(ArcCacheFsVfs(cache_fs.clone()));
-    scatter_vfs.mkdir_p(&scatter_path)?;
-    let scatter_prefix = format!("s_{}", generate_hash(&scatter_path));
-
-    let mut segment_files = Vec::with_capacity(num_buckets);
-    let segment_writers: Vec<Mutex<SegmentWriter<Box<dyn sframe_io::vfs::WritableFile>>>> =
-        (0..num_buckets)
-            .map(|seg_idx| {
-                let seg_file = segment_filename(&scatter_prefix, seg_idx);
-                let seg_path = format!("{scatter_path}/{seg_file}");
-                let file = scatter_vfs.open_write(&seg_path)?;
-                segment_files.push(seg_file);
-                Ok(Mutex::new(SegmentWriter::new(file, scatter_dtypes.len())))
-            })
-            .collect::<Result<_>>()?;
-
-    let flush_thresh = (64 * 1024 / 8usize).clamp(8, 256 * 1024); // ~8K rows for integers
-
-    // Read inverse_map in chunks, scatter in parallel across chunks.
-    let num_threads = rayon::current_num_threads().max(1);
-    let concurrent_chunks = num_threads.max(1);
-    let fmap_chunk_size = (budget / 2 / 8 / concurrent_chunks).max(1024) as u64;
-
-    let mut batch_start = 0u64;
-    while batch_start < num_rows {
-        let mut batch_chunks: Vec<(u64, u64)> = Vec::new();
-        let mut row = batch_start;
-        for _ in 0..concurrent_chunks {
-            if row >= num_rows { break; }
-            let end = (row + fmap_chunk_size).min(num_rows);
-            batch_chunks.push((row, end));
-            row = end;
-        }
-        batch_start = row;
-
-        // Read all inverse_map chunks for this batch
-        let imap_arcs: Vec<Arc<Vec<u64>>> = batch_chunks
-            .iter()
-            .map(|&(cs, ce)| {
-                let vals = read_fmap_chunk(&imap_sf, &imap_source, cs, ce)?;
-                Ok(Arc::new(vals))
-            })
-            .collect::<Result<_>>()?;
-
-        // Process all chunks in parallel — each work item handles one chunk.
-        // With a single column there's no column dimension, but we still
-        // get parallelism across chunks.
-        let errors: Vec<Result<()>> = batch_chunks
-            .par_iter()
-            .enumerate()
-            .map(|(ci, &(cs, _ce))| {
-                let imap = &imap_arcs[ci];
-                let mut seg_bufs_val: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
-                let mut seg_bufs_fmap: Vec<Vec<FlexType>> = vec![Vec::new(); num_buckets];
-
-                for (r, &imap_val) in imap.iter().enumerate() {
-                    let global_row = cs + r as u64;
-                    let bucket = (imap_val / rows_per_bucket)
-                        .min(num_buckets as u64 - 1) as usize;
-
-                    // Value column: the row index (synthesized, not read)
-                    seg_bufs_val[bucket].push(FlexType::Integer(global_row as i64));
-                    // Forward_map column: the inverse_map value
-                    seg_bufs_fmap[bucket].push(FlexType::Integer(imap_val as i64));
-
-                    if seg_bufs_val[bucket].len() >= flush_thresh {
-                        let buf_v = std::mem::take(&mut seg_bufs_val[bucket]);
-                        let buf_f = std::mem::take(&mut seg_bufs_fmap[bucket]);
-                        flush_to_segment_writer(
-                            &segment_writers, bucket, 0, &buf_v, FlexTypeEnum::Integer,
-                        )?;
-                        flush_to_segment_writer(
-                            &segment_writers, bucket, 1, &buf_f, FlexTypeEnum::Integer,
-                        )?;
-                    }
-                }
-
-                // Flush remaining
-                for seg in 0..num_buckets {
-                    let buf_v = std::mem::take(&mut seg_bufs_val[seg]);
-                    let buf_f = std::mem::take(&mut seg_bufs_fmap[seg]);
-                    if !buf_v.is_empty() {
-                        flush_to_segment_writer(
-                            &segment_writers, seg, 0, &buf_v, FlexTypeEnum::Integer,
-                        )?;
-                        flush_to_segment_writer(
-                            &segment_writers, seg, 1, &buf_f, FlexTypeEnum::Integer,
-                        )?;
-                    }
-                }
-
-                Ok(())
-            })
-            .collect();
-
-        for err in errors { err?; }
-    }
-
-    // Finish scatter segment writers
-    let mut scatter_seg_sizes = Vec::with_capacity(num_buckets);
-    for sw_mutex in segment_writers {
-        scatter_seg_sizes.push(sw_mutex.into_inner().unwrap().finish()?);
-    }
-
-    // Permute phase: for each bucket, read value + fmap columns,
-    // permute value by fmap, write to output.
-    let output_path = cache_fs.alloc_dir();
-    let output_vfs: Arc<dyn VirtualFileSystem> = Arc::new(ArcCacheFsVfs(cache_fs.clone()));
-    output_vfs.mkdir_p(&output_path)?;
-    let output_prefix = format!("m_{}", generate_hash(&output_path));
-    let output_dtypes = vec![FlexTypeEnum::Integer];
-
-    let permute_results: Vec<Option<Result<(String, Vec<u64>, u64)>>> = (0..num_buckets)
-        .into_par_iter()
-        .map(|bucket_idx| {
-            let bucket_rows = scatter_seg_sizes[bucket_idx].first().copied().unwrap_or(0);
-            if bucket_rows == 0 { return None; }
-
-            Some((|| -> Result<(String, Vec<u64>, u64)> {
-                let seg_path = format!("{scatter_path}/{}", segment_files[bucket_idx]);
-                let file = scatter_vfs.open_read(&seg_path)?;
-                let file_size = file.size()?;
-                let mut reader = SegmentReader::open(
-                    Box::new(file), file_size, scatter_dtypes.clone(),
-                )?;
-
-                let values = reader.read_column(0)?;    // the row indices
-                let fmap_col = reader.read_column(1)?;  // the inverse_map values
-                let n = values.len();
-
-                let bucket_start = bucket_idx as u64 * rows_per_bucket;
-                let mut permuted = vec![FlexType::Integer(0); n];
-                for i in 0..n {
-                    let target = match &fmap_col[i] {
-                        FlexType::Integer(v) => (*v as u64 - bucket_start) as usize,
-                        _ => 0,
-                    };
-                    permuted[target] = values[i].clone();
-                }
-
-                let out_file_name = segment_filename(&output_prefix, bucket_idx);
-                let out_path = format!("{output_path}/{out_file_name}");
-                let out_file = output_vfs.open_write(&out_path)?;
-                let mut out_writer = BufferedSegmentWriter::new(out_file, &output_dtypes);
-
-                for chunk in permuted.chunks(CHUNK_SIZE) {
-                    out_writer.write_column_block(0, chunk, FlexTypeEnum::Integer)?;
-                }
-
-                let sizes = out_writer.finish()?;
-                Ok((out_file_name, sizes, n as u64))
-            })())
-        })
-        .collect();
-
-    // Clean up scatter scratch
-    cache_fs.remove_dir(&scatter_path).ok();
-
-    // Assemble output
-    let mut out_seg_files = Vec::new();
-    let mut out_seg_sizes = Vec::new();
-    let mut total_rows_out = 0u64;
-    for r in permute_results.into_iter().flatten() {
-        let (f, s, n) = r?;
-        if n > 0 {
-            out_seg_files.push(f);
-            out_seg_sizes.push(s);
-            total_rows_out += n;
-        }
-    }
-
-    assemble_sframe_from_segments(
-        &*output_vfs, &output_path,
-        &["__fwd__"], &[FlexTypeEnum::Integer],
-        &out_seg_files, &out_seg_sizes,
-        total_rows_out, &HashMap::new(),
-    )?;
-
-    let store: Arc<dyn Send + Sync> = Arc::new(AnonymousStore {
-        path: output_path.clone(),
-        cache_fs: cache_fs.clone(),
-    });
-    let plan = PlannerNode::sframe_source_cached(
-        &output_path,
-        vec!["__fwd__".to_string()],
-        vec![FlexTypeEnum::Integer],
-        total_rows_out,
-        store,
-    );
-
-    Ok(SArray::from_plan(plan, FlexTypeEnum::Integer, Some(total_rows_out), 0))
-}
 
 /// Permute an SFrame according to a forward map.
 ///
@@ -1106,7 +275,7 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
 
     // Phase 1: Scatter (column-parallel via plan slicing)
     eprintln!("[sframe] ec_sort phase 1/2: scattering...");
-    let scatter_result = scatter_columns(
+    let scatter_result = scatter::scatter_columns(
         &*scatter_vfs,
         &scatter_path,
         &scatter_prefix,
@@ -1125,7 +294,7 @@ pub(crate) fn permute_sframe(input: &SFrame, forward_map: &SArray) -> Result<SFr
 
     // Phase 2: Permute
     eprintln!("[sframe] ec_sort phase 2/2: permuting...");
-    let result = permute_buckets(
+    let result = permute::permute_buckets(
         &scatter_vfs,
         &scatter_path,
         &scatter_result,
@@ -1247,7 +416,7 @@ pub(crate) fn ec_sort(
     // values from row indices — no Range SFrame needed, fully parallel.
 
     eprintln!("[sframe] ec_sort: inverting permutation to get forward map...");
-    let forward_map = invert_permutation(&inverse_map, num_rows)?;
+    let forward_map = invert::invert_permutation(&inverse_map, num_rows)?;
 
     // -----------------------------------------------------------------------
     // Step 3: Permute value columns using the forward_map
