@@ -1,5 +1,6 @@
 mod ec_sort;
 mod external_sort;
+mod join;
 pub mod sarray;
 pub mod sframe;
 
