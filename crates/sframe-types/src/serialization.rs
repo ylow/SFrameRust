@@ -8,10 +8,10 @@
 //! - FlexType: 1-byte tag (128 + type_enum) + value data
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use crate::error::{Result, SFrameError};
 use crate::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
+use crate::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 // --- Primitive readers ---
 
@@ -223,10 +223,10 @@ pub fn read_flex_type(reader: &mut (impl Read + ?Sized)) -> Result<FlexType> {
     match type_enum {
         FlexTypeEnum::Integer => Ok(FlexType::Integer(read_i64(reader)?)),
         FlexTypeEnum::Float => Ok(FlexType::Float(read_f64(reader)?)),
-        FlexTypeEnum::String => Ok(FlexType::String(Arc::from(read_string(reader)?))),
+        FlexTypeEnum::String => Ok(FlexType::String(FlexString::from(read_string(reader)?))),
         FlexTypeEnum::Vector => {
             let v = read_vec_f64(reader)?;
-            Ok(FlexType::Vector(Arc::from(v)))
+            Ok(FlexType::Vector(FlexVec::from(v)))
         }
         FlexTypeEnum::List => {
             let len = read_u64(reader)? as usize;
@@ -234,7 +234,7 @@ pub fn read_flex_type(reader: &mut (impl Read + ?Sized)) -> Result<FlexType> {
             for _ in 0..len {
                 items.push(read_flex_type(reader)?);
             }
-            Ok(FlexType::List(Arc::from(items)))
+            Ok(FlexType::List(FlexList::from(items)))
         }
         FlexTypeEnum::Dict => {
             let len = read_u64(reader)? as usize;
@@ -244,11 +244,11 @@ pub fn read_flex_type(reader: &mut (impl Read + ?Sized)) -> Result<FlexType> {
                 let value = read_flex_type(reader)?;
                 pairs.push((key, value));
             }
-            Ok(FlexType::Dict(Arc::from(pairs)))
+            Ok(FlexType::Dict(FlexDict::from(pairs)))
         }
         FlexTypeEnum::DateTime => {
             let dt = read_flex_datetime(reader)?;
-            Ok(FlexType::DateTime(dt))
+            Ok(FlexType::DateTime(Box::new(dt)))
         }
         FlexTypeEnum::Undefined => Ok(FlexType::Undefined),
     }
@@ -381,7 +381,7 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         assert_eq!(
             read_flex_type(&mut cursor).unwrap(),
-            FlexType::String(Arc::from("hello"))
+            FlexType::String(FlexString::from("hello"))
         );
     }
 
@@ -421,7 +421,7 @@ mod tests {
             FlexType::List(l) => {
                 assert_eq!(l.len(), 2);
                 assert_eq!(l[0], FlexType::Integer(1));
-                assert_eq!(l[1], FlexType::String(Arc::from("hi")));
+                assert_eq!(l[1], FlexType::String(FlexString::from("hi")));
             }
             other => panic!("Expected List, got {other:?}"),
         }
@@ -442,7 +442,7 @@ mod tests {
         match read_flex_type(&mut cursor).unwrap() {
             FlexType::Dict(d) => {
                 assert_eq!(d.len(), 1);
-                assert_eq!(d[0].0, FlexType::String(Arc::from("key")));
+                assert_eq!(d[0].0, FlexType::String(FlexString::from("key")));
                 assert_eq!(d[0].1, FlexType::Integer(99));
             }
             other => panic!("Expected Dict, got {other:?}"),

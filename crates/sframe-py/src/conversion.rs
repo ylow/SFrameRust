@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 /// Convert a FlexType to a Python object.
 pub fn flextype_to_py(py: Python<'_>, val: &FlexType) -> Py<PyAny> {
@@ -61,7 +60,7 @@ pub fn py_to_flextype(obj: &Bound<'_, PyAny>) -> PyResult<FlexType> {
     // String
     if let Ok(s) = obj.cast::<PyString>() {
         let val: String = s.extract()?;
-        return Ok(FlexType::String(Arc::from(val.as_str())));
+        return Ok(FlexType::String(FlexString::from(val.as_str())));
     }
     // Dict
     if let Ok(d) = obj.cast::<PyDict>() {
@@ -69,7 +68,7 @@ pub fn py_to_flextype(obj: &Bound<'_, PyAny>) -> PyResult<FlexType> {
         for (k, v) in d.iter() {
             pairs.push((py_to_flextype(&k)?, py_to_flextype(&v)?));
         }
-        return Ok(FlexType::Dict(Arc::from(pairs)));
+        return Ok(FlexType::Dict(FlexDict::from(pairs)));
     }
     // List
     if let Ok(l) = obj.cast::<PyList>() {
@@ -84,18 +83,18 @@ pub fn py_to_flextype(obj: &Bound<'_, PyAny>) -> PyResult<FlexType> {
                 .iter()
                 .map(|item| item.extract::<f64>())
                 .collect::<PyResult<_>>()?;
-            return Ok(FlexType::Vector(Arc::from(floats)));
+            return Ok(FlexType::Vector(FlexVec::from(floats)));
         }
         // Mixed list
         let flex_items: Vec<FlexType> = items
             .iter()
             .map(|item| py_to_flextype(item))
             .collect::<PyResult<_>>()?;
-        return Ok(FlexType::List(Arc::from(flex_items)));
+        return Ok(FlexType::List(FlexList::from(flex_items)));
     }
     // Fallback: try to convert to string
     let s: String = obj.str()?.extract()?;
-    Ok(FlexType::String(Arc::from(s.as_str())))
+    Ok(FlexType::String(FlexString::from(s.as_str())))
 }
 
 /// Convert a Python string to a FlexTypeEnum.

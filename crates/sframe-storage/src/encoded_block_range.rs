@@ -8,13 +8,13 @@
 use std::future::Future;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::pin::Pin;
-use std::sync::Arc;
 
 use genawaiter::sync::{Co, Gen};
 use genawaiter::GeneratorState;
 
 use sframe_types::bitset::DenseBitset;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexString, FlexVec};
 use sframe_types::serialization::read_flex_type;
 use sframe_types::varint::decode_varint;
 
@@ -415,7 +415,7 @@ async fn stream_strings(
             Err(_) => return,
         };
 
-        let mut dict: Vec<Arc<str>> = Vec::with_capacity(dict_len);
+        let mut dict: Vec<FlexString> = Vec::with_capacity(dict_len);
         for _ in 0..dict_len {
             let str_len = match decode_varint(&mut cursor) {
                 Ok(v) => v as usize,
@@ -426,7 +426,7 @@ async fn stream_strings(
                 break;
             }
             let s = String::from_utf8_lossy(&buf);
-            dict.push(Arc::from(s.as_ref()));
+            dict.push(FlexString::from(s.as_ref()));
         }
 
         let pos = cursor.position() as usize;
@@ -438,7 +438,7 @@ async fn stream_strings(
             if idx < dict_ref.len() {
                 FlexType::String(dict_ref[idx].clone())
             } else {
-                FlexType::String(Arc::from(""))
+                FlexType::String(FlexString::from(""))
             }
         }, first_cmd)
         .await;
@@ -468,7 +468,7 @@ async fn stream_strings(
                             break;
                         }
                         let s = String::from_utf8_lossy(&buf);
-                        values.push(FlexType::String(Arc::from(s.as_ref())));
+                        values.push(FlexType::String(FlexString::from(s.as_ref())));
                     }
                     pos += values.len();
                     cmd = co.yield_(DecoderResponse::Values(values)).await;
@@ -545,7 +545,7 @@ async fn stream_vectors(
     for &len in &lengths {
         let len = len as usize;
         let end = (offset + len).min(flat_values.len());
-        buffer.push(FlexType::Vector(Arc::from(&flat_values[offset..end])));
+        buffer.push(FlexType::Vector(FlexVec::from(&flat_values[offset..end])));
         offset = end;
     }
 

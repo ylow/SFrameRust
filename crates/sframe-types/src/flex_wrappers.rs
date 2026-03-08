@@ -272,7 +272,6 @@ impl fmt::Debug for FlexDict {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     // --- Size assertions ---
 
@@ -438,10 +437,10 @@ mod tests {
     #[test]
     fn test_flexdict_from_vec() {
         let d = FlexDict::from(vec![
-            (FlexType::String(Arc::from("key")), FlexType::Integer(1)),
+            (FlexType::String(FlexString::from("key")), FlexType::Integer(1)),
         ]);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].0, FlexType::String(Arc::from("key")));
+        assert_eq!(d[0].0, FlexType::String(FlexString::from("key")));
         assert_eq!(d[0].1, FlexType::Integer(1));
     }
 
@@ -454,10 +453,10 @@ mod tests {
     #[test]
     fn test_flexdict_eq() {
         let a = FlexDict::from(vec![
-            (FlexType::String(Arc::from("k")), FlexType::Integer(1)),
+            (FlexType::String(FlexString::from("k")), FlexType::Integer(1)),
         ]);
         let b = FlexDict::from(vec![
-            (FlexType::String(Arc::from("k")), FlexType::Integer(1)),
+            (FlexType::String(FlexString::from("k")), FlexType::Integer(1)),
         ]);
         assert_eq!(a, b);
     }

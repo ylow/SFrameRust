@@ -1,6 +1,5 @@
-use std::sync::Arc;
-
 use crate::error::{Result, SFrameError};
+use crate::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 /// Type tag enum matching C++ flex_type_enum values for format compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,16 +75,17 @@ impl std::hash::Hash for FlexDateTime {
 }
 
 /// The core value type, mirroring C++ flexible_type.
-/// Uses Arc for shared ownership of heap-allocated data.
+/// Uses thin-pointer wrappers for shared ownership of heap-allocated data.
+/// Each variant is at most 16 bytes (8-byte tag + 8-byte payload).
 #[derive(Debug, Clone)]
 pub enum FlexType {
     Integer(i64),
     Float(f64),
-    String(Arc<str>),
-    Vector(Arc<[f64]>),
-    List(Arc<[FlexType]>),
-    Dict(Arc<[(FlexType, FlexType)]>),
-    DateTime(FlexDateTime),
+    String(FlexString),
+    Vector(FlexVec),
+    List(FlexList),
+    Dict(FlexDict),
+    DateTime(Box<FlexDateTime>),
     Undefined,
 }
 
@@ -216,12 +216,12 @@ impl std::ops::Add for FlexType {
             (FlexType::String(a), FlexType::String(b)) => {
                 let mut s = a.to_string();
                 s.push_str(&b);
-                FlexType::String(Arc::from(s.as_str()))
+                FlexType::String(FlexString::from(s))
             }
             (FlexType::Vector(a), FlexType::Vector(b)) => {
                 if a.len() == b.len() {
                     let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
-                    FlexType::Vector(Arc::from(v))
+                    FlexType::Vector(FlexVec::from(v))
                 } else {
                     FlexType::Undefined
                 }
@@ -244,7 +244,7 @@ impl std::ops::Sub for FlexType {
             (FlexType::Vector(a), FlexType::Vector(b)) => {
                 if a.len() == b.len() {
                     let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x - y).collect();
-                    FlexType::Vector(Arc::from(v))
+                    FlexType::Vector(FlexVec::from(v))
                 } else {
                     FlexType::Undefined
                 }
@@ -267,7 +267,7 @@ impl std::ops::Mul for FlexType {
             (FlexType::Vector(a), FlexType::Vector(b)) => {
                 if a.len() == b.len() {
                     let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
-                    FlexType::Vector(Arc::from(v))
+                    FlexType::Vector(FlexVec::from(v))
                 } else {
                     FlexType::Undefined
                 }
@@ -275,12 +275,12 @@ impl std::ops::Mul for FlexType {
             // vector * scalar
             (FlexType::Vector(a), FlexType::Float(s)) | (FlexType::Float(s), FlexType::Vector(a)) => {
                 let v: Vec<f64> = a.iter().map(|x| x * s).collect();
-                FlexType::Vector(Arc::from(v))
+                FlexType::Vector(FlexVec::from(v))
             }
             (FlexType::Vector(a), FlexType::Integer(s)) | (FlexType::Integer(s), FlexType::Vector(a)) => {
                 let sf = s as f64;
                 let v: Vec<f64> = a.iter().map(|x| x * sf).collect();
-                FlexType::Vector(Arc::from(v))
+                FlexType::Vector(FlexVec::from(v))
             }
             (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
             _ => FlexType::Undefined,
@@ -307,7 +307,7 @@ impl std::ops::Div for FlexType {
             (FlexType::Vector(a), FlexType::Vector(b)) => {
                 if a.len() == b.len() {
                     let v: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x / y).collect();
-                    FlexType::Vector(Arc::from(v))
+                    FlexType::Vector(FlexVec::from(v))
                 } else {
                     FlexType::Undefined
                 }
@@ -315,12 +315,12 @@ impl std::ops::Div for FlexType {
             // vector / scalar
             (FlexType::Vector(a), FlexType::Float(s)) => {
                 let v: Vec<f64> = a.iter().map(|x| x / s).collect();
-                FlexType::Vector(Arc::from(v))
+                FlexType::Vector(FlexVec::from(v))
             }
             (FlexType::Vector(a), FlexType::Integer(s)) => {
                 let sf = s as f64;
                 let v: Vec<f64> = a.iter().map(|x| x / sf).collect();
-                FlexType::Vector(Arc::from(v))
+                FlexType::Vector(FlexVec::from(v))
             }
             (FlexType::Undefined, _) | (_, FlexType::Undefined) => FlexType::Undefined,
             _ => FlexType::Undefined,
@@ -355,7 +355,7 @@ impl std::ops::Neg for FlexType {
             FlexType::Float(a) => FlexType::Float(-a),
             FlexType::Vector(a) => {
                 let v: Vec<f64> = a.iter().map(|x| -x).collect();
-                FlexType::Vector(Arc::from(v))
+                FlexType::Vector(FlexVec::from(v))
             }
             FlexType::Undefined => FlexType::Undefined,
             _ => FlexType::Undefined,
@@ -455,7 +455,7 @@ mod tests {
     fn test_flex_type_type_tag() {
         assert_eq!(FlexType::Integer(42).type_enum(), FlexTypeEnum::Integer);
         assert_eq!(FlexType::Float(3.14).type_enum(), FlexTypeEnum::Float);
-        assert_eq!(FlexType::String(Arc::from("hello")).type_enum(), FlexTypeEnum::String);
+        assert_eq!(FlexType::String(FlexString::from("hello")).type_enum(), FlexTypeEnum::String);
         assert_eq!(FlexType::Undefined.type_enum(), FlexTypeEnum::Undefined);
     }
 
@@ -463,7 +463,7 @@ mod tests {
     fn test_flex_type_display() {
         assert_eq!(format!("{}", FlexType::Integer(42)), "42");
         assert_eq!(format!("{}", FlexType::Float(3.14)), "3.14");
-        assert_eq!(format!("{}", FlexType::String(Arc::from("hello"))), "hello");
+        assert_eq!(format!("{}", FlexType::String(FlexString::from("hello"))), "hello");
         assert_eq!(format!("{}", FlexType::Undefined), "None");
     }
 
@@ -496,15 +496,15 @@ mod tests {
     #[test]
     fn test_add_strings() {
         assert_eq!(
-            FlexType::String(Arc::from("hello")) + FlexType::String(Arc::from(" world")),
-            FlexType::String(Arc::from("hello world"))
+            FlexType::String(FlexString::from("hello")) + FlexType::String(FlexString::from(" world")),
+            FlexType::String(FlexString::from("hello world"))
         );
     }
 
     #[test]
     fn test_add_vectors() {
-        let a = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
-        let b = FlexType::Vector(Arc::from(vec![4.0, 5.0, 6.0]));
+        let a = FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0]));
+        let b = FlexType::Vector(FlexVec::from(vec![4.0, 5.0, 6.0]));
         match a + b {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[5.0, 7.0, 9.0]),
             other => panic!("Expected Vector, got {other:?}"),
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_mul_vector_scalar() {
-        let v = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
+        let v = FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0]));
         match v * FlexType::Float(2.0) {
             FlexType::Vector(r) => assert_eq!(r.as_ref(), &[2.0, 4.0, 6.0]),
             other => panic!("Expected Vector, got {other:?}"),
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_neg_vector() {
-        match -FlexType::Vector(Arc::from(vec![1.0, -2.0, 3.0])) {
+        match -FlexType::Vector(FlexVec::from(vec![1.0, -2.0, 3.0])) {
             FlexType::Vector(v) => assert_eq!(v.as_ref(), &[-1.0, 2.0, -3.0]),
             other => panic!("Expected Vector, got {other:?}"),
         }
@@ -611,21 +611,21 @@ mod tests {
 
     #[test]
     fn test_ordering_strings() {
-        assert!(FlexType::String(Arc::from("apple")) < FlexType::String(Arc::from("banana")));
+        assert!(FlexType::String(FlexString::from("apple")) < FlexType::String(FlexString::from("banana")));
     }
 
     #[test]
     fn test_ordering_undefined_last() {
         assert!(FlexType::Integer(1) < FlexType::Undefined);
-        assert!(FlexType::String(Arc::from("z")) < FlexType::Undefined);
+        assert!(FlexType::String(FlexString::from("z")) < FlexType::Undefined);
         assert!(FlexType::Undefined == FlexType::Undefined);
     }
 
     #[test]
     fn test_ordering_different_types() {
         // Integer < Float < String < Vector
-        assert!(FlexType::Integer(999) < FlexType::String(Arc::from("a")));
-        assert!(FlexType::Float(999.0) < FlexType::String(Arc::from("a")));
+        assert!(FlexType::Integer(999) < FlexType::String(FlexString::from("a")));
+        assert!(FlexType::Float(999.0) < FlexType::String(FlexString::from("a")));
     }
 
     // === Hash + Eq tests ===
@@ -658,9 +658,9 @@ mod tests {
     fn test_flextype_hash_eq_strings() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
-        set.insert(FlexType::String(Arc::from("hello")));
-        assert!(set.contains(&FlexType::String(Arc::from("hello"))));
-        assert!(!set.contains(&FlexType::String(Arc::from("world"))));
+        set.insert(FlexType::String(FlexString::from("hello")));
+        assert!(set.contains(&FlexType::String(FlexString::from("hello"))));
+        assert!(!set.contains(&FlexType::String(FlexString::from("world"))));
     }
 
     #[test]
@@ -677,24 +677,24 @@ mod tests {
     fn test_flextype_hash_eq_vectors() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
-        set.insert(FlexType::Vector(Arc::from(vec![1.0, 2.0].as_slice())));
-        assert!(set.contains(&FlexType::Vector(Arc::from(vec![1.0, 2.0].as_slice()))));
-        assert!(!set.contains(&FlexType::Vector(Arc::from(vec![1.0, 3.0].as_slice()))));
+        set.insert(FlexType::Vector(FlexVec::from(vec![1.0, 2.0].as_slice())));
+        assert!(set.contains(&FlexType::Vector(FlexVec::from(vec![1.0, 2.0].as_slice()))));
+        assert!(!set.contains(&FlexType::Vector(FlexVec::from(vec![1.0, 3.0].as_slice()))));
     }
 
     #[test]
     fn test_flextype_hash_eq_datetime() {
         use std::collections::HashSet;
-        let dt1 = FlexType::DateTime(FlexDateTime {
+        let dt1 = FlexType::DateTime(Box::new(FlexDateTime {
             posix_timestamp: 1000,
             tz_offset_quarter_hours: 0,
             microsecond: 500,
-        });
-        let dt2 = FlexType::DateTime(FlexDateTime {
+        }));
+        let dt2 = FlexType::DateTime(Box::new(FlexDateTime {
             posix_timestamp: 1000,
             tz_offset_quarter_hours: 0,
             microsecond: 500,
-        });
+        }));
         let mut set = HashSet::new();
         set.insert(dt1);
         assert!(set.contains(&dt2));
@@ -722,5 +722,10 @@ mod tests {
         a.hash(&mut ha);
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn test_flextype_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<FlexType>(), 16);
     }
 }

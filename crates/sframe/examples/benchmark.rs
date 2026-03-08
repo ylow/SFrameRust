@@ -17,6 +17,7 @@ use sframe_query::algorithms::aggregators::AggSpec;
 use sframe_query::algorithms::sort::SortOrder;
 use sframe_query::batch::{ColumnData, SFrameRows};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::FlexString;
 
 fn num_rows() -> usize {
     std::env::var("SFRAME_BENCH_ROWS")
@@ -249,15 +250,15 @@ fn generate_data(path: &str, n: usize) {
     while offset < n {
         let end = (offset + batch_size).min(n);
         let ids: Vec<Option<i64>> = (offset..end).map(|i| Some(i as i64)).collect();
-        let categories: Vec<Option<Arc<str>>> = (offset..end)
-            .map(|i| Some(Arc::from(format!("cat_{:03}", i % 100).as_str())))
+        let categories: Vec<Option<FlexString>> = (offset..end)
+            .map(|i| Some(FlexString::from(format!("cat_{:03}", i % 100))))
             .collect();
         let values: Vec<Option<f64>> = (offset..end).map(|i| Some(pseudo_random_f64(i))).collect();
         let scores: Vec<Option<i64>> = (offset..end)
             .map(|i| Some((pseudo_random_u64(i) % 1001) as i64))
             .collect();
-        let labels: Vec<Option<Arc<str>>> = (offset..end)
-            .map(|i| Some(Arc::from(format!("label_{}", i % 10).as_str())))
+        let labels: Vec<Option<FlexString>> = (offset..end)
+            .map(|i| Some(FlexString::from(format!("label_{}", i % 10))))
             .collect();
 
         let batch = SFrameRows::new(vec![

@@ -12,11 +12,11 @@
 //!   >2: mixed types — fall back to raw FlexType archive deserialization
 
 use std::io::Cursor;
-use std::sync::Arc;
 
 use sframe_types::bitset::DenseBitset;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexString, FlexVec};
 use sframe_types::serialization::read_flex_type;
 
 use crate::block_info::BlockInfo;
@@ -126,14 +126,14 @@ pub(crate) fn decode_typed_values(
             let values = decode_strings(data, num_elements)?;
             Ok(values
                 .into_iter()
-                .map(|s| FlexType::String(Arc::from(s)))
+                .map(|s| FlexType::String(FlexString::from(s)))
                 .collect())
         }
         FlexTypeEnum::Vector => {
             let values = decode_vectors(data, num_elements, has_ext)?;
             Ok(values
                 .into_iter()
-                .map(|v| FlexType::Vector(Arc::from(v)))
+                .map(|v| FlexType::Vector(FlexVec::from(v)))
                 .collect())
         }
         FlexTypeEnum::List | FlexTypeEnum::Dict | FlexTypeEnum::DateTime => {

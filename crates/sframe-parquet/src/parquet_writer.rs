@@ -106,7 +106,7 @@ pub fn write_parquet_shard(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use sframe_types::flex_wrappers::FlexString;
 
     use sframe_query::batch::{ColumnData, SFrameRows};
     use sframe_query::execute::{BatchCo, BatchCommand, BatchIterator, BatchResponse};
@@ -159,9 +159,9 @@ mod tests {
         let rows = SFrameRows::new(vec![
             ColumnData::Integer(vec![Some(1), Some(2), Some(3)].into()),
             ColumnData::String(vec![
-                Some(Arc::from("alpha")),
-                Some(Arc::from("beta")),
-                Some(Arc::from("gamma")),
+                Some(FlexString::from("alpha")),
+                Some(FlexString::from("beta")),
+                Some(FlexString::from("gamma")),
             ].into()),
         ])
         .unwrap();
@@ -188,9 +188,9 @@ mod tests {
         assert_eq!(batch.row(0)[0], FlexType::Integer(1));
         assert_eq!(batch.row(1)[0], FlexType::Integer(2));
         assert_eq!(batch.row(2)[0], FlexType::Integer(3));
-        assert_eq!(batch.row(0)[1], FlexType::String(Arc::from("alpha")));
-        assert_eq!(batch.row(1)[1], FlexType::String(Arc::from("beta")));
-        assert_eq!(batch.row(2)[1], FlexType::String(Arc::from("gamma")));
+        assert_eq!(batch.row(0)[1], FlexType::String(FlexString::from("alpha")));
+        assert_eq!(batch.row(1)[1], FlexType::String(FlexString::from("beta")));
+        assert_eq!(batch.row(2)[1], FlexType::String(FlexString::from("gamma")));
 
         assert!(iter.next_batch().is_none());
     }
@@ -288,7 +288,7 @@ mod tests {
 
         let rows = SFrameRows::new(vec![
             ColumnData::Integer(vec![Some(10), None, Some(30)].into()),
-            ColumnData::String(vec![None, Some(Arc::from("hello")), None].into()),
+            ColumnData::String(vec![None, Some(FlexString::from("hello")), None].into()),
         ])
         .unwrap();
 
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(batch.row(0)[0], FlexType::Integer(10));
         assert_eq!(batch.row(0)[1], FlexType::Undefined);
         assert_eq!(batch.row(1)[0], FlexType::Undefined);
-        assert_eq!(batch.row(1)[1], FlexType::String(Arc::from("hello")));
+        assert_eq!(batch.row(1)[1], FlexType::String(FlexString::from("hello")));
         assert_eq!(batch.row(2)[0], FlexType::Integer(30));
         assert_eq!(batch.row(2)[1], FlexType::Undefined);
     }
@@ -390,7 +390,7 @@ mod tests {
         let rows = SFrameRows::new(vec![
             ColumnData::Integer(vec![Some(100), Some(200)].into()),
             ColumnData::Float(vec![Some(1.1), Some(2.2)].into()),
-            ColumnData::String(vec![Some(Arc::from("foo")), Some(Arc::from("bar"))].into()),
+            ColumnData::String(vec![Some(FlexString::from("foo")), Some(FlexString::from("bar"))].into()),
         ])
         .unwrap();
 
@@ -415,9 +415,9 @@ mod tests {
 
         assert_eq!(batch.row(0)[0], FlexType::Integer(100));
         assert_eq!(batch.row(0)[1], FlexType::Float(1.1));
-        assert_eq!(batch.row(0)[2], FlexType::String(Arc::from("foo")));
+        assert_eq!(batch.row(0)[2], FlexType::String(FlexString::from("foo")));
         assert_eq!(batch.row(1)[0], FlexType::Integer(200));
         assert_eq!(batch.row(1)[1], FlexType::Float(2.2));
-        assert_eq!(batch.row(1)[2], FlexType::String(Arc::from("bar")));
+        assert_eq!(batch.row(1)[2], FlexType::String(FlexString::from("bar")));
     }
 }

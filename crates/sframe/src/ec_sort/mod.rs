@@ -29,6 +29,9 @@ use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use sframe_types::flex_wrappers::FlexString;
+
 use crate::sarray::SArray;
 use crate::sframe::SFrame;
 
@@ -533,12 +536,12 @@ mod tests {
 
         let col_b = SArray::from_vec(
             vec![
-                FlexType::String(Arc::from("a")),
-                FlexType::String(Arc::from("b")),
-                FlexType::String(Arc::from("c")),
-                FlexType::String(Arc::from("d")),
-                FlexType::String(Arc::from("e")),
-                FlexType::String(Arc::from("f")),
+                FlexType::String(FlexString::from("a")),
+                FlexType::String(FlexString::from("b")),
+                FlexType::String(FlexString::from("c")),
+                FlexType::String(FlexString::from("d")),
+                FlexType::String(FlexString::from("e")),
+                FlexType::String(FlexString::from("f")),
             ],
             FlexTypeEnum::String,
         )
@@ -567,12 +570,12 @@ mod tests {
 
         // Row 0 of output should be original row 5 (since fmap[5]=0)
         // Row 5 of output should be original row 0 (since fmap[0]=5)
-        assert_eq!(rows[0], vec![FlexType::Integer(5), FlexType::String(Arc::from("f"))]);
-        assert_eq!(rows[1], vec![FlexType::Integer(4), FlexType::String(Arc::from("e"))]);
-        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(Arc::from("d"))]);
-        assert_eq!(rows[3], vec![FlexType::Integer(2), FlexType::String(Arc::from("c"))]);
-        assert_eq!(rows[4], vec![FlexType::Integer(1), FlexType::String(Arc::from("b"))]);
-        assert_eq!(rows[5], vec![FlexType::Integer(0), FlexType::String(Arc::from("a"))]);
+        assert_eq!(rows[0], vec![FlexType::Integer(5), FlexType::String(FlexString::from("f"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(4), FlexType::String(FlexString::from("e"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(FlexString::from("d"))]);
+        assert_eq!(rows[3], vec![FlexType::Integer(2), FlexType::String(FlexString::from("c"))]);
+        assert_eq!(rows[4], vec![FlexType::Integer(1), FlexType::String(FlexString::from("b"))]);
+        assert_eq!(rows[5], vec![FlexType::Integer(0), FlexType::String(FlexString::from("a"))]);
     }
 
     #[test]
@@ -623,9 +626,9 @@ mod tests {
         ).unwrap();
         let names = SArray::from_vec(
             vec![
-                FlexType::String(Arc::from("three")),
-                FlexType::String(Arc::from("one")),
-                FlexType::String(Arc::from("two")),
+                FlexType::String(FlexString::from("three")),
+                FlexType::String(FlexString::from("one")),
+                FlexType::String(FlexString::from("two")),
             ],
             FlexTypeEnum::String,
         ).unwrap();
@@ -635,9 +638,9 @@ mod tests {
 
         assert_eq!(result.num_rows().unwrap(), 3);
         let rows = result.iter_rows().unwrap();
-        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
-        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
-        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(FlexString::from("one"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(FlexString::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(FlexString::from("three"))]);
 
         // Column names should be preserved in order
         assert_eq!(result.column_names(), &["id", "name"]);
@@ -651,9 +654,9 @@ mod tests {
         ).unwrap();
         let names = SArray::from_vec(
             vec![
-                FlexType::String(Arc::from("three")),
-                FlexType::String(Arc::from("one")),
-                FlexType::String(Arc::from("two")),
+                FlexType::String(FlexString::from("three")),
+                FlexType::String(FlexString::from("one")),
+                FlexType::String(FlexString::from("two")),
             ],
             FlexTypeEnum::String,
         ).unwrap();
@@ -663,9 +666,9 @@ mod tests {
 
         assert_eq!(result.num_rows().unwrap(), 3);
         let rows = result.iter_rows().unwrap();
-        assert_eq!(rows[0], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
-        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
-        assert_eq!(rows[2], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
+        assert_eq!(rows[0], vec![FlexType::Integer(3), FlexType::String(FlexString::from("three"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(FlexString::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(1), FlexType::String(FlexString::from("one"))]);
     }
 
     #[test]
@@ -679,7 +682,7 @@ mod tests {
             .collect();
         let str_vals: Vec<FlexType> = (0..n)
             .rev()
-            .map(|i| FlexType::String(Arc::from(format!("str_{:04}", i))))
+            .map(|i| FlexType::String(FlexString::from(format!("str_{:04}", i))))
             .collect();
         let float_vals: Vec<FlexType> = (0..n)
             .rev()
@@ -720,7 +723,7 @@ mod tests {
             FlexTypeEnum::Integer,
         ).unwrap();
         let vals = SArray::from_vec(
-            vec![FlexType::String(Arc::from("hello"))],
+            vec![FlexType::String(FlexString::from("hello"))],
             FlexTypeEnum::String,
         ).unwrap();
 
@@ -729,7 +732,7 @@ mod tests {
 
         assert_eq!(result.num_rows().unwrap(), 1);
         let rows = result.iter_rows().unwrap();
-        assert_eq!(rows[0], vec![FlexType::Integer(42), FlexType::String(Arc::from("hello"))]);
+        assert_eq!(rows[0], vec![FlexType::Integer(42), FlexType::String(FlexString::from("hello"))]);
     }
 
     #[test]
@@ -737,7 +740,7 @@ mod tests {
         let n = 100;
         let int_vals: Vec<FlexType> = (0..n).map(|i| FlexType::Integer(i as i64)).collect();
         let str_vals: Vec<FlexType> = (0..n)
-            .map(|i| FlexType::String(Arc::from(format!("row_{:03}", i))))
+            .map(|i| FlexType::String(FlexString::from(format!("row_{:03}", i))))
             .collect();
 
         let col_i = SArray::from_vec(int_vals.clone(), FlexTypeEnum::Integer).unwrap();
@@ -759,7 +762,7 @@ mod tests {
         let n = 10;
         let int_vals: Vec<FlexType> = (0..n).map(|_| FlexType::Integer(7)).collect();
         let str_vals: Vec<FlexType> = (0..n)
-            .map(|i| FlexType::String(Arc::from(format!("item_{}", i))))
+            .map(|i| FlexType::String(FlexString::from(format!("item_{}", i))))
             .collect();
 
         let col_i = SArray::from_vec(int_vals, FlexTypeEnum::Integer).unwrap();
@@ -813,10 +816,10 @@ mod tests {
         ).unwrap();
         let labels = SArray::from_vec(
             vec![
-                FlexType::String(Arc::from("g2p10")),
-                FlexType::String(Arc::from("g1p20")),
-                FlexType::String(Arc::from("g1p30")),
-                FlexType::String(Arc::from("g2p40")),
+                FlexType::String(FlexString::from("g2p10")),
+                FlexType::String(FlexString::from("g1p20")),
+                FlexType::String(FlexString::from("g1p30")),
+                FlexType::String(FlexString::from("g2p40")),
             ],
             FlexTypeEnum::String,
         ).unwrap();
@@ -836,19 +839,19 @@ mod tests {
         // Expected order: group=1,pri=30 -> group=1,pri=20 -> group=2,pri=40 -> group=2,pri=10
         assert_eq!(rows[0][0], FlexType::Integer(1));
         assert_eq!(rows[0][1], FlexType::Integer(30));
-        assert_eq!(rows[0][2], FlexType::String(Arc::from("g1p30")));
+        assert_eq!(rows[0][2], FlexType::String(FlexString::from("g1p30")));
 
         assert_eq!(rows[1][0], FlexType::Integer(1));
         assert_eq!(rows[1][1], FlexType::Integer(20));
-        assert_eq!(rows[1][2], FlexType::String(Arc::from("g1p20")));
+        assert_eq!(rows[1][2], FlexType::String(FlexString::from("g1p20")));
 
         assert_eq!(rows[2][0], FlexType::Integer(2));
         assert_eq!(rows[2][1], FlexType::Integer(40));
-        assert_eq!(rows[2][2], FlexType::String(Arc::from("g2p40")));
+        assert_eq!(rows[2][2], FlexType::String(FlexString::from("g2p40")));
 
         assert_eq!(rows[3][0], FlexType::Integer(2));
         assert_eq!(rows[3][1], FlexType::Integer(10));
-        assert_eq!(rows[3][2], FlexType::String(Arc::from("g2p10")));
+        assert_eq!(rows[3][2], FlexType::String(FlexString::from("g2p10")));
     }
 
     #[test]
@@ -869,7 +872,7 @@ mod tests {
         for i in 0..20 {
             let str_vals: Vec<FlexType> = (0..n)
                 .rev()
-                .map(|j| FlexType::String(Arc::from(format!("c{}_r{}", i, j))))
+                .map(|j| FlexType::String(FlexString::from(format!("c{}_r{}", i, j))))
                 .collect();
             all_columns.push(SArray::from_vec(str_vals, FlexTypeEnum::String).unwrap());
         }
@@ -884,7 +887,7 @@ mod tests {
         assert_eq!(rows[0][0], FlexType::Integer(0));
         // Its value columns should reference row 0
         for i in 0..20 {
-            assert_eq!(rows[0][1 + i], FlexType::String(Arc::from(format!("c{}_r0", i))));
+            assert_eq!(rows[0][1 + i], FlexType::String(FlexString::from(format!("c{}_r0", i))));
         }
 
         // Last row should have key=199 (originally first row)
@@ -892,7 +895,7 @@ mod tests {
         for i in 0..20 {
             assert_eq!(
                 rows[n - 1][1 + i],
-                FlexType::String(Arc::from(format!("c{}_r{}", i, n - 1)))
+                FlexType::String(FlexString::from(format!("c{}_r{}", i, n - 1)))
             );
         }
     }
@@ -906,9 +909,9 @@ mod tests {
         ).unwrap();
         let names = SArray::from_vec(
             vec![
-                FlexType::String(Arc::from("three")),
-                FlexType::String(Arc::from("one")),
-                FlexType::String(Arc::from("two")),
+                FlexType::String(FlexString::from("three")),
+                FlexType::String(FlexString::from("one")),
+                FlexType::String(FlexString::from("two")),
             ],
             FlexTypeEnum::String,
         ).unwrap();
@@ -918,9 +921,9 @@ mod tests {
 
         assert_eq!(result.num_rows().unwrap(), 3);
         let rows = result.iter_rows().unwrap();
-        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(Arc::from("one"))]);
-        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(Arc::from("two"))]);
-        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(Arc::from("three"))]);
+        assert_eq!(rows[0], vec![FlexType::Integer(1), FlexType::String(FlexString::from("one"))]);
+        assert_eq!(rows[1], vec![FlexType::Integer(2), FlexType::String(FlexString::from("two"))]);
+        assert_eq!(rows[2], vec![FlexType::Integer(3), FlexType::String(FlexString::from("three"))]);
     }
 
     #[test]

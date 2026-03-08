@@ -7,9 +7,8 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
-
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 use super::csv_parser::{read_csv_string, CsvOptions};
 
@@ -182,16 +181,16 @@ fn float(v: f64) -> FlexType {
     FlexType::Float(v)
 }
 fn string(v: &str) -> FlexType {
-    FlexType::String(Arc::from(v))
+    FlexType::String(FlexString::from(v))
 }
 fn vec_f(v: &[f64]) -> FlexType {
-    FlexType::Vector(Arc::from(v))
+    FlexType::Vector(FlexVec::from(v))
 }
 fn list(v: Vec<FlexType>) -> FlexType {
-    FlexType::List(Arc::from(v))
+    FlexType::List(FlexList::from(v))
 }
 fn dict(pairs: Vec<(FlexType, FlexType)>) -> FlexType {
-    FlexType::Dict(Arc::from(pairs))
+    FlexType::Dict(FlexDict::from(pairs))
 }
 fn undef() -> FlexType {
     FlexType::Undefined

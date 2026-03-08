@@ -22,6 +22,7 @@ use sframe_query::algorithms::aggregators::AggSpec;
 use sframe_query::algorithms::sort::SortOrder;
 use sframe_query::batch::{ColumnData, SFrameRows};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::FlexString;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -132,9 +133,9 @@ fn generate_and_write(path: &str, total_rows: u64) {
     let mut writer = SFrameStreamWriter::new(path, col_names, col_types)
         .expect("failed to create writer");
 
-    // Pre-allocate Arc<str> for categories and regions to avoid per-row heap allocs.
-    let cat_arcs: Vec<Arc<str>> = CATEGORIES.iter().map(|&s| Arc::from(s)).collect();
-    let reg_arcs: Vec<Arc<str>> = REGIONS.iter().map(|&s| Arc::from(s)).collect();
+    // Pre-allocate FlexString for categories and regions to avoid per-row heap allocs.
+    let cat_strs: Vec<FlexString> = CATEGORIES.iter().map(|&s| FlexString::from(s)).collect();
+    let reg_strs: Vec<FlexString> = REGIONS.iter().map(|&s| FlexString::from(s)).collect();
 
     let mut rng = Rng::new(42);
     let num_batches = (total_rows as usize).div_ceil(BATCH_SIZE);
@@ -149,20 +150,20 @@ fn generate_and_write(path: &str, total_rows: u64) {
 
         let mut user_ids = Vec::with_capacity(rows_in_batch);
         let mut product_ids = Vec::with_capacity(rows_in_batch);
-        let mut categories: Vec<Option<Arc<str>>> = Vec::with_capacity(rows_in_batch);
+        let mut categories: Vec<Option<FlexString>> = Vec::with_capacity(rows_in_batch);
         let mut amounts = Vec::with_capacity(rows_in_batch);
         let mut quantities = Vec::with_capacity(rows_in_batch);
         let mut scores = Vec::with_capacity(rows_in_batch);
-        let mut regions: Vec<Option<Arc<str>>> = Vec::with_capacity(rows_in_batch);
+        let mut regions: Vec<Option<FlexString>> = Vec::with_capacity(rows_in_batch);
 
         for _ in 0..rows_in_batch {
             user_ids.push(Some(rng.next_i64_range(NUM_USERS)));
             product_ids.push(Some(rng.next_i64_range(NUM_PRODUCTS)));
-            categories.push(Some(Arc::clone(&cat_arcs[rng.next_u64() as usize % cat_arcs.len()])));
+            categories.push(Some(cat_strs[rng.next_u64() as usize % cat_strs.len()].clone()));
             amounts.push(Some(rng.next_f64_range(1.0, 10_000.0)));
             quantities.push(Some(rng.next_i64_range(100) + 1));
             scores.push(Some(rng.next_f64_range(0.0, 100.0)));
-            regions.push(Some(Arc::clone(&reg_arcs[rng.next_u64() as usize % reg_arcs.len()])));
+            regions.push(Some(reg_strs[rng.next_u64() as usize % reg_strs.len()].clone()));
         }
 
         let batch = SFrameRows::new(vec![

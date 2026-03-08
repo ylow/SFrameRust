@@ -17,6 +17,7 @@ use sframe_query::batch::{ColumnData, SFrameRows};
 use sframe_query::nullable_vec::NullableVec;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 // ---------------------------------------------------------------------------
 // Task 2: Arrow DataType -> FlexTypeEnum
@@ -216,7 +217,7 @@ fn convert_to_string(array: &dyn Array) -> Result<ColumnData> {
             if arr.is_null(i) {
                 out.push(None);
             } else {
-                out.push(Some(Arc::from(arr.value(i))));
+                out.push(Some(FlexString::from(arr.value(i))));
             }
         }
         Ok(ColumnData::String(out))
@@ -226,7 +227,7 @@ fn convert_to_string(array: &dyn Array) -> Result<ColumnData> {
             if arr.is_null(i) {
                 out.push(None);
             } else {
-                out.push(Some(Arc::from(arr.value(i))));
+                out.push(Some(FlexString::from(arr.value(i))));
             }
         }
         Ok(ColumnData::String(out))
@@ -415,7 +416,7 @@ fn convert_to_vector(array: &dyn Array) -> Result<ColumnData> {
             let start = list_arr.value_offsets()[i] as usize;
             let end = list_arr.value_offsets()[i + 1] as usize;
             let slice: Vec<f64> = (start..end).map(|j| values.value(j)).collect();
-            out.push(Some(Arc::from(slice)));
+            out.push(Some(FlexVec::from(slice)));
         }
     }
     Ok(ColumnData::Vector(out))
@@ -450,7 +451,7 @@ fn convert_list_array_to_list(list_arr: &ListArray) -> Result<ColumnData> {
             let slice = values.slice(start, len);
             let inner_col = arrow_array_to_column(slice.as_ref(), inner_sframe_type)?;
             let flex_vec = inner_col.to_flex_vec();
-            out.push(Some(Arc::from(flex_vec)));
+            out.push(Some(FlexList::from(flex_vec)));
         }
     }
     Ok(ColumnData::List(out))
@@ -472,7 +473,7 @@ fn convert_large_list_array_to_list(list_arr: &LargeListArray) -> Result<ColumnD
             let slice = values.slice(start, len);
             let inner_col = arrow_array_to_column(slice.as_ref(), inner_sframe_type)?;
             let flex_vec = inner_col.to_flex_vec();
-            out.push(Some(Arc::from(flex_vec)));
+            out.push(Some(FlexList::from(flex_vec)));
         }
     }
     Ok(ColumnData::List(out))
@@ -504,12 +505,12 @@ fn convert_to_dict(array: &dyn Array) -> Result<ColumnData> {
             let entries: Vec<(FlexType, FlexType)> = field_cols
                 .iter()
                 .map(|(name, col)| {
-                    let key = FlexType::String(Arc::from(name.as_str()));
+                    let key = FlexType::String(FlexString::from(name.as_str()));
                     let val = col.get(i);
                     (key, val)
                 })
                 .collect();
-            out.push(Some(Arc::from(entries)));
+            out.push(Some(FlexDict::from(entries)));
         }
     }
     Ok(ColumnData::Dict(out))
@@ -1188,10 +1189,10 @@ mod tests {
                 assert_eq!(v.len(), 2);
                 let first = v.get(0).unwrap();
                 assert_eq!(first.len(), 2);
-                assert_eq!(first[0].0, FlexType::String(Arc::from("x")));
+                assert_eq!(first[0].0, FlexType::String(FlexString::from("x")));
                 assert_eq!(first[0].1, FlexType::Integer(1));
-                assert_eq!(first[1].0, FlexType::String(Arc::from("y")));
-                assert_eq!(first[1].1, FlexType::String(Arc::from("a")));
+                assert_eq!(first[1].0, FlexType::String(FlexString::from("y")));
+                assert_eq!(first[1].1, FlexType::String(FlexString::from("a")));
             }
             _ => panic!("Expected Dict column"),
         }
@@ -1248,7 +1249,7 @@ mod tests {
 
     #[test]
     fn test_column_to_arrow_string() {
-        let col = ColumnData::String(vec![Some(Arc::from("hello")), None, Some(Arc::from(""))].into());
+        let col = ColumnData::String(vec![Some(FlexString::from("hello")), None, Some(FlexString::from(""))].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(s_arr.value(0), "hello");
@@ -1278,9 +1279,9 @@ mod tests {
     #[test]
     fn test_column_to_arrow_vector() {
         let col = ColumnData::Vector(vec![
-            Some(Arc::from(vec![1.0, 2.0].as_slice())),
+            Some(FlexVec::from(vec![1.0, 2.0])),
             None,
-            Some(Arc::from(vec![3.0].as_slice())),
+            Some(FlexVec::from(vec![3.0])),
         ].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1308,8 +1309,8 @@ mod tests {
     #[test]
     fn test_column_to_arrow_list_json() {
         let col = ColumnData::List(vec![
-            Some(Arc::from(
-                vec![FlexType::Integer(1), FlexType::Integer(2)].as_slice(),
+            Some(FlexList::from(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
             )),
             None,
         ].into());
@@ -1321,12 +1322,11 @@ mod tests {
 
     #[test]
     fn test_column_to_arrow_dict_json() {
-        let col = ColumnData::Dict(vec![Some(Arc::from(
+        let col = ColumnData::Dict(vec![Some(FlexDict::from(
             vec![(
-                FlexType::String(Arc::from("key")),
+                FlexType::String(FlexString::from("key")),
                 FlexType::Integer(42),
-            )]
-            .as_slice(),
+            )],
         ))].into());
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1338,7 +1338,7 @@ mod tests {
         let col = ColumnData::Flexible(vec![
             FlexType::Integer(42),
             FlexType::Undefined,
-            FlexType::String(Arc::from("hello")),
+            FlexType::String(FlexString::from("hello")),
         ]);
         let arr = column_to_arrow_array(&col).unwrap();
         let s_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1376,14 +1376,14 @@ mod tests {
         assert_eq!(rows.column(0).get(0), FlexType::Integer(1));
         assert_eq!(rows.column(1).get(0), FlexType::Float(1.5));
         assert_eq!(rows.column(1).get(1), FlexType::Undefined);
-        assert_eq!(rows.column(2).get(1), FlexType::String(Arc::from("b")));
+        assert_eq!(rows.column(2).get(1), FlexType::String(FlexString::from("b")));
     }
 
     #[test]
     fn test_sframe_rows_to_record_batch() {
         let rows = SFrameRows::new(vec![
             ColumnData::Integer(vec![Some(10), Some(20)].into()),
-            ColumnData::String(vec![Some(Arc::from("x")), None].into()),
+            ColumnData::String(vec![Some(FlexString::from("x")), None].into()),
         ])
         .unwrap();
         let names = vec!["id".to_string(), "label".to_string()];
@@ -1550,9 +1550,9 @@ mod tests {
     #[test]
     fn test_vector_roundtrip() {
         let orig = ColumnData::Vector(vec![
-            Some(Arc::from(vec![1.0, 2.0, 3.0].as_slice())),
+            Some(FlexVec::from(vec![1.0, 2.0, 3.0])),
             None,
-            Some(Arc::from(Vec::<f64>::new().as_slice())),
+            Some(FlexVec::from(Vec::<f64>::new())),
         ].into());
 
         let arrow_arr = column_to_arrow_array(&orig).unwrap();

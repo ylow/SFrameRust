@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 
 use sframe_types::error::Result;
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexVec};
 use sframe_types::serialization::{
     read_f64, read_i64, read_u64, read_u8, write_f64, write_i64, write_u64, write_u8,
     read_flex_type, write_flex_type, read_string, write_string,
@@ -1001,7 +1002,7 @@ impl Aggregator for FrequencyCountAggregator {
             .iter()
             .map(|(k, &v)| (FlexType::String(k.clone().into()), FlexType::Integer(v as i64)))
             .collect();
-        FlexType::Dict(std::sync::Arc::from(entries))
+        FlexType::Dict(FlexDict::from(entries))
     }
 
     fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
@@ -1065,7 +1066,7 @@ impl Aggregator for ZipListAggregator {
     }
 
     fn finalize(&mut self) -> FlexType {
-        FlexType::List(std::sync::Arc::from(self.values.clone()))
+        FlexType::List(FlexList::from(self.values.clone()))
     }
 
     fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
@@ -1145,7 +1146,7 @@ impl Aggregator for VectorSumAggregator {
 
     fn finalize(&mut self) -> FlexType {
         match &self.sum {
-            Some(s) => FlexType::Vector(std::sync::Arc::from(s.clone())),
+            Some(s) => FlexType::Vector(FlexVec::from(s.clone())),
             None => FlexType::Undefined,
         }
     }
@@ -1238,7 +1239,7 @@ impl Aggregator for VectorAvgAggregator {
         match &self.sum {
             Some(s) if self.count > 0 => {
                 let avg: Vec<f64> = s.iter().map(|v| v / self.count as f64).collect();
-                FlexType::Vector(std::sync::Arc::from(avg))
+                FlexType::Vector(FlexVec::from(avg))
             }
             _ => FlexType::Undefined,
         }
@@ -1599,7 +1600,7 @@ impl Aggregator for FrequentItemsAggregator {
             .into_iter()
             .map(|(item, count)| (item, FlexType::Integer(count as i64)))
             .collect();
-        FlexType::Dict(std::sync::Arc::from(entries))
+        FlexType::Dict(FlexDict::from(entries))
     }
 
     fn output_type(&self, _input_types: &[FlexTypeEnum]) -> FlexTypeEnum {
@@ -1930,8 +1931,8 @@ mod tests {
     #[test]
     fn test_vector_sum() {
         let mut agg = VectorSumAggregator::new();
-        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![1.0, 2.0, 3.0]))]);
-        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![4.0, 5.0, 6.0]))]);
+        agg.add(&[FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0]))]);
+        agg.add(&[FlexType::Vector(FlexVec::from(vec![4.0, 5.0, 6.0]))]);
         let result = agg.finalize();
         if let FlexType::Vector(v) = result {
             assert_eq!(&*v, &[5.0, 7.0, 9.0]);
@@ -1943,8 +1944,8 @@ mod tests {
     #[test]
     fn test_vector_avg() {
         let mut agg = VectorAvgAggregator::new();
-        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![2.0, 4.0]))]);
-        agg.add(&[FlexType::Vector(std::sync::Arc::from(vec![4.0, 6.0]))]);
+        agg.add(&[FlexType::Vector(FlexVec::from(vec![2.0, 4.0]))]);
+        agg.add(&[FlexType::Vector(FlexVec::from(vec![4.0, 6.0]))]);
         let result = agg.finalize();
         if let FlexType::Vector(v) = result {
             assert!((v[0] - 3.0).abs() < 1e-10);

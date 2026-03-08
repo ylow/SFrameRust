@@ -16,6 +16,7 @@ use sframe_query::execute::{compile, materialize_head_sync, materialize_sync, ma
 use sframe_query::planner::{Aggregator, PlannerNode};
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexVec};
 
 /// Binary function operating on two FlexType values.
 type BinaryFlexFn = Arc<dyn Fn(&FlexType, &FlexType) -> FlexType + Send + Sync>;
@@ -918,7 +919,7 @@ impl SArray {
                     .into_iter()
                     .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
                     .collect();
-                FlexType::Dict(Arc::from(dict))
+                FlexType::Dict(FlexDict::from(dict))
             }),
             FlexTypeEnum::Dict,
         )
@@ -945,7 +946,7 @@ impl SArray {
                     .into_iter()
                     .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
                     .collect();
-                FlexType::Dict(Arc::from(dict))
+                FlexType::Dict(FlexDict::from(dict))
             }),
             FlexTypeEnum::Dict,
         )
@@ -972,7 +973,7 @@ impl SArray {
                     .into_iter()
                     .map(|(k, v)| (FlexType::String(k.into()), FlexType::Integer(v as i64)))
                     .collect();
-                FlexType::Dict(Arc::from(dict))
+                FlexType::Dict(FlexDict::from(dict))
             }),
             FlexTypeEnum::Dict,
         )
@@ -1003,7 +1004,7 @@ impl SArray {
             Arc::new(|v| match v {
                 FlexType::Dict(d) => {
                     let keys: Vec<FlexType> = d.iter().map(|(k, _)| k.clone()).collect();
-                    FlexType::List(Arc::from(keys))
+                    FlexType::List(FlexList::from(keys))
                 }
                 _ => FlexType::Undefined,
             }),
@@ -1017,7 +1018,7 @@ impl SArray {
             Arc::new(|v| match v {
                 FlexType::Dict(d) => {
                     let vals: Vec<FlexType> = d.iter().map(|(_, v)| v.clone()).collect();
-                    FlexType::List(Arc::from(vals))
+                    FlexType::List(FlexList::from(vals))
                 }
                 _ => FlexType::Undefined,
             }),
@@ -1040,7 +1041,7 @@ impl SArray {
                         })
                         .cloned()
                         .collect();
-                    FlexType::Dict(Arc::from(filtered))
+                    FlexType::Dict(FlexDict::from(filtered))
                 }
                 _ => FlexType::Undefined,
             }),
@@ -1060,7 +1061,7 @@ impl SArray {
                         .filter(|(_, v)| v >= &lo && v <= &hi)
                         .cloned()
                         .collect();
-                    FlexType::Dict(Arc::from(filtered))
+                    FlexType::Dict(FlexDict::from(filtered))
                 }
                 _ => FlexType::Undefined,
             }),
@@ -1123,9 +1124,9 @@ impl SArray {
                     let s = start.min(vec.len());
                     let e = end.unwrap_or(vec.len()).min(vec.len());
                     if s >= e {
-                        FlexType::Vector(Arc::from(Vec::<f64>::new()))
+                        FlexType::Vector(FlexVec::from(Vec::<f64>::new()))
                     } else {
-                        FlexType::Vector(Arc::from(vec[s..e].to_vec()))
+                        FlexType::Vector(FlexVec::from(vec[s..e].to_vec()))
                     }
                 }
                 _ => FlexType::Undefined,
@@ -1877,7 +1878,7 @@ mod tests {
             (FlexType::String("b".into()), FlexType::Integer(2)),
         ];
         let sa = SArray::from_vec(
-            vec![FlexType::Dict(Arc::from(d1))],
+            vec![FlexType::Dict(FlexDict::from(d1))],
             FlexTypeEnum::Dict,
         ).unwrap();
 
@@ -1902,7 +1903,7 @@ mod tests {
             (FlexType::String("c".into()), FlexType::Integer(3)),
         ];
         let sa = SArray::from_vec(
-            vec![FlexType::Dict(Arc::from(d1))],
+            vec![FlexType::Dict(FlexDict::from(d1))],
             FlexTypeEnum::Dict,
         ).unwrap();
 
@@ -1932,7 +1933,7 @@ mod tests {
             (FlexType::String("b".into()), FlexType::Integer(2)),
         ];
         let sa = SArray::from_vec(
-            vec![FlexType::Dict(Arc::from(d1))],
+            vec![FlexType::Dict(FlexDict::from(d1))],
             FlexTypeEnum::Dict,
         ).unwrap();
 
@@ -1959,7 +1960,7 @@ mod tests {
 
         // Test with vectors
         let sa_vec = SArray::from_vec(
-            vec![FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]))],
+            vec![FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0]))],
             FlexTypeEnum::Vector,
         ).unwrap();
         let lengths = sa_vec.item_length().to_vec().unwrap();
@@ -1970,16 +1971,16 @@ mod tests {
     fn test_vector_slice() {
         let sa = SArray::from_vec(
             vec![
-                FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
-                FlexType::Vector(Arc::from(vec![10.0, 20.0])),
+                FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+                FlexType::Vector(FlexVec::from(vec![10.0, 20.0])),
             ],
             FlexTypeEnum::Vector,
         ).unwrap();
 
         let sliced = sa.vector_slice(1, Some(3));
         let vals = sliced.to_vec().unwrap();
-        assert_eq!(vals[0], FlexType::Vector(Arc::from(vec![2.0, 3.0])));
-        assert_eq!(vals[1], FlexType::Vector(Arc::from(vec![20.0])));
+        assert_eq!(vals[0], FlexType::Vector(FlexVec::from(vec![2.0, 3.0])));
+        assert_eq!(vals[1], FlexType::Vector(FlexVec::from(vec![20.0])));
     }
 
     #[test]

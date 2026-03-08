@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 use crate::batch::SFrameRows;
 
@@ -69,24 +69,24 @@ pub fn json_to_flex(val: &JsonValue) -> FlexType {
                 FlexType::Undefined
             }
         }
-        JsonValue::String(s) => FlexType::String(Arc::from(s.as_str())),
+        JsonValue::String(s) => FlexType::String(FlexString::from(s.as_str())),
         JsonValue::Array(arr) => {
             // Check if all elements are numbers → Vector, else List
             let all_numeric = arr.iter().all(|v| v.is_number());
             if all_numeric && !arr.is_empty() {
                 let floats: Vec<f64> = arr.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
-                FlexType::Vector(Arc::from(floats))
+                FlexType::Vector(FlexVec::from(floats))
             } else {
                 let items: Vec<FlexType> = arr.iter().map(json_to_flex).collect();
-                FlexType::List(Arc::from(items))
+                FlexType::List(FlexList::from(items))
             }
         }
         JsonValue::Object(map) => {
             let entries: Vec<(FlexType, FlexType)> = map
                 .iter()
-                .map(|(k, v)| (FlexType::String(Arc::from(k.as_str())), json_to_flex(v)))
+                .map(|(k, v)| (FlexType::String(FlexString::from(k.as_str())), json_to_flex(v)))
                 .collect();
-            FlexType::Dict(Arc::from(entries))
+            FlexType::Dict(FlexDict::from(entries))
         }
     }
 }
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_json_vector() {
-        let v = FlexType::Vector(Arc::from(vec![1.0, 2.0, 3.0]));
+        let v = FlexType::Vector(FlexVec::from(vec![1.0, 2.0, 3.0]));
         let json = flex_to_json(&v);
         assert!(json.is_array());
         let back = json_to_flex(&json);

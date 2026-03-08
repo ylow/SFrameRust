@@ -300,7 +300,7 @@ impl<W: Write> BufferedSegmentWriter<W> {
 mod tests {
     use super::*;
     use crate::segment_reader::SegmentReader;
-    use std::sync::Arc;
+    use sframe_types::flex_wrappers::FlexString;
 
     /// Helper: write to a Vec<u8>, then read back with SegmentReader.
     fn make_reader(buf: Vec<u8>, dtypes: &[FlexTypeEnum]) -> SegmentReader {
@@ -323,7 +323,7 @@ mod tests {
                 .unwrap();
 
             let strings: Vec<FlexType> = (0..10)
-                .map(|i| FlexType::String(Arc::from(format!("val_{i}"))))
+                .map(|i| FlexType::String(FlexString::from(format!("val_{i}"))))
                 .collect();
             writer
                 .write_column_block(1, &strings, FlexTypeEnum::String)
@@ -346,7 +346,7 @@ mod tests {
         let col1 = reader.read_column(1).unwrap();
         assert_eq!(col1.len(), 10);
         for (i, v) in col1.iter().enumerate() {
-            let expected = FlexType::String(Arc::from(format!("val_{i}")));
+            let expected = FlexType::String(FlexString::from(format!("val_{i}")));
             assert_eq!(*v, expected, "string mismatch at {i}");
         }
     }

@@ -167,7 +167,7 @@ mod tests {
     use super::*;
     use crate::segment_reader::SegmentReader;
     use sframe_io::local_fs::LocalFileSystem;
-    use std::sync::Arc;
+    use sframe_types::flex_wrappers::FlexString;
 
     #[test]
     fn test_scatter_roundtrip() {
@@ -196,7 +196,7 @@ mod tests {
         // Write 9 string values with round-robin distribution
         for i in 0..9i64 {
             let seg = (i % 3) as usize;
-            sw.write_to_segment(1, seg, FlexType::String(Arc::from(format!("val_{i}"))))
+            sw.write_to_segment(1, seg, FlexType::String(FlexString::from(format!("val_{i}"))))
                 .unwrap();
         }
 
@@ -228,7 +228,7 @@ mod tests {
             assert_eq!(strs.len(), 3);
             for (j, val) in strs.iter().enumerate() {
                 let expected_i = seg_idx + j * 3;
-                let expected = FlexType::String(Arc::from(format!("val_{expected_i}")));
+                let expected = FlexType::String(FlexString::from(format!("val_{expected_i}")));
                 assert_eq!(*val, expected);
             }
         }
@@ -249,7 +249,7 @@ mod tests {
         for i in 0..6i64 {
             let seg = (i % 2) as usize;
             sw.write_to_segment(0, seg, FlexType::Integer(i)).unwrap();
-            sw.write_to_segment(1, seg, FlexType::String(Arc::from(format!("s{i}"))))
+            sw.write_to_segment(1, seg, FlexType::String(FlexString::from(format!("s{i}"))))
                 .unwrap();
         }
 
@@ -271,9 +271,9 @@ mod tests {
 
         let strs = reader.read_column(1).unwrap();
         assert_eq!(strs, vec![
-            FlexType::String(Arc::from("s0")),
-            FlexType::String(Arc::from("s2")),
-            FlexType::String(Arc::from("s4")),
+            FlexType::String(FlexString::from("s0")),
+            FlexType::String(FlexString::from("s2")),
+            FlexType::String(FlexString::from("s4")),
         ]);
     }
 

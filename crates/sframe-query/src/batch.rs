@@ -3,10 +3,9 @@
 //! `SFrameRows` is a columnar batch of rows using typed column vectors.
 //! This avoids the per-value tag overhead of `Vec<Vec<FlexType>>`.
 
-use std::sync::Arc;
-
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexDateTime, FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 use crate::nullable_vec::NullableVec;
 
@@ -26,10 +25,10 @@ pub struct SFrameRows {
 pub enum ColumnData {
     Integer(NullableVec<i64>),
     Float(NullableVec<f64>),
-    String(NullableVec<Arc<str>>),
-    Vector(NullableVec<Arc<[f64]>>),
-    List(NullableVec<Arc<[FlexType]>>),
-    Dict(NullableVec<Arc<[(FlexType, FlexType)]>>),
+    String(NullableVec<FlexString>),
+    Vector(NullableVec<FlexVec>),
+    List(NullableVec<FlexList>),
+    Dict(NullableVec<FlexDict>),
     DateTime(NullableVec<FlexDateTime>),
     /// Mixed-type column for UNDEFINED/per-value-parsed data.
     /// Uses `FlexType::Undefined` for null instead of `Option` wrapping.
@@ -130,7 +129,7 @@ impl ColumnData {
             (ColumnData::List(v), FlexType::Undefined) => v.push(None),
             (ColumnData::Dict(v), FlexType::Dict(d)) => v.push(Some(d.clone())),
             (ColumnData::Dict(v), FlexType::Undefined) => v.push(None),
-            (ColumnData::DateTime(v), FlexType::DateTime(dt)) => v.push(Some(dt.clone())),
+            (ColumnData::DateTime(v), FlexType::DateTime(dt)) => v.push(Some(dt.as_ref().clone())),
             (ColumnData::DateTime(v), FlexType::Undefined) => v.push(None),
             (ColumnData::Flexible(v), val) => v.push(val.clone()),
             (col, val) => {
@@ -172,7 +171,7 @@ impl ColumnData {
                 None => FlexType::Undefined,
             },
             ColumnData::DateTime(v) => match v.get(index) {
-                Some(dt) => FlexType::DateTime(dt.clone()),
+                Some(dt) => FlexType::DateTime(Box::new(dt.clone())),
                 None => FlexType::Undefined,
             },
             ColumnData::Flexible(v) => v[index].clone(),
@@ -205,7 +204,12 @@ impl ColumnData {
             FlexTypeEnum::Vector => convert_opt!(Vector, Vector),
             FlexTypeEnum::List => convert_opt!(List, List),
             FlexTypeEnum::Dict => convert_opt!(Dict, Dict),
-            FlexTypeEnum::DateTime => convert_opt!(DateTime, DateTime),
+            FlexTypeEnum::DateTime => {
+                ColumnData::DateTime(data.iter().map(|v| match v {
+                    FlexType::DateTime(x) => Some(x.as_ref().clone()),
+                    _ => None,
+                }).collect())
+            }
             FlexTypeEnum::Undefined => ColumnData::Flexible(data.to_vec()),
         }
     }
@@ -227,7 +231,12 @@ impl ColumnData {
             FlexTypeEnum::Vector => convert_opt!(Vector, Vector),
             FlexTypeEnum::List => convert_opt!(List, List),
             FlexTypeEnum::Dict => convert_opt!(Dict, Dict),
-            FlexTypeEnum::DateTime => convert_opt!(DateTime, DateTime),
+            FlexTypeEnum::DateTime => {
+                ColumnData::DateTime(data.into_iter().map(|v| match v {
+                    FlexType::DateTime(x) => Some(*x),
+                    _ => None,
+                }).collect())
+            }
             FlexTypeEnum::Undefined => ColumnData::Flexible(data),
         }
     }
@@ -277,7 +286,15 @@ impl ColumnData {
             ColumnData::Vector(v) => map_opt!(v, Vector),
             ColumnData::List(v) => map_opt!(v, List),
             ColumnData::Dict(v) => map_opt!(v, Dict),
-            ColumnData::DateTime(v) => map_opt!(v, DateTime),
+            ColumnData::DateTime(v) => {
+                v.iter().map(|val| {
+                    let ft = match val {
+                        Some(x) => FlexType::DateTime(Box::new(x.clone())),
+                        None => FlexType::Undefined,
+                    };
+                    func(&ft)
+                }).collect()
+            }
             ColumnData::Flexible(v) => v.iter().map(|v| func(v)).collect(),
         }
     }
@@ -305,7 +322,15 @@ impl ColumnData {
             ColumnData::Vector(v) => filter_opt!(v, Vector),
             ColumnData::List(v) => filter_opt!(v, List),
             ColumnData::Dict(v) => filter_opt!(v, Dict),
-            ColumnData::DateTime(v) => filter_opt!(v, DateTime),
+            ColumnData::DateTime(v) => {
+                v.iter().enumerate().filter_map(|(i, val)| {
+                    let ft = match val {
+                        Some(x) => FlexType::DateTime(Box::new(x.clone())),
+                        None => FlexType::Undefined,
+                    };
+                    if pred(&ft) { Some(i) } else { None }
+                }).collect()
+            }
             ColumnData::Flexible(v) => {
                 v.iter().enumerate().filter_map(|(i, val)| {
                     if pred(val) { Some(i) } else { None }
@@ -333,7 +358,12 @@ impl ColumnData {
             ColumnData::Vector(v) => convert_opt!(v, Vector),
             ColumnData::List(v) => convert_opt!(v, List),
             ColumnData::Dict(v) => convert_opt!(v, Dict),
-            ColumnData::DateTime(v) => convert_opt!(v, DateTime),
+            ColumnData::DateTime(v) => {
+                v.iter().map(|val| match val {
+                    Some(x) => FlexType::DateTime(Box::new(x.clone())),
+                    None => FlexType::Undefined,
+                }).collect()
+            }
             ColumnData::Flexible(v) => v.to_vec(),
         }
     }
@@ -744,8 +774,8 @@ mod tests {
             vec![FlexType::String("hello".into())],
             vec![FlexType::Float(3.14)],
             vec![FlexType::Undefined],
-            vec![FlexType::Dict(Arc::from(
-                vec![(FlexType::String("k".into()), FlexType::Integer(1))].as_slice(),
+            vec![FlexType::Dict(FlexDict::from(
+                vec![(FlexType::String("k".into()), FlexType::Integer(1))],
             ))],
         ];
 

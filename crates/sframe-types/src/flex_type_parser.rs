@@ -15,9 +15,8 @@
 //! structure. If parsing fails (mismatched brackets, invalid content), it
 //! falls back to treating the entire input as a string.
 
-use std::sync::Arc;
-
 use crate::flex_type::FlexType;
+use crate::flex_wrappers::{FlexDict, FlexList, FlexString, FlexVec};
 
 /// Parse a string into the best-matching FlexType.
 ///
@@ -40,13 +39,13 @@ pub fn parse_flextype(s: &str) -> FlexType {
             return v;
         }
         // Bracket didn't parse as vector or list — fall through to string
-        return FlexType::String(Arc::from(s));
+        return FlexType::String(FlexString::from(s));
     }
     if first == b'{' {
         if let Some(v) = try_parse_dict(s) {
             return v;
         }
-        return FlexType::String(Arc::from(s));
+        return FlexType::String(FlexString::from(s));
     }
 
     // Try numeric types
@@ -59,7 +58,7 @@ pub fn parse_flextype(s: &str) -> FlexType {
     }
 
     // Everything else is a string
-    FlexType::String(Arc::from(s))
+    FlexType::String(FlexString::from(s))
 }
 
 /// Try to parse as a float. Requires a decimal point, 'inf', 'nan', or
@@ -103,7 +102,7 @@ fn try_parse_vector(s: &str) -> Option<FlexType> {
 
     let inner = s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Some(FlexType::Vector(Arc::from(Vec::<f64>::new().as_slice())));
+        return Some(FlexType::Vector(FlexVec::from(Vec::<f64>::new())));
     }
 
     // Split by commas, semicolons, or whitespace
@@ -121,7 +120,7 @@ fn try_parse_vector(s: &str) -> Option<FlexType> {
         }
     }
 
-    Some(FlexType::Vector(Arc::from(values)))
+    Some(FlexType::Vector(FlexVec::from(values)))
 }
 
 /// Split vector elements by comma, semicolon, or whitespace.
@@ -154,7 +153,7 @@ fn try_parse_list(s: &str) -> Option<FlexType> {
         // Empty brackets — could be empty vector or empty list.
         // The C++ returns empty vector for []. We already handled that
         // in try_parse_vector, so if we get here return empty list.
-        return Some(FlexType::List(Arc::from(Vec::<FlexType>::new().as_slice())));
+        return Some(FlexType::List(FlexList::from(Vec::<FlexType>::new())));
     }
 
     // Split by commas respecting bracket/brace nesting
@@ -170,7 +169,7 @@ fn try_parse_list(s: &str) -> Option<FlexType> {
         }
     }
 
-    Some(FlexType::List(Arc::from(values)))
+    Some(FlexType::List(FlexList::from(values)))
 }
 
 /// Try to parse as a dict: `{key: value, key: value, ...}`
@@ -185,8 +184,8 @@ fn try_parse_dict(s: &str) -> Option<FlexType> {
 
     let inner = s[1..s.len() - 1].trim();
     if inner.is_empty() {
-        return Some(FlexType::Dict(Arc::from(
-            Vec::<(FlexType, FlexType)>::new().as_slice(),
+        return Some(FlexType::Dict(FlexDict::from(
+            Vec::<(FlexType, FlexType)>::new(),
         )));
     }
 
@@ -210,7 +209,7 @@ fn try_parse_dict(s: &str) -> Option<FlexType> {
         entries.push((key, value));
     }
 
-    Some(FlexType::Dict(Arc::from(entries)))
+    Some(FlexType::Dict(FlexDict::from(entries)))
 }
 
 /// Parse a single element within a list or dict.
@@ -227,7 +226,7 @@ fn parse_element(s: &str) -> FlexType {
     {
         let inner = &s[1..s.len() - 1];
         let unescaped = unescape_string(inner);
-        return FlexType::String(Arc::from(unescaped.as_str()));
+        return FlexType::String(FlexString::from(unescaped.as_str()));
     }
 
     // Nested structure
@@ -239,13 +238,13 @@ fn parse_element(s: &str) -> FlexType {
         if let Some(v) = try_parse_list(s) {
             return v;
         }
-        return FlexType::String(Arc::from(s));
+        return FlexType::String(FlexString::from(s));
     }
     if first == b'{' {
         if let Some(v) = try_parse_dict(s) {
             return v;
         }
-        return FlexType::String(Arc::from(s));
+        return FlexType::String(FlexString::from(s));
     }
 
     // Atomic types: float (with dot), integer, then string fallback
@@ -256,7 +255,7 @@ fn parse_element(s: &str) -> FlexType {
         return v;
     }
 
-    FlexType::String(Arc::from(s))
+    FlexType::String(FlexString::from(s))
 }
 
 /// Split a string by a delimiter, respecting bracket/brace/quote nesting.
@@ -512,11 +511,11 @@ mod tests {
     fn test_parse_string() {
         assert_eq!(
             parse_flextype("hello"),
-            FlexType::String(Arc::from("hello"))
+            FlexType::String(FlexString::from("hello"))
         );
         assert_eq!(
             parse_flextype("hello world"),
-            FlexType::String(Arc::from("hello world"))
+            FlexType::String(FlexString::from("hello world"))
         );
     }
 
@@ -587,7 +586,7 @@ mod tests {
             FlexType::List(v) => {
                 assert_eq!(v.len(), 3);
                 assert_eq!(v[0], FlexType::Integer(1));
-                assert_eq!(v[1], FlexType::String(Arc::from("hello")));
+                assert_eq!(v[1], FlexType::String(FlexString::from("hello")));
                 assert_eq!(v[2], FlexType::Float(2.5));
             }
             other => panic!("Expected List, got {other:?}"),
@@ -619,9 +618,9 @@ mod tests {
         match parse_flextype("{\"a\": 1, \"b\": 2}") {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 2);
-                assert_eq!(v[0].0, FlexType::String(Arc::from("a")));
+                assert_eq!(v[0].0, FlexType::String(FlexString::from("a")));
                 assert_eq!(v[0].1, FlexType::Integer(1));
-                assert_eq!(v[1].0, FlexType::String(Arc::from("b")));
+                assert_eq!(v[1].0, FlexType::String(FlexString::from("b")));
                 assert_eq!(v[1].1, FlexType::Integer(2));
             }
             other => panic!("Expected Dict, got {other:?}"),
@@ -633,7 +632,7 @@ mod tests {
         match parse_flextype("{a: 1, b: 2}") {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 2);
-                assert_eq!(v[0].0, FlexType::String(Arc::from("a")));
+                assert_eq!(v[0].0, FlexType::String(FlexString::from("a")));
                 assert_eq!(v[0].1, FlexType::Integer(1));
             }
             other => panic!("Expected Dict, got {other:?}"),
@@ -655,10 +654,10 @@ mod tests {
         match parse_flextype("{\"a\": {\"b\": 1}}") {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].0, FlexType::String(Arc::from("a")));
+                assert_eq!(v[0].0, FlexType::String(FlexString::from("a")));
                 match &v[0].1 {
                     FlexType::Dict(inner) => {
-                        assert_eq!(inner[0].0, FlexType::String(Arc::from("b")));
+                        assert_eq!(inner[0].0, FlexType::String(FlexString::from("b")));
                         assert_eq!(inner[0].1, FlexType::Integer(1));
                     }
                     other => panic!("Expected Dict value, got {other:?}"),
@@ -675,11 +674,11 @@ mod tests {
         // Mismatched brackets should fall back to string
         assert_eq!(
             parse_flextype("[abc"),
-            FlexType::String(Arc::from("[abc"))
+            FlexType::String(FlexString::from("[abc"))
         );
         assert_eq!(
             parse_flextype("{abc"),
-            FlexType::String(Arc::from("{abc"))
+            FlexType::String(FlexString::from("{abc"))
         );
     }
 
@@ -689,9 +688,9 @@ mod tests {
         match parse_flextype("[a, b, c]") {
             FlexType::List(v) => {
                 assert_eq!(v.len(), 3);
-                assert_eq!(v[0], FlexType::String(Arc::from("a")));
-                assert_eq!(v[1], FlexType::String(Arc::from("b")));
-                assert_eq!(v[2], FlexType::String(Arc::from("c")));
+                assert_eq!(v[0], FlexType::String(FlexString::from("a")));
+                assert_eq!(v[1], FlexType::String(FlexString::from("b")));
+                assert_eq!(v[2], FlexType::String(FlexString::from("c")));
             }
             other => panic!("Expected List, got {other:?}"),
         }
@@ -726,10 +725,10 @@ mod tests {
         match parse_flextype("{\"key\": \"value with spaces\"}") {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].0, FlexType::String(Arc::from("key")));
+                assert_eq!(v[0].0, FlexType::String(FlexString::from("key")));
                 assert_eq!(
                     v[0].1,
-                    FlexType::String(Arc::from("value with spaces"))
+                    FlexType::String(FlexString::from("value with spaces"))
                 );
             }
             other => panic!("Expected Dict, got {other:?}"),
@@ -741,8 +740,8 @@ mod tests {
         match parse_flextype("[\"hello, world\", \"foo\"]") {
             FlexType::List(v) => {
                 assert_eq!(v.len(), 2);
-                assert_eq!(v[0], FlexType::String(Arc::from("hello, world")));
-                assert_eq!(v[1], FlexType::String(Arc::from("foo")));
+                assert_eq!(v[0], FlexType::String(FlexString::from("hello, world")));
+                assert_eq!(v[1], FlexType::String(FlexString::from("foo")));
             }
             other => panic!("Expected List, got {other:?}"),
         }
@@ -755,7 +754,7 @@ mod tests {
         match parse_flextype("{\"name\": \"John\", \"age\": 30, \"score\": 9.5}") {
             FlexType::Dict(v) => {
                 assert_eq!(v.len(), 3);
-                assert_eq!(v[0].1, FlexType::String(Arc::from("John")));
+                assert_eq!(v[0].1, FlexType::String(FlexString::from("John")));
                 assert_eq!(v[1].1, FlexType::Integer(30));
                 assert_eq!(v[2].1, FlexType::Float(9.5));
             }

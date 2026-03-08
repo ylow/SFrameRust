@@ -24,6 +24,7 @@ use sframe_query::planner::PlannerNode;
 use sframe_storage::sframe_writer::SFrameWriter;
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
+use sframe_types::flex_wrappers::FlexDict;
 
 use crate::sarray::SArray;
 
@@ -1234,7 +1235,7 @@ impl SFrame {
                     )
                 })
                 .collect();
-            dict_col.push(FlexType::Dict(Arc::from(entries)));
+            dict_col.push(FlexType::Dict(FlexDict::from(entries)));
         }
         new_names.push(new_column_name.to_string());
         new_col_vecs.push(dict_col);
@@ -2058,6 +2059,7 @@ impl SFrameStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sframe_types::flex_wrappers::FlexList;
 
     fn samples_dir() -> String {
         let manifest = env!("CARGO_MANIFEST_DIR");
@@ -2527,8 +2529,8 @@ mod tests {
     fn test_stack() {
         let sa = SArray::from_vec(
             vec![
-                FlexType::List(Arc::from(vec![FlexType::Integer(1), FlexType::Integer(2)])),
-                FlexType::List(Arc::from(vec![FlexType::Integer(3)])),
+                FlexType::List(FlexList::from(vec![FlexType::Integer(1), FlexType::Integer(2)])),
+                FlexType::List(FlexList::from(vec![FlexType::Integer(3)])),
             ],
             FlexTypeEnum::List,
         ).unwrap();

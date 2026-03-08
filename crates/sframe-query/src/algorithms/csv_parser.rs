@@ -26,7 +26,7 @@
 //! which delegate to these internally.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use sframe_types::flex_wrappers::{FlexList, FlexString, FlexVec};
 
 use sframe_types::error::{Result, SFrameError};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
@@ -341,7 +341,7 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
     // Empty values: String columns produce String(""), all others produce Undefined.
     if val.is_empty() {
         return match dtype {
-            FlexTypeEnum::String => Ok(FlexType::String(Arc::from(""))),
+            FlexTypeEnum::String => Ok(FlexType::String(FlexString::from(""))),
             _ => Ok(FlexType::Undefined),
         };
     }
@@ -359,7 +359,7 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
             })?;
             Ok(FlexType::Float(v))
         }
-        FlexTypeEnum::String => Ok(FlexType::String(Arc::from(val))),
+        FlexTypeEnum::String => Ok(FlexType::String(FlexString::from(val))),
         FlexTypeEnum::Vector => {
             let parsed = parse_flextype(val);
             match &parsed {
@@ -374,7 +374,7 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
                             _ => return Ok(FlexType::Undefined),
                         }
                     }
-                    Ok(FlexType::Vector(Arc::from(floats)))
+                    Ok(FlexType::Vector(FlexVec::from(floats)))
                 }
                 _ => Ok(FlexType::Undefined),
             }
@@ -399,7 +399,7 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
                             }
                         })
                         .collect();
-                    Ok(FlexType::List(Arc::from(items)))
+                    Ok(FlexType::List(FlexList::from(items)))
                 }
                 _ => Ok(FlexType::Undefined),
             }
@@ -421,12 +421,12 @@ pub(crate) fn parse_cell(val: &str, dtype: FlexTypeEnum, na_set: &HashSet<String
             // (e.g. "\n" after escape processing) returns Undefined. In CSV
             // context, non-empty values should be preserved as String.
             if matches!(parsed, FlexType::Undefined) {
-                Ok(FlexType::String(Arc::from(val)))
+                Ok(FlexType::String(FlexString::from(val)))
             } else {
                 Ok(parsed)
             }
         }
-        _ => Ok(FlexType::String(Arc::from(val))),
+        _ => Ok(FlexType::String(FlexString::from(val))),
     }
 }
 
