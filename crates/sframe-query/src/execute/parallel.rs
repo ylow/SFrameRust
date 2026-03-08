@@ -21,15 +21,13 @@ const MIN_ROWS_FOR_PARALLEL: u64 = 10_000;
 /// Check if a plan is parallel-sliceable and return the total row count.
 ///
 /// A plan is parallel-sliceable when:
-/// - Every leaf node is `SFrameSource`
-/// - All `SFrameSource` leaves have the same path (or are the same Arc)
-/// - All `SFrameSource` leaves read the full range (begin_row=0, end_row=num_rows)
+/// - Every leaf node is `SFrameSource`, `ParquetSource`, or `Range`
+/// - All leaf nodes have the same effective row count
 /// - No `Reduce`, `Append`, `Union`, or `MaterializedSource` operators
 pub fn parallel_slice_row_count(plan: &Arc<PlannerNode>) -> Option<u64> {
     let mut total_rows: Option<u64> = None;
-    let mut source_path: Option<String> = None;
 
-    if !check_sliceable(plan, &mut total_rows, &mut source_path) {
+    if !check_sliceable(plan, &mut total_rows) {
         return None;
     }
 
@@ -40,64 +38,32 @@ pub fn parallel_slice_row_count(plan: &Arc<PlannerNode>) -> Option<u64> {
 fn check_sliceable(
     node: &Arc<PlannerNode>,
     total_rows: &mut Option<u64>,
-    source_path: &mut Option<String>,
 ) -> bool {
     match &node.op {
         LogicalOp::SFrameSource {
-            path,
-            num_rows,
             begin_row,
             end_row,
             ..
         } => {
-            // Must be a full-range source
-            if *begin_row != 0 || *end_row != *num_rows {
-                return false;
-            }
-
-            // All sources must have the same path
-            match source_path {
-                None => {
-                    *source_path = Some(path.clone());
-                    *total_rows = Some(*num_rows);
-                }
-                Some(existing) => {
-                    if existing != path {
-                        return false;
-                    }
-                    // num_rows should match (same SFrame)
-                    if *total_rows != Some(*num_rows) {
-                        return false;
-                    }
-                }
+            let effective = end_row - begin_row;
+            match *total_rows {
+                None => *total_rows = Some(effective),
+                Some(existing) if existing != effective => return false,
+                _ => {}
             }
             true
         }
 
         LogicalOp::ParquetSource {
-            source_id,
-            num_rows,
             begin_row,
             end_row,
             ..
         } => {
-            if *begin_row != 0 || *end_row != *num_rows {
-                return false;
-            }
-
-            match source_path {
-                None => {
-                    *source_path = Some(source_id.clone());
-                    *total_rows = Some(*num_rows);
-                }
-                Some(existing) => {
-                    if existing != source_id {
-                        return false;
-                    }
-                    if *total_rows != Some(*num_rows) {
-                        return false;
-                    }
-                }
+            let effective = end_row - begin_row;
+            match *total_rows {
+                None => *total_rows = Some(effective),
+                Some(existing) if existing != effective => return false,
+                _ => {}
             }
             true
         }
@@ -129,7 +95,7 @@ fn check_sliceable(
         | LogicalOp::ColumnUnion => {
             node.inputs
                 .iter()
-                .all(|input| check_sliceable(input, total_rows, source_path))
+                .all(|input| check_sliceable(input, total_rows))
         }
     }
 }
@@ -321,7 +287,7 @@ mod tests {
 
 
     #[test]
-    fn test_not_sliceable_different_paths() {
+    fn test_sliceable_different_paths_same_rows() {
         let s1 = PlannerNode::sframe_source(
             "a.sf",
             vec!["a".into()],
@@ -334,9 +300,46 @@ mod tests {
             vec![FlexTypeEnum::Integer],
             100_000,
         );
-        // LogicalFilter with different-path sources
+        // Different paths but same row count — should be sliceable
+        let lf = PlannerNode::logical_filter(s1, s2);
+        assert_eq!(parallel_slice_row_count(&lf), Some(100_000));
+    }
+
+    #[test]
+    fn test_not_sliceable_different_row_counts() {
+        let s1 = PlannerNode::sframe_source(
+            "a.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            100_000,
+        );
+        let s2 = PlannerNode::sframe_source(
+            "b.sf",
+            vec!["a".into()],
+            vec![FlexTypeEnum::Integer],
+            50_000,
+        );
+        // Different effective row counts — not sliceable
         let lf = PlannerNode::logical_filter(s1, s2);
         assert_eq!(parallel_slice_row_count(&lf), None);
+    }
+
+    #[test]
+    fn test_sliceable_sub_range_source() {
+        // A source reading rows [100, 500) should be sliceable with 400 effective rows
+        let source = Arc::new(PlannerNode::new(
+            LogicalOp::SFrameSource {
+                path: "test.sf".to_string(),
+                column_names: vec!["a".into()],
+                column_types: vec![FlexTypeEnum::Integer],
+                num_rows: 1000,
+                begin_row: 100,
+                end_row: 500,
+                _keep_alive: None,
+            },
+            vec![],
+        ));
+        assert_eq!(parallel_slice_row_count(&source), Some(400));
     }
 
     #[test]

@@ -789,6 +789,7 @@ pub fn clone_plan_with_row_range(
                 column_names,
                 column_types,
                 num_rows,
+                begin_row: orig_begin,
                 _keep_alive,
                 ..
             } => LogicalOp::SFrameSource {
@@ -796,14 +797,15 @@ pub fn clone_plan_with_row_range(
                 column_names: column_names.clone(),
                 column_types: column_types.clone(),
                 num_rows: *num_rows,
-                begin_row,
-                end_row,
+                begin_row: orig_begin + begin_row,
+                end_row: orig_begin + end_row,
                 _keep_alive: _keep_alive.clone(),
             },
             LogicalOp::ParquetSource {
                 column_names,
                 column_types,
                 num_rows,
+                begin_row: orig_begin,
                 source_id,
                 source_fn,
                 ..
@@ -811,8 +813,8 @@ pub fn clone_plan_with_row_range(
                 column_names: column_names.clone(),
                 column_types: column_types.clone(),
                 num_rows: *num_rows,
-                begin_row,
-                end_row,
+                begin_row: orig_begin + begin_row,
+                end_row: orig_begin + end_row,
                 source_id: source_id.clone(),
                 source_fn: source_fn.clone(),
             },
@@ -898,6 +900,25 @@ fn slice_recursive(
                     begin_row: new_begin,
                     end_row: new_end,
                     _keep_alive: _keep_alive.clone(),
+                },
+                vec![],
+            )))
+        }
+        LogicalOp::ParquetSource {
+            column_names, column_types, num_rows, begin_row, end_row, source_id, source_fn,
+        } => {
+            let new_begin = begin_row + begin;
+            let new_end = begin_row + end;
+            assert!(new_end <= *end_row);
+            Ok(Arc::new(PlannerNode::new(
+                LogicalOp::ParquetSource {
+                    column_names: column_names.clone(),
+                    column_types: column_types.clone(),
+                    num_rows: *num_rows,
+                    begin_row: new_begin,
+                    end_row: new_end,
+                    source_id: source_id.clone(),
+                    source_fn: source_fn.clone(),
                 },
                 vec![],
             )))
