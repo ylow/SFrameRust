@@ -67,6 +67,8 @@ pub struct CsvOptions {
     pub escape_char: char,
     /// Skip leading whitespace before each field. Default: true.
     pub skip_initial_space: bool,
+    /// Quote character. Default: '"'.
+    pub quote_char: char,
 }
 
 impl Default for CsvOptions {
@@ -85,6 +87,7 @@ impl Default for CsvOptions {
             line_terminator: "\n".to_string(),
             escape_char: '\\',
             skip_initial_space: true,
+            quote_char: '"',
         }
     }
 }
@@ -134,20 +137,7 @@ impl CsvSchema {
 /// infer types row-by-row. The raw string rows are retained so that
 /// [`parse_rows_range`] can convert them in independent chunks.
 pub fn tokenize_and_infer(content: &str, options: &CsvOptions) -> Result<CsvSchema> {
-    let config = CsvConfig {
-        delimiter: options.delimiter.clone(),
-        line_terminator: options.line_terminator.clone(),
-        escape_char: options.escape_char,
-        double_quote: options.double_quote,
-        skip_initial_space: options.skip_initial_space,
-        has_header: options.has_header,
-        comment_char: options.comment_char,
-        na_values: options.na_values.clone(),
-        skip_rows: options.skip_rows,
-        row_limit: options.row_limit,
-        output_columns: options.output_columns.clone(),
-        ..Default::default()
-    };
+    let config = options_to_config(options);
 
     let (header, raw_rows) = csv_tokenizer::tokenize(content, &config);
 
@@ -498,6 +488,7 @@ pub fn options_to_config(options: &CsvOptions) -> CsvConfig {
         delimiter: options.delimiter.clone(),
         line_terminator: options.line_terminator.clone(),
         escape_char: options.escape_char,
+        quote_char: options.quote_char,
         double_quote: options.double_quote,
         skip_initial_space: options.skip_initial_space,
         has_header: options.has_header,
@@ -506,7 +497,6 @@ pub fn options_to_config(options: &CsvOptions) -> CsvConfig {
         skip_rows: options.skip_rows,
         row_limit: options.row_limit,
         output_columns: options.output_columns.clone(),
-        ..Default::default()
     }
 }
 

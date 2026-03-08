@@ -7,7 +7,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use sframe_core::{SArray, SFrame};
 use sframe_query::algorithms::aggregators::AggSpec;
 use sframe_query::algorithms::csv_parser::CsvOptions;
-use sframe_query::algorithms::csv_writer::CsvWriterOptions;
+use sframe_query::algorithms::csv_writer::{CsvWriterOptions, QuoteStyle};
 use sframe_query::algorithms::join::JoinType;
 use sframe_query::algorithms::sort::SortOrder;
 use sframe_types::flex_type::FlexType;
@@ -48,14 +48,91 @@ impl PySFrame {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (path, delimiter=None))]
-    fn from_csv(path: &str, delimiter: Option<&str>, py: Python<'_>) -> PyResult<Self> {
+    #[pyo3(signature = (
+        path,
+        delimiter = ",",
+        header = true,
+        comment_char = "#",
+        escape_char = "\\",
+        double_quote = true,
+        quote_char = "\"",
+        skip_initial_space = true,
+        column_type_hints = None,
+        na_values = None,
+        line_terminator = "\n",
+        usecols = None,
+        nrows = None,
+        skiprows = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_csv(
+        path: &str,
+        delimiter: &str,
+        header: bool,
+        comment_char: &str,
+        escape_char: &str,
+        double_quote: bool,
+        quote_char: &str,
+        skip_initial_space: bool,
+        column_type_hints: Option<&Bound<'_, PyDict>>,
+        na_values: Option<Vec<String>>,
+        line_terminator: &str,
+        usecols: Option<Vec<String>>,
+        nrows: Option<usize>,
+        skiprows: usize,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        let type_hints = match column_type_hints {
+            Some(d) => {
+                let mut hints = Vec::new();
+                for (k, v) in d.iter() {
+                    let name: String = k.extract()?;
+                    let dtype_str: String = v.extract()?;
+                    let dtype = crate::conversion::py_str_to_dtype(&dtype_str)?;
+                    hints.push((name, dtype));
+                }
+                hints
+            }
+            None => Vec::new(),
+        };
+        let comment = if comment_char.is_empty() {
+            None
+        } else {
+            Some(
+                comment_char
+                    .chars()
+                    .next()
+                    .ok_or_else(|| PyValueError::new_err("comment_char must be a single character"))?,
+            )
+        };
+        let esc = escape_char
+            .chars()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("escape_char must be a single character"))?;
+        let qc = quote_char
+            .chars()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("quote_char must be a single character"))?;
+
+        let opts = CsvOptions {
+            has_header: header,
+            delimiter: delimiter.to_string(),
+            type_hints,
+            na_values: na_values.unwrap_or_default(),
+            comment_char: comment,
+            skip_rows: skiprows,
+            row_limit: nrows,
+            output_columns: usecols,
+            use_custom_tokenizer: true,
+            double_quote,
+            line_terminator: line_terminator.to_string(),
+            escape_char: esc,
+            skip_initial_space,
+            quote_char: qc,
+        };
+
         let path = path.to_string();
-        let opts = delimiter.map(|d| CsvOptions {
-            delimiter: d.to_string(),
-            ..Default::default()
-        });
-        let sf = allow(py, move || SFrame::from_csv(&path, opts))?;
+        let sf = allow(py, move || SFrame::from_csv(&path, Some(opts)))?;
         Ok(PySFrame::new(sf))
     }
 
@@ -111,15 +188,62 @@ impl PySFrame {
         allow(py, move || inner.save(&path))
     }
 
-    #[pyo3(signature = (path, delimiter=None))]
-    fn to_csv(&self, path: &str, delimiter: Option<&str>, py: Python<'_>) -> PyResult<()> {
+    #[pyo3(signature = (
+        path,
+        delimiter = ",",
+        quote_char = "\"",
+        escape_char = "\\",
+        line_terminator = "\n",
+        na_rep = "",
+        header = true,
+        quoting = "minimal",
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn to_csv(
+        &self,
+        path: &str,
+        delimiter: &str,
+        quote_char: &str,
+        escape_char: &str,
+        line_terminator: &str,
+        na_rep: &str,
+        header: bool,
+        quoting: &str,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        let qc = quote_char
+            .chars()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("quote_char must be a single character"))?;
+        let esc = escape_char
+            .chars()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("escape_char must be a single character"))?;
+        let quote_style = match quoting {
+            "minimal" => QuoteStyle::Minimal,
+            "all" => QuoteStyle::All,
+            "nonnumeric" => QuoteStyle::NonNumeric,
+            "none" => QuoteStyle::None,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown quoting style: '{quoting}'. Use 'minimal', 'all', 'nonnumeric', or 'none'"
+                )))
+            }
+        };
+
+        let opts = CsvWriterOptions {
+            delimiter: delimiter.to_string(),
+            quote_char: qc,
+            escape_char: esc,
+            line_terminator: line_terminator.to_string(),
+            na_rep: na_rep.to_string(),
+            header,
+            quoting: quote_style,
+        };
+
         let inner = self.inner.clone();
         let path = path.to_string();
-        let opts = delimiter.map(|d| CsvWriterOptions {
-            delimiter: d.to_string(),
-            ..Default::default()
-        });
-        allow(py, move || inner.to_csv(&path, opts))
+        allow(py, move || inner.to_csv(&path, Some(opts)))
     }
 
     fn to_json(&self, path: &str, py: Python<'_>) -> PyResult<()> {
