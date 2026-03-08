@@ -2704,6 +2704,85 @@ mod tests {
     }
 
     #[test]
+    fn test_join_empty_left() {
+        let left = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(vec![], FlexTypeEnum::Integer).unwrap()),
+        ]).unwrap();
+        let right = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1)], FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("v", SArray::from_vec(
+                vec![FlexType::Float(1.0)], FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let inner = left.join(&right, "id", "id", JoinType::Inner).unwrap();
+        assert_eq!(inner.num_rows().unwrap(), 0);
+
+        let full = left.join(&right, "id", "id", JoinType::Full).unwrap();
+        assert_eq!(full.num_rows().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_join_right_join() {
+        let left = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1)], FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("name", SArray::from_vec(
+                vec![FlexType::String("a".into())], FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+        let right = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("score", SArray::from_vec(
+                vec![FlexType::Float(10.0), FlexType::Float(20.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let result = left.join(&right, "id", "id", JoinType::Right).unwrap();
+        assert_eq!(result.num_rows().unwrap(), 2); // both right rows kept
+    }
+
+    #[test]
+    fn test_join_duplicate_keys() {
+        // Left has duplicate key values -> cross product
+        let left = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(1), FlexType::Integer(2)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("tag", SArray::from_vec(
+                vec![
+                    FlexType::String("x".into()),
+                    FlexType::String("y".into()),
+                    FlexType::String("z".into()),
+                ],
+                FlexTypeEnum::String,
+            ).unwrap()),
+        ]).unwrap();
+        let right = SFrame::from_columns(vec![
+            ("id", SArray::from_vec(
+                vec![FlexType::Integer(1), FlexType::Integer(1)],
+                FlexTypeEnum::Integer,
+            ).unwrap()),
+            ("v", SArray::from_vec(
+                vec![FlexType::Float(10.0), FlexType::Float(20.0)],
+                FlexTypeEnum::Float,
+            ).unwrap()),
+        ]).unwrap();
+
+        let result = left.join(&right, "id", "id", JoinType::Inner).unwrap();
+        // id=1 appears 2x in left, 2x in right -> 4 rows. id=2 has no match.
+        assert_eq!(result.num_rows().unwrap(), 4);
+    }
+
+    #[test]
     fn test_unique_uses_proper_hashing() {
         // Regression: ensure unique() uses FlexType Hash+Eq, not Debug string.
         // Floats with different representations must be treated correctly.
