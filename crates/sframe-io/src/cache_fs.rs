@@ -19,7 +19,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 
 use sframe_types::error::Result;
 
@@ -27,6 +27,48 @@ use crate::vfs::{ReadableFile, VirtualFileSystem, WritableFile};
 
 /// Global instance counter for unique root directories.
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// PID-scoped cache directory with atexit cleanup
+// ---------------------------------------------------------------------------
+
+/// The per-process cache directory (`{cache_dir}/{pid}`).
+/// Set once when the first CacheFs is created; removed on clean process exit.
+static PID_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+static ATEXIT_REGISTERED: Once = Once::new();
+
+extern "C" {
+    fn atexit(f: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+extern "C" fn cleanup_pid_dir() {
+    if let Ok(mut guard) = PID_DIR.try_lock() {
+        if let Some(dir) = guard.take() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Return the per-process cache directory, creating it on first call and
+/// registering an `atexit` handler to remove it on clean shutdown.
+fn ensure_pid_dir() -> PathBuf {
+    let mut guard = PID_DIR.lock().unwrap();
+    if let Some(ref dir) = *guard {
+        return dir.clone();
+    }
+    let cache_dir = &sframe_config::global().cache_dir;
+    let pid_dir = cache_dir.join(format!("{}", std::process::id()));
+    fs::create_dir_all(&pid_dir).expect("Failed to create cache pid directory");
+    *guard = Some(pid_dir.clone());
+
+    ATEXIT_REGISTERED.call_once(|| {
+        unsafe {
+            atexit(cleanup_pid_dir);
+        }
+    });
+
+    pid_dir
+}
 
 /// Global CacheFs instance shared across the process.
 static GLOBAL_CACHE_FS: LazyLock<Arc<CacheFs>> = LazyLock::new(|| {
@@ -61,15 +103,11 @@ pub struct CacheFs {
 }
 
 impl CacheFs {
-    /// Create a new CacheFs backed by a system temp directory.
+    /// Create a new CacheFs under the configured cache directory.
     /// Cache capacity limits are read from `sframe_config` at construction time.
     pub fn new() -> Result<Self> {
         let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "sframe_cache_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let root = ensure_pid_dir().join(format!("{id}"));
         fs::create_dir_all(&root)?;
         Ok(CacheFs {
             root,
@@ -86,11 +124,7 @@ impl CacheFs {
     /// Create a CacheFs with explicit capacity limits (for testing).
     pub fn with_limits(cache_capacity: usize, cache_capacity_per_file: usize) -> Result<Self> {
         let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "sframe_cache_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let root = ensure_pid_dir().join(format!("{id}"));
         fs::create_dir_all(&root)?;
         Ok(CacheFs {
             root,

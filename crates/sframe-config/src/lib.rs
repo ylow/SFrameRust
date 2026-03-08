@@ -7,6 +7,8 @@
 //! # Environment Variables
 //!
 //! All prefixed with `SFRAME_`:
+//! - `SFRAME_CACHE_DIR`: On-disk cache directory (default `/var/tmp/sframe` on Linux,
+//!   `temp_dir()/sframe` elsewhere). Files are written under a `{pid}/` subdirectory.
 //! - `SFRAME_CACHE_CAPACITY`: CacheFs in-memory store limit (default 2G)
 //! - `SFRAME_CACHE_CAPACITY_PER_FILE`: Max single file in cache (default 2G)
 //! - `SFRAME_SOURCE_BATCH_SIZE`: Rows per batch (default 4096)
@@ -15,6 +17,7 @@
 //! - `SFRAME_JOIN_BUFFER_NUM_CELLS`: Join hash table limit (default 50000000)
 //! - `SFRAME_SOURCE_PREFETCH_SEGMENTS`: Lazy source prefetch (default 2)
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
@@ -36,6 +39,9 @@ pub struct SFrameConfig {
     cache_capacity_per_file: AtomicUsize,
 
     // --- Immutable after init ---
+    /// Root directory for on-disk cache storage.
+    /// Within this directory, files are written under a `{pid}/` subdirectory.
+    pub cache_dir: PathBuf,
     /// Batch size for source operators (rows per batch).
     pub source_batch_size: usize,
     /// Maximum total memory for the external sort phase.
@@ -126,9 +132,15 @@ static GLOBAL_CONFIG: LazyLock<SFrameConfig> = LazyLock::new(|| {
         }
     }
 
+    let cache_dir = match std::env::var("SFRAME_CACHE_DIR") {
+        Ok(val) => PathBuf::from(val),
+        Err(_) => default_cache_dir(),
+    };
+
     SFrameConfig {
         cache_capacity: AtomicUsize::new(cache_cap),
         cache_capacity_per_file: AtomicUsize::new(cache_cap_per_file),
+        cache_dir,
         source_batch_size,
         sort_max_memory,
         groupby_buffer_num_rows,
@@ -170,6 +182,15 @@ pub fn set_cache_capacity_per_file(bytes: usize) {
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
+
+/// Default cache directory: `/var/tmp/sframe` on Linux, `temp_dir()/sframe` elsewhere.
+fn default_cache_dir() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        PathBuf::from("/var/tmp/sframe")
+    } else {
+        std::env::temp_dir().join("sframe")
+    }
+}
 
 /// Parse a byte size string. Supports plain integers and suffixes:
 /// `K`/`KB`, `M`/`MB`, `G`/`GB` (case-insensitive).
