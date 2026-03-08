@@ -13,7 +13,7 @@ use sframe_query::algorithms::csv_parser::{self, CsvOptions};
 use sframe_query::algorithms::csv_writer::{self, CsvWriterOptions};
 use sframe_query::algorithms::json as json_io;
 use sframe_query::algorithms::groupby;
-use sframe_query::algorithms::join::{self, JoinOn, JoinType};
+use sframe_query::algorithms::join::{JoinOn, JoinType};
 use sframe_query::algorithms::sort::{self, SortKey, SortOrder};
 use sframe_query::batch::SFrameRows;
 use sframe_query::execute::{
@@ -437,7 +437,7 @@ impl SFrame {
     }
 
     /// Return the row count if cheaply available (no materialization).
-    fn known_len(&self) -> Option<u64> {
+    pub(crate) fn known_len(&self) -> Option<u64> {
         if self.columns.is_empty() {
             Some(0)
         } else {
@@ -880,9 +880,6 @@ impl SFrame {
         let right_key_indices: HashSet<usize> =
             pairs.iter().map(|&(_, r)| r).collect();
 
-        let left_stream = self.compile_stream()?;
-        let right_stream = other.compile_stream()?;
-
         // Build output column names: all left cols + right cols (minus join keys)
         let mut names: Vec<String> = self.column_names.clone();
         let mut output_dtypes: Vec<FlexTypeEnum> = self.column_types();
@@ -898,21 +895,7 @@ impl SFrame {
             }
         }
 
-        let mut join_stream = join::join(
-            left_stream,
-            right_stream,
-            &JoinOn::multi(pairs),
-            how,
-        )?;
-
-        // Consume the stream into a builder
-        let mut builder = SFrameBuilder::anonymous(names.clone(), output_dtypes)?;
-        while let Some(batch_result) = join_stream.next_batch() {
-            let batch = batch_result?;
-            builder.write_batch_chunked(&batch, DEFAULT_CHUNK_SIZE)?;
-        }
-
-        builder.finish()
+        crate::join::hash_join(self, other, &JoinOn::multi(pairs), how, &names, &output_dtypes)
     }
 
     /// Group by columns and aggregate.
