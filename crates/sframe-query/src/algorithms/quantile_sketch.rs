@@ -26,6 +26,7 @@ struct GKTuple {
 }
 
 /// Greenwald-Khanna streaming approximate quantile sketch.
+#[derive(Clone)]
 pub struct QuantileSketch {
     tuples: Vec<GKTuple>,
     count: usize,

@@ -786,13 +786,25 @@ impl SArray {
     /// Execute a streaming reduction over this column using a plan-based
     /// Reduce node. Projects to the single column, reduces, and extracts
     /// the scalar result — never materializes the full column.
-    fn reduce_with(&self, aggregator: impl Aggregator + 'static) -> Result<FlexType> {
+    pub fn reduce_with(&self, aggregator: impl Aggregator + 'static) -> Result<FlexType> {
         // Project down to just this column, then reduce.
         let projected = PlannerNode::project(self.plan.clone(), vec![self.column_index]);
         let reduce_plan = PlannerNode::reduce(projected, Arc::new(aggregator));
         let stream = compile(&reduce_plan)?;
         let batch = materialize_sync(stream)?;
         Ok(batch.column(0).get(0))
+    }
+
+    /// Like `reduce_with`, but returns the merged aggregator instead of
+    /// calling `finalize()`. Useful for composite aggregators (e.g. Sketch)
+    /// where the caller needs the internal state, not a single FlexType.
+    ///
+    /// Uses the same parallel reduction path as `reduce_with` when the
+    /// plan is parallel-sliceable.
+    pub fn reduce_aggregate<A: Aggregator + Clone + 'static>(&self, aggregator: A) -> Result<A> {
+        use sframe_query::execute::reduce_to_aggregator;
+        let projected = PlannerNode::project(self.plan.clone(), vec![self.column_index]);
+        reduce_to_aggregator(&projected, aggregator)
     }
 
     /// Sum of all values.

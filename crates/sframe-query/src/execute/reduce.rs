@@ -100,6 +100,68 @@ pub(super) fn execute_parallel_reduce(plan: &ParallelReducePlan) -> Result<SFram
     SFrameRows::new(vec![col])
 }
 
+/// Reduce an input plan to a typed aggregator, returning the merged aggregator
+/// without calling `finalize()`. Uses parallel partitioning when possible.
+///
+/// This is the "keep the aggregator" variant of `reduce_with` — useful for
+/// composite aggregators like Sketch where the caller needs the internal state.
+pub fn reduce_to_aggregator<A: Aggregator + Clone + 'static>(
+    input_plan: &Arc<PlannerNode>,
+    template: A,
+) -> Result<A> {
+    use rayon::prelude::*;
+    let optimized = crate::optimizer::optimize(input_plan);
+
+    if let Some(total_rows) = parallel_slice_row_count(&optimized) {
+        let n_workers = rayon::current_num_threads().max(1);
+        let worker_plans: Vec<Arc<PlannerNode>> = (0..n_workers)
+            .filter_map(|i| {
+                let begin = (i as u64 * total_rows) / n_workers as u64;
+                let end = ((i as u64 + 1) * total_rows) / n_workers as u64;
+                if begin >= end {
+                    return None;
+                }
+                Some(clone_plan_with_row_range(&optimized, begin, end))
+            })
+            .collect();
+
+        let partials: Vec<Result<A>> = worker_plans
+            .into_par_iter()
+            .map(|wp| {
+                let mut local = template.clone();
+                let mut iter = super::compile_single_threaded(&wp)?;
+                while let Some(batch_result) = iter.next_batch() {
+                    let batch = batch_result?;
+                    for i in 0..batch.num_rows() {
+                        let row = batch.row(i);
+                        local.add(&row);
+                    }
+                }
+                Ok(local)
+            })
+            .collect();
+
+        let mut merged = template;
+        for partial in partials {
+            let partial = partial?;
+            merged.merge(&partial);
+        }
+        Ok(merged)
+    } else {
+        // Sequential fallback
+        let mut agg = template;
+        let mut iter = super::compile_single_threaded(&optimized)?;
+        while let Some(batch_result) = iter.next_batch() {
+            let batch = batch_result?;
+            for i in 0..batch.num_rows() {
+                let row = batch.row(i);
+                agg.add(&row);
+            }
+        }
+        Ok(agg)
+    }
+}
+
 /// Execute a reduce operation by consuming the entire input BatchIterator.
 pub(super) fn execute_reduce_iter(
     input: &mut BatchIterator,

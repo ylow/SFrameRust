@@ -38,6 +38,7 @@ pub type BatchStream = BatchIterator;
 
 pub use consumer::consume_to_segment;
 pub use parallel::{execute_parallel, parallel_slice_row_count};
+pub use reduce::reduce_to_aggregator;
 
 /// Default broadcast buffer capacity (batches per consumer channel).
 const BROADCAST_BUFFER: usize = 4;

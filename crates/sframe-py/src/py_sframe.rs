@@ -38,6 +38,152 @@ impl PySFrame {
 
 #[pymethods]
 impl PySFrame {
+    // ── Constructor ─────────────────────────────────────────────────
+
+    /// Construct an SFrame from various Python types:
+    ///   - dict {str: list|SArray} → columns
+    ///   - list of dicts → rows
+    ///   - pandas DataFrame
+    ///   - None / no arg → empty SFrame
+    #[new]
+    #[pyo3(signature = (data=None))]
+    fn py_new(data: Option<&Bound<'_, PyAny>>, _py: Python<'_>) -> PyResult<Self> {
+        let data = match data {
+            None => return Ok(PySFrame::new(SFrame::from_columns(Vec::<(&str, SArray)>::new()).into_pyresult()?)),
+            Some(d) => d,
+        };
+
+        // Dict → from_columns
+        if let Ok(d) = data.cast::<PyDict>() {
+            let mut names: Vec<String> = Vec::new();
+            let mut arrays: Vec<SArray> = Vec::new();
+            for (key, val) in d.iter() {
+                let name: String = key.extract()?;
+                // Value can be SArray or list
+                if let Ok(sa) = val.extract::<PyRef<PySArray>>() {
+                    names.push(name);
+                    arrays.push(sa.inner.clone());
+                } else if let Ok(list) = val.cast::<PyList>() {
+                    let values: Vec<FlexType> = list
+                        .iter()
+                        .map(|item| py_to_flextype(&item))
+                        .collect::<PyResult<_>>()?;
+                    let dt = values
+                        .iter()
+                        .find(|v| !matches!(v, FlexType::Undefined))
+                        .map(|v| v.type_enum())
+                        .unwrap_or(sframe_types::flex_type::FlexTypeEnum::Undefined);
+                    let sa = SArray::from_vec(values, dt).into_pyresult()?;
+                    names.push(name);
+                    arrays.push(sa);
+                } else {
+                    return Err(PyTypeError::new_err(format!(
+                        "SFrame dict values must be lists or SArrays, got {} for column '{name}'",
+                        val.get_type().name()?
+                    )));
+                }
+            }
+            let rust_cols: Vec<(&str, SArray)> = names
+                .iter()
+                .zip(arrays)
+                .map(|(n, a)| (n.as_str(), a))
+                .collect();
+            let sf = SFrame::from_columns(rust_cols).into_pyresult()?;
+            return Ok(PySFrame::new(sf));
+        }
+
+        // List of dicts → row-oriented construction
+        if let Ok(list) = data.cast::<PyList>() {
+            if list.is_empty() {
+                return Ok(PySFrame::new(SFrame::from_columns(Vec::<(&str, SArray)>::new()).into_pyresult()?));
+            }
+            // Peek at first element to check if it's a dict
+            let first = list.get_item(0)?;
+            if first.cast::<PyDict>().is_ok() {
+                // Collect column names from all dicts (preserving order from first)
+                let mut col_order: Vec<String> = Vec::new();
+                let mut col_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut col_data: HashMap<String, Vec<FlexType>> = HashMap::new();
+                let n = list.len();
+
+                for i in 0..n {
+                    let row = list.get_item(i)?.cast::<PyDict>().map_err(|_| {
+                        PyTypeError::new_err("All elements in list must be dicts")
+                    })?.clone();
+                    for (k, v) in row.iter() {
+                        let name: String = k.extract()?;
+                        if col_set.insert(name.clone()) {
+                            col_order.push(name.clone());
+                            // Back-fill with Undefined for prior rows
+                            col_data.insert(name.clone(), vec![FlexType::Undefined; i]);
+                        }
+                        col_data.get_mut(&name).unwrap().push(py_to_flextype(&v)?);
+                    }
+                    // Fill Undefined for columns not in this row
+                    for name in &col_order {
+                        let vals = col_data.get_mut(name).unwrap();
+                        if vals.len() <= i {
+                            vals.push(FlexType::Undefined);
+                        }
+                    }
+                }
+
+                let mut rust_cols: Vec<(String, SArray)> = Vec::new();
+                for name in &col_order {
+                    let values = col_data.remove(name).unwrap();
+                    let dt = values
+                        .iter()
+                        .find(|v| !matches!(v, FlexType::Undefined))
+                        .map(|v| v.type_enum())
+                        .unwrap_or(sframe_types::flex_type::FlexTypeEnum::Undefined);
+                    let sa = SArray::from_vec(values, dt).into_pyresult()?;
+                    rust_cols.push((name.clone(), sa));
+                }
+                let col_refs: Vec<(&str, SArray)> = rust_cols
+                    .iter()
+                    .map(|(n, a)| (n.as_str(), a.clone()))
+                    .collect();
+                let sf = SFrame::from_columns(col_refs).into_pyresult()?;
+                return Ok(PySFrame::new(sf));
+            }
+        }
+
+        // pandas DataFrame
+        let type_name: String = data.get_type().name()?.extract()?;
+        if type_name.contains("DataFrame") {
+            // Extract column names
+            let columns = data.getattr("columns")?;
+            let col_list: Vec<String> = columns.call_method0("tolist")?.extract()?;
+            let mut rust_cols: Vec<(String, SArray)> = Vec::new();
+            for name in &col_list {
+                let series = data.get_item(name)?;
+                let values_list = series.call_method0("tolist")?;
+                let pylist = values_list.cast::<PyList>()?;
+                let values: Vec<FlexType> = pylist
+                    .iter()
+                    .map(|item| py_to_flextype(&item))
+                    .collect::<PyResult<_>>()?;
+                let dt = values
+                    .iter()
+                    .find(|v| !matches!(v, FlexType::Undefined))
+                    .map(|v| v.type_enum())
+                    .unwrap_or(sframe_types::flex_type::FlexTypeEnum::Undefined);
+                let sa = SArray::from_vec(values, dt).into_pyresult()?;
+                rust_cols.push((name.clone(), sa));
+            }
+            let col_refs: Vec<(&str, SArray)> = rust_cols
+                .iter()
+                .map(|(n, a)| (n.as_str(), a.clone()))
+                .collect();
+            let sf = SFrame::from_columns(col_refs).into_pyresult()?;
+            return Ok(PySFrame::new(sf));
+        }
+
+        Err(PyTypeError::new_err(
+            "SFrame() expects a dict, list of dicts, pandas DataFrame, or None",
+        ))
+    }
+
     // ── Constructors / I/O ──────────────────────────────────────────
 
     #[staticmethod]
@@ -274,6 +420,30 @@ impl PySFrame {
         self.inner.num_columns()
     }
 
+    /// Alias for num_columns (C++ API compat).
+    fn num_cols(&self) -> usize {
+        self.inner.num_columns()
+    }
+
+    /// (num_rows, num_columns) tuple.
+    #[getter]
+    fn shape(&self, py: Python<'_>) -> PyResult<(u64, usize)> {
+        let inner = self.inner.clone();
+        let nrows = allow(py, move || inner.num_rows())?;
+        Ok((nrows, self.inner.num_columns()))
+    }
+
+    /// Column name → type string mapping.
+    #[getter(dtype)]
+    fn py_dtype(&self) -> HashMap<String, &'static str> {
+        self.inner
+            .column_names()
+            .iter()
+            .zip(self.inner.column_types())
+            .map(|(n, dt)| (n.clone(), dtype_to_py_str(dt)))
+            .collect()
+    }
+
     fn column_names(&self) -> Vec<String> {
         self.inner.column_names().to_vec()
     }
@@ -315,6 +485,97 @@ impl PySFrame {
 
     // ── Column access ───────────────────────────────────────────────
 
+    // ── Aliases (C++ API compat) ───────────────────────────────────
+
+    #[staticmethod]
+    #[pyo3(signature = (
+        url,
+        delimiter = ",",
+        header = true,
+        comment_char = "#",
+        escape_char = "\\",
+        double_quote = true,
+        quote_char = "\"",
+        skip_initial_space = true,
+        column_type_hints = None,
+        na_values = None,
+        line_terminator = "\n",
+        usecols = None,
+        nrows = None,
+        skiprows = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn read_csv(
+        url: &str,
+        delimiter: &str,
+        header: bool,
+        comment_char: &str,
+        escape_char: &str,
+        double_quote: bool,
+        quote_char: &str,
+        skip_initial_space: bool,
+        column_type_hints: Option<&Bound<'_, PyDict>>,
+        na_values: Option<Vec<String>>,
+        line_terminator: &str,
+        usecols: Option<Vec<String>>,
+        nrows: Option<usize>,
+        skiprows: usize,
+        py: Python<'_>,
+    ) -> PyResult<Self> {
+        Self::from_csv(
+            url, delimiter, header, comment_char, escape_char, double_quote,
+            quote_char, skip_initial_space, column_type_hints, na_values,
+            line_terminator, usecols, nrows, skiprows, py,
+        )
+    }
+
+    #[staticmethod]
+    fn read_json(url: &str, py: Python<'_>) -> PyResult<Self> {
+        Self::from_json(url, py)
+    }
+
+    #[pyo3(signature = (
+        filename,
+        delimiter = ",",
+        quote_char = "\"",
+        escape_char = "\\",
+        line_terminator = "\n",
+        na_rep = "",
+        header = true,
+        quoting = "minimal",
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn export_csv(
+        &self,
+        filename: &str,
+        delimiter: &str,
+        quote_char: &str,
+        escape_char: &str,
+        line_terminator: &str,
+        na_rep: &str,
+        header: bool,
+        quoting: &str,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        self.to_csv(filename, delimiter, quote_char, escape_char, line_terminator, na_rep, header, quoting, py)
+    }
+
+    fn export_json(&self, path: &str, py: Python<'_>) -> PyResult<()> {
+        self.to_json(path, py)
+    }
+
+    /// Alias for `select` (C++ API compat).
+    fn select_columns(&self, names: Vec<String>) -> PyResult<PySFrame> {
+        self.select(names)
+    }
+
+    /// Alias for `column` (C++ API compat).
+    fn select_column(&self, name: &str) -> PyResult<PySArray> {
+        self.column(name)
+    }
+
+    // ── Column access ───────────────────────────────────────────────
+
     fn column(&self, name: &str) -> PyResult<PySArray> {
         let sa = self.inner.column(name).into_pyresult()?;
         Ok(PySArray::new(sa.clone()))
@@ -334,8 +595,46 @@ impl PySFrame {
         Ok(PySFrame::new(sf))
     }
 
+    /// Add multiple columns at once.
+    fn add_columns(&self, data: &Bound<'_, PyAny>) -> PyResult<PySFrame> {
+        // Accept dict {name: SArray} or list of SArrays with namelist
+        let mut sf = self.inner.clone();
+        if let Ok(d) = data.cast::<PyDict>() {
+            for (k, v) in d.iter() {
+                let name: String = k.extract()?;
+                let sa: PyRef<PySArray> = v.extract()?;
+                sf = sf.add_column(&name, sa.inner.clone()).into_pyresult()?;
+            }
+            return Ok(PySFrame::new(sf));
+        }
+        // Also accept list of (name, SArray) tuples
+        if let Ok(list) = data.cast::<PyList>() {
+            for item in list.iter() {
+                let tup = item.cast::<PyTuple>().map_err(|_| {
+                    PyTypeError::new_err("add_columns expects a dict or list of (name, SArray) tuples")
+                })?;
+                let name: String = tup.get_item(0)?.extract()?;
+                let sa: PyRef<PySArray> = tup.get_item(1)?.extract()?;
+                sf = sf.add_column(&name, sa.inner.clone()).into_pyresult()?;
+            }
+            return Ok(PySFrame::new(sf));
+        }
+        Err(PyTypeError::new_err(
+            "add_columns expects a dict {name: SArray} or list of (name, SArray) tuples",
+        ))
+    }
+
     fn remove_column(&self, name: &str) -> PyResult<PySFrame> {
         let sf = self.inner.remove_column(name).into_pyresult()?;
+        Ok(PySFrame::new(sf))
+    }
+
+    /// Remove multiple columns at once.
+    fn remove_columns(&self, column_names: Vec<String>) -> PyResult<PySFrame> {
+        let mut sf = self.inner.clone();
+        for name in &column_names {
+            sf = sf.remove_column(name).into_pyresult()?;
+        }
         Ok(PySFrame::new(sf))
     }
 
@@ -438,6 +737,16 @@ impl PySFrame {
         self.inner.column_names().contains(&key.to_string())
     }
 
+    fn __delitem__(&mut self, key: &str) -> PyResult<()> {
+        self.inner = self.inner.remove_column(key).into_pyresult()?;
+        Ok(())
+    }
+
+    /// Return self (SFrames are lazy/immutable plans, so copy is trivial).
+    fn copy(&self) -> PySFrame {
+        PySFrame::new(self.inner.clone())
+    }
+
     // ── Filtering & selection ───────────────────────────────────────
 
     #[pyo3(signature = (n=10))]
@@ -503,6 +812,172 @@ impl PySFrame {
         let col = column.to_string();
         let sf = allow(py, move || inner.topk(&col, k, reverse))?;
         Ok(PySFrame::new(sf))
+    }
+
+    /// Filter rows where column_name's value is in (or not in) values.
+    #[pyo3(signature = (values, column_name, exclude=false))]
+    fn filter_by(
+        &self,
+        values: &Bound<'_, PyAny>,
+        column_name: &str,
+        exclude: bool,
+        py: Python<'_>,
+    ) -> PyResult<PySFrame> {
+        // Collect values into a HashSet for O(1) lookup.
+        let val_list: Vec<FlexType> = if let Ok(sa) = values.extract::<PyRef<PySArray>>() {
+            let sa_inner = sa.inner.clone();
+            allow(py, move || sa_inner.to_vec())?
+        } else if let Ok(list) = values.cast::<PyList>() {
+            list.iter()
+                .map(|item| py_to_flextype(&item))
+                .collect::<PyResult<_>>()?
+        } else {
+            return Err(PyTypeError::new_err(
+                "filter_by values must be a list or SArray",
+            ));
+        };
+        let val_set: std::collections::HashSet<FlexType> = val_list.into_iter().collect();
+        let pred: Arc<dyn Fn(&FlexType) -> bool + Send + Sync> = if exclude {
+            Arc::new(move |v: &FlexType| !val_set.contains(v))
+        } else {
+            Arc::new(move |v: &FlexType| val_set.contains(v))
+        };
+        let sf = self.inner.filter(column_name, pred).into_pyresult()?;
+        Ok(PySFrame::new(sf))
+    }
+
+    /// Add a sequential row number column.
+    #[pyo3(signature = (column_name="id", start=0))]
+    fn add_row_number(
+        &self,
+        column_name: &str,
+        start: i64,
+        py: Python<'_>,
+    ) -> PyResult<PySFrame> {
+        let inner = self.inner.clone();
+        let nrows = allow(py, move || inner.num_rows())?;
+        let sa = SArray::from_range(start, 1, nrows);
+        let sf = self
+            .inner
+            .add_column(column_name, sa)
+            .into_pyresult()?;
+        // Move the new column to position 0
+        let mut names = sf.column_names().to_vec();
+        let pos = names.iter().position(|n| n == column_name).unwrap();
+        names.remove(pos);
+        names.insert(0, column_name.to_string());
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let sf = sf.select(&refs).into_pyresult()?;
+        Ok(PySFrame::new(sf))
+    }
+
+    /// Split into (clean, dirty) SFrames based on missing values.
+    #[pyo3(signature = (columns=None, how="any"))]
+    fn dropna_split(
+        &self,
+        columns: Option<Vec<String>>,
+        how: &str,
+        py: Python<'_>,
+    ) -> PyResult<(PySFrame, PySFrame)> {
+        let inner = self.inner.clone();
+        let inner2 = self.inner.clone();
+        let col_names: Vec<String> = match &columns {
+            Some(c) => c.clone(),
+            None => inner.column_names().to_vec(),
+        };
+        let col_names2 = col_names.clone();
+        let how_str = how.to_string();
+        let how_str2 = how_str.clone();
+        // Clean: dropna(None, how) checks all columns when column is None
+        let clean = allow(py, move || {
+            // If specific columns requested, we need to build a mask ourselves.
+            // Otherwise use dropna(None) which checks all.
+            if columns.is_some() {
+                let mut mask: Option<SArray> = None;
+                for cname in &col_names {
+                    let col = inner.column(cname)?;
+                    let na = col.is_na();
+                    mask = Some(match mask {
+                        None => na,
+                        Some(prev) => {
+                            if how_str == "all" {
+                                prev.and(&na)?
+                            } else {
+                                prev.or(&na)?
+                            }
+                        }
+                    });
+                }
+                match mask {
+                    // NOT mask → clean rows (no missing)
+                    Some(m) => {
+                        let not_mask: SArray = m.eq_scalar(FlexType::Integer(0));
+                        inner.logical_filter(not_mask)
+                    }
+                    None => Ok(inner.clone()),
+                }
+            } else {
+                inner.dropna(None, &how_str)
+            }
+        })?;
+        // Dirty: rows WITH missing values (complement of clean)
+        let dirty = allow(py, move || {
+            let mut mask: Option<SArray> = None;
+            for cname in &col_names2 {
+                let col = inner2.column(cname)?;
+                let na = col.is_na();
+                mask = Some(match mask {
+                    None => na,
+                    Some(prev) => {
+                        if how_str2 == "all" {
+                            prev.and(&na)?
+                        } else {
+                            prev.or(&na)?
+                        }
+                    }
+                });
+            }
+            match mask {
+                Some(m) => inner2.logical_filter(m),
+                None => inner2.head(0),
+            }
+        })?;
+        Ok((PySFrame::new(clean), PySFrame::new(dirty)))
+    }
+
+    /// Formatted printing with configurable dimensions.
+    #[pyo3(signature = (num_rows=10, num_columns=40, max_column_width=30))]
+    fn print_rows(&self, num_rows: usize, num_columns: usize, max_column_width: usize, py: Python<'_>) -> PyResult<String> {
+        let inner = self.inner.clone();
+        let sf = allow(py, move || inner.head(num_rows))?;
+        let names = sf.column_names();
+        let display_cols = names.len().min(num_columns);
+
+        let mut lines: Vec<String> = Vec::new();
+
+        // Header
+        let mut header = String::new();
+        for name in names.iter().take(display_cols) {
+            let truncated: String = name.chars().take(max_column_width).collect();
+            header.push_str(&format!("{:<width$} ", truncated, width = max_column_width.min(truncated.len() + 2)));
+        }
+        lines.push(header);
+        lines.push("-".repeat(lines[0].len()));
+
+        // Rows
+        let rows = sf.iter_rows().into_pyresult()?;
+        for row in &rows {
+            let mut line = String::new();
+            for val in row.iter().take(display_cols) {
+                let s = format!("{val}");
+                let truncated: String = s.chars().take(max_column_width).collect();
+                line.push_str(&format!("{:<width$} ", truncated, width = max_column_width.min(truncated.len() + 2)));
+            }
+            lines.push(line);
+        }
+
+        let result = lines.join("\n");
+        Ok(result)
     }
 
     // ── Data manipulation ───────────────────────────────────────────

@@ -7,12 +7,14 @@ mod error;
 mod py_config;
 mod py_sarray;
 mod py_sframe;
+mod py_sketch;
 mod py_stream_writer;
 
 use error::IntoPyResult;
 use py_config::PyConfig;
 use py_sarray::{PySArray, PySArrayIter};
 use py_sframe::{PySFrame, PySFrameIter};
+use py_sketch::PySketch;
 use py_stream_writer::PySFrameStreamWriter;
 
 use pyo3::exceptions::PyValueError;
@@ -150,6 +152,26 @@ fn SELECT_ONE(col: &str) -> PyAggSpec {
     }
 }
 
+/// Alias for MEAN (C++ API compat).
+#[pyfunction]
+#[allow(non_snake_case)]
+fn AVG(col: &str) -> PyAggSpec {
+    PyAggSpec {
+        column: col.to_string(),
+        op: "MEAN".to_string(),
+    }
+}
+
+/// Alias for STD (C++ API compat).
+#[pyfunction]
+#[allow(non_snake_case)]
+fn STDV(col: &str) -> PyAggSpec {
+    PyAggSpec {
+        column: col.to_string(),
+        op: "STD".to_string(),
+    }
+}
+
 // ── Top-level convenience ───────────────────────────────────────────
 
 /// Load an SFrame from a path (convenience function).
@@ -165,6 +187,7 @@ fn load(path: &str) -> PyResult<PySFrame> {
 fn _sframe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySFrame>()?;
     m.add_class::<PySArray>()?;
+    m.add_class::<PySketch>()?;
     m.add_class::<PySFrameStreamWriter>()?;
     m.add_class::<PySArrayIter>()?;
     m.add_class::<PySFrameIter>()?;
@@ -184,6 +207,8 @@ fn _sframe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     aggregate.add_function(wrap_pyfunction!(COUNT_DISTINCT, &aggregate)?)?;
     aggregate.add_function(wrap_pyfunction!(CONCAT, &aggregate)?)?;
     aggregate.add_function(wrap_pyfunction!(SELECT_ONE, &aggregate)?)?;
+    aggregate.add_function(wrap_pyfunction!(AVG, &aggregate)?)?;
+    aggregate.add_function(wrap_pyfunction!(STDV, &aggregate)?)?;
     m.add_submodule(&aggregate)?;
 
     Ok(())

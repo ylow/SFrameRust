@@ -3,7 +3,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use sframe_core::SArray;
+use sframe_core::{SArray, SFrame};
 use sframe_types::flex_type::{FlexType, FlexTypeEnum};
 
 use crate::conversion::{dtype_to_py_str, flextype_to_py, py_str_to_dtype, py_to_flextype};
@@ -93,10 +93,50 @@ impl PySArray {
         }
     }
 
+    /// Create a constant-valued SArray.
+    #[staticmethod]
+    #[pyo3(signature = (value, size, dtype=None))]
+    fn from_const(value: &Bound<'_, PyAny>, size: u64, dtype: Option<&str>) -> PyResult<Self> {
+        let val = py_to_flextype(value)?;
+        let dt = match dtype {
+            Some(s) => py_str_to_dtype(s)?,
+            None => val.type_enum(),
+        };
+        let values = vec![val; size as usize];
+        let sa = SArray::from_vec(values, dt).into_pyresult()?;
+        Ok(PySArray { inner: sa })
+    }
+
+    /// Split into two SArrays by wrapping into a 1-column SFrame and splitting.
+    #[pyo3(signature = (fraction, seed=None))]
+    fn random_split(&self, fraction: f64, seed: Option<u64>, py: Python<'_>) -> PyResult<(PySArray, PySArray)> {
+        let inner = self.inner.clone();
+        let (a, b) = allow(py, move || {
+            let sf = SFrame::from_columns(vec![("_col", inner)])?;
+            let (sa, sb) = sf.random_split(fraction, seed)?;
+            Ok((sa.column("_col")?.clone(), sb.column("_col")?.clone()))
+        })?;
+        Ok((PySArray::new(a), PySArray::new(b)))
+    }
+
     /// The data type of this array.
     #[getter]
     fn dtype(&self) -> &'static str {
         dtype_to_py_str(self.inner.dtype())
+    }
+
+    /// (length,) tuple — compatible with C++ SArray.shape.
+    #[getter]
+    fn shape(&self, py: Python<'_>) -> PyResult<(usize,)> {
+        let inner = self.inner.clone();
+        let len = allow(py, move || inner.len())? as usize;
+        Ok((len,))
+    }
+
+    /// Alias for len() — compatible with C++ SArray.size().
+    fn size(&self, py: Python<'_>) -> PyResult<usize> {
+        let inner = self.inner.clone();
+        Ok(allow(py, move || inner.len())? as usize)
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
@@ -180,6 +220,42 @@ impl PySArray {
 
     fn __rmod__(&self, other: &Bound<'_, PyAny>) -> PyResult<PySArray> {
         self.reverse_scalar_op(other, BinOp::Rem)
+    }
+
+    fn __floordiv__(&self, other: &Bound<'_, PyAny>) -> PyResult<PySArray> {
+        self.binop(other, BinOp::FloorDiv)
+    }
+
+    fn __rfloordiv__(&self, other: &Bound<'_, PyAny>) -> PyResult<PySArray> {
+        self.reverse_scalar_op(other, BinOp::FloorDiv)
+    }
+
+    fn __pow__(&self, other: &Bound<'_, PyAny>, _modulo: Option<&Bound<'_, PyAny>>) -> PyResult<PySArray> {
+        self.binop(other, BinOp::Pow)
+    }
+
+    fn __rpow__(&self, other: &Bound<'_, PyAny>, _modulo: Option<&Bound<'_, PyAny>>) -> PyResult<PySArray> {
+        self.reverse_scalar_op(other, BinOp::Pow)
+    }
+
+    // ── Unary operators ────────────────────────────────────────────
+
+    fn __neg__(&self) -> PySArray {
+        PySArray::new(self.inner.mul_scalar(FlexType::Integer(-1)))
+    }
+
+    fn __pos__(&self) -> PySArray {
+        PySArray::new(self.inner.clone())
+    }
+
+    fn __abs__(&self) -> PySArray {
+        let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> =
+            Arc::new(|v: &FlexType| match v {
+                FlexType::Integer(x) => FlexType::Integer(x.abs()),
+                FlexType::Float(x) => FlexType::Float(x.abs()),
+                _ => FlexType::Undefined,
+            });
+        PySArray::new(self.inner.apply(closure, self.inner.dtype()))
     }
 
     // ── Comparison operators ────────────────────────────────────────
@@ -313,6 +389,16 @@ impl PySArray {
         let lo = py_to_flextype(lower)?;
         let hi = py_to_flextype(upper)?;
         Ok(PySArray::new(self.inner.clip(lo, hi)))
+    }
+
+    fn clip_lower(&self, threshold: &Bound<'_, PyAny>) -> PyResult<PySArray> {
+        let lo = py_to_flextype(threshold)?;
+        Ok(PySArray::new(self.inner.clip(lo, FlexType::Float(f64::INFINITY))))
+    }
+
+    fn clip_upper(&self, threshold: &Bound<'_, PyAny>) -> PyResult<PySArray> {
+        let hi = py_to_flextype(threshold)?;
+        Ok(PySArray::new(self.inner.clip(FlexType::Float(f64::NEG_INFINITY), hi)))
     }
 
     fn unique(&self, py: Python<'_>) -> PyResult<PySArray> {
@@ -513,6 +599,15 @@ impl PySArray {
         self.inner.explain()
     }
 
+    /// Compute a single-pass sketch summary of this array.
+    ///
+    /// Returns a Sketch object with exact and approximate statistics.
+    fn sketch_summary(&self, py: Python<'_>) -> PyResult<crate::py_sketch::PySketch> {
+        let inner = self.inner.clone();
+        let data = py.detach(move || crate::py_sketch::compute_sketch(&inner)).into_pyresult()?;
+        Ok(crate::py_sketch::PySketch::from_data(data))
+    }
+
     // ── Iteration ───────────────────────────────────────────────────
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PySArrayIter> {
@@ -527,6 +622,40 @@ impl PySArray {
             current_batch: None,
             batch_offset: 0,
         })
+    }
+
+    /// Element-wise membership test: returns boolean SArray.
+    fn is_in(&self, other: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PySArray> {
+        // Collect the values into a HashSet
+        let val_list: Vec<FlexType> = if let Ok(sa) = other.extract::<PyRef<PySArray>>() {
+            let sa_inner = sa.inner.clone();
+            allow(py, move || sa_inner.to_vec())?
+        } else if let Ok(list) = other.cast::<PyList>() {
+            list.iter()
+                .map(|item| py_to_flextype(&item))
+                .collect::<PyResult<_>>()?
+        } else {
+            return Err(PyTypeError::new_err("is_in expects a list or SArray"));
+        };
+        let val_set: std::collections::HashSet<FlexType> =
+            val_list.into_iter().collect();
+        let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> =
+            Arc::new(move |v: &FlexType| {
+                if val_set.contains(v) {
+                    FlexType::Integer(1)
+                } else {
+                    FlexType::Integer(0)
+                }
+            });
+        Ok(PySArray::new(self.inner.apply(closure, FlexTypeEnum::Integer)))
+    }
+
+    /// Check if item is contained in this array (linear scan).
+    fn __contains__(&self, item: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
+        let needle = py_to_flextype(item)?;
+        let inner = self.inner.clone();
+        let vals = allow(py, move || inner.to_vec())?;
+        Ok(vals.contains(&needle))
     }
 
     fn __bool__(&self) -> PyResult<bool> {
@@ -616,6 +745,8 @@ enum BinOp {
     Mul,
     Div,
     Rem,
+    FloorDiv,
+    Pow,
 }
 
 impl PySArray {
@@ -673,6 +804,10 @@ impl PySArray {
     }
 
     fn binop(&self, other: &Bound<'_, PyAny>, op: BinOp) -> PyResult<PySArray> {
+        // FloorDiv and Pow have no direct Rust-side SArray ops, so use apply.
+        if matches!(op, BinOp::FloorDiv | BinOp::Pow) {
+            return self.apply_binop(other, op);
+        }
         if let Ok(rhs) = other.extract::<PyRef<PySArray>>() {
             let result = match op {
                 BinOp::Add => self.inner.add(&rhs.inner),
@@ -680,6 +815,7 @@ impl PySArray {
                 BinOp::Mul => self.inner.mul(&rhs.inner),
                 BinOp::Div => self.inner.div(&rhs.inner),
                 BinOp::Rem => self.inner.rem(&rhs.inner),
+                BinOp::FloorDiv | BinOp::Pow => unreachable!(),
             }
             .into_pyresult()?;
             return Ok(PySArray::new(result));
@@ -691,13 +827,80 @@ impl PySArray {
             BinOp::Mul => self.inner.mul_scalar(scalar),
             BinOp::Div => self.inner.div_scalar(scalar),
             BinOp::Rem => self.inner.rem_scalar(scalar),
+            BinOp::FloorDiv | BinOp::Pow => unreachable!(),
         };
         Ok(PySArray::new(result))
+    }
+
+    /// FloorDiv / Pow via scalar apply (no native Rust SArray ops).
+    fn apply_binop(&self, other: &Bound<'_, PyAny>, op: BinOp) -> PyResult<PySArray> {
+        if let Ok(rhs) = other.extract::<PyRef<PySArray>>() {
+            // array op array: divide first, then floor for FloorDiv; pow for Pow.
+            match op {
+                BinOp::FloorDiv => {
+                    let divided = self.inner.div(&rhs.inner).into_pyresult()?;
+                    let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> =
+                        Arc::new(|v: &FlexType| match v {
+                            FlexType::Float(x) => FlexType::Integer(x.floor() as i64),
+                            FlexType::Integer(x) => FlexType::Integer(*x),
+                            _ => FlexType::Undefined,
+                        });
+                    Ok(PySArray::new(divided.apply(closure, FlexTypeEnum::Integer)))
+                }
+                BinOp::Pow => {
+                    // No element-wise pow on two SArrays in Rust; would need
+                    // a zip-apply. For now, materialize RHS.
+                    return Err(PyTypeError::new_err(
+                        "SArray ** SArray is not supported; use a scalar exponent",
+                    ));
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let scalar = py_to_flextype(other)?;
+            let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> = match op {
+                BinOp::FloorDiv => match scalar {
+                    FlexType::Integer(d) => Arc::new(move |v: &FlexType| match v {
+                        FlexType::Integer(x) if d != 0 => FlexType::Integer(x.div_euclid(d)),
+                        FlexType::Float(x) if d != 0 => FlexType::Integer((x / d as f64).floor() as i64),
+                        _ => FlexType::Undefined,
+                    }),
+                    FlexType::Float(d) => Arc::new(move |v: &FlexType| match v {
+                        FlexType::Integer(x) if d != 0.0 => FlexType::Float((*x as f64 / d).floor()),
+                        FlexType::Float(x) if d != 0.0 => FlexType::Float((x / d).floor()),
+                        _ => FlexType::Undefined,
+                    }),
+                    _ => return Err(PyTypeError::new_err("floor division requires numeric types")),
+                },
+                BinOp::Pow => match scalar {
+                    FlexType::Integer(e) => Arc::new(move |v: &FlexType| match v {
+                        FlexType::Integer(x) => FlexType::Float((*x as f64).powi(e as i32)),
+                        FlexType::Float(x) => FlexType::Float(x.powi(e as i32)),
+                        _ => FlexType::Undefined,
+                    }),
+                    FlexType::Float(e) => Arc::new(move |v: &FlexType| match v {
+                        FlexType::Integer(x) => FlexType::Float((*x as f64).powf(e)),
+                        FlexType::Float(x) => FlexType::Float(x.powf(e)),
+                        _ => FlexType::Undefined,
+                    }),
+                    _ => return Err(PyTypeError::new_err("pow requires numeric types")),
+                },
+                _ => unreachable!(),
+            };
+            let out_dt = match (&op, &scalar) {
+                (BinOp::FloorDiv, FlexType::Float(_)) => FlexTypeEnum::Float,
+                (BinOp::FloorDiv, _) => FlexTypeEnum::Integer,
+                (BinOp::Pow, _) => FlexTypeEnum::Float,
+                _ => self.inner.dtype(),
+            };
+            Ok(PySArray::new(self.inner.apply(closure, out_dt)))
+        }
     }
 
     /// Reverse scalar operations: scalar op self (e.g., 10 - sa)
     fn reverse_scalar_op(&self, other: &Bound<'_, PyAny>, op: BinOp) -> PyResult<PySArray> {
         let scalar = py_to_flextype(other)?;
+        let is_float_scalar = matches!(scalar, FlexType::Float(_));
         let closure: Arc<dyn Fn(&FlexType) -> FlexType + Send + Sync> = match op {
             BinOp::Sub => Arc::new(move |v: &FlexType| match (&scalar, v) {
                 (FlexType::Integer(a), FlexType::Integer(b)) => FlexType::Integer(a - b),
@@ -726,12 +929,42 @@ impl PySArray {
                 (FlexType::Float(a), FlexType::Float(b)) if *b != 0.0 => FlexType::Float(a % b),
                 _ => FlexType::Undefined,
             }),
+            BinOp::FloorDiv => Arc::new(move |v: &FlexType| {
+                let (a, b) = match (&scalar, v) {
+                    (FlexType::Integer(a), FlexType::Integer(b)) if *b != 0 => {
+                        return FlexType::Integer(a.div_euclid(*b));
+                    }
+                    (FlexType::Integer(a), FlexType::Float(b)) => (*a as f64, *b),
+                    (FlexType::Float(a), FlexType::Integer(b)) => (*a, *b as f64),
+                    (FlexType::Float(a), FlexType::Float(b)) => (*a, *b),
+                    _ => return FlexType::Undefined,
+                };
+                if b == 0.0 { FlexType::Undefined } else { FlexType::Float((a / b).floor()) }
+            }),
+            BinOp::Pow => Arc::new(move |v: &FlexType| {
+                let (base, exp) = match (&scalar, v) {
+                    (FlexType::Integer(a), FlexType::Integer(b)) => (*a as f64, *b as f64),
+                    (FlexType::Integer(a), FlexType::Float(b)) => (*a as f64, *b),
+                    (FlexType::Float(a), FlexType::Integer(b)) => (*a, *b as f64),
+                    (FlexType::Float(a), FlexType::Float(b)) => (*a, *b),
+                    _ => return FlexType::Undefined,
+                };
+                FlexType::Float(base.powf(exp))
+            }),
             // Add/Mul are commutative — shouldn't reach here, but handle gracefully
             BinOp::Add => return self.binop(other, BinOp::Add),
             BinOp::Mul => return self.binop(other, BinOp::Mul),
         };
-        let output_type = match self.inner.dtype() {
-            FlexTypeEnum::Integer | FlexTypeEnum::Float => self.inner.dtype(),
+        let output_type = match (&op, self.inner.dtype()) {
+            (BinOp::FloorDiv, _) => {
+                if is_float_scalar {
+                    FlexTypeEnum::Float
+                } else {
+                    FlexTypeEnum::Integer
+                }
+            }
+            (BinOp::Pow, _) => FlexTypeEnum::Float,
+            (_, FlexTypeEnum::Integer | FlexTypeEnum::Float) => self.inner.dtype(),
             _ => FlexTypeEnum::Float,
         };
         Ok(PySArray::new(self.inner.apply(closure, output_type)))
