@@ -1,27 +1,41 @@
 # SFrame
 
-A scalable, out-of-core columnar data store written in Rust, with Python bindings.
+**Process datasets that don't fit in memory — without a cluster.**
 
-SFrame provides disk-backed tabular data structures that can handle datasets
-larger than memory. It supports lazy evaluation, data-parallel query execution,
-and external-memory algorithms (sort, groupby, join) that spill to disk when
-needed.
+SFrame is a Rust-native, out-of-core columnar data engine with Python bindings.
+Load a 50 GB CSV on a laptop with 8 GB of RAM, sort it, join it, group it —
+SFrame streams data from disk, parallelizes across all cores, and spills
+intermediate results when memory gets tight. No cluster. No config files.
+Just `pip install` and go.
 
-This is a Rust port of the [C++ SFrame](https://github.com/turi-code/SFrame)
-library, reading the V2 on-disk format.
+```python
+from sframe import SFrame, aggregate
 
-## Features
+sf = SFrame.from_csv("50gb_dataset.csv")
+result = sf.groupby(["region"], {
+    "total":  aggregate.SUM("revenue"),
+    "avg":    aggregate.MEAN("revenue"),
+    "top5":   aggregate.CONCAT("product"),
+})
+result.sort("total", ascending=False).head(10)
+```
 
-- **Out-of-core**: Operates on data larger than RAM via streaming I/O and
-  disk-backed spill
-- **Columnar compression**: Frame-of-reference bit packing, dictionary encoding,
-  LZ4 block compression
-- **Lazy evaluation**: Operations build a query plan; execution is deferred
-  until materialization
-- **Data-parallel**: Queries automatically split across threads by row range
-- **Pluggable storage**: VFS trait with local filesystem, HTTP, S3, and HDFS
-  backends
-- **Python bindings**: PyO3-based Python package with a pandas-like API
+Ported from the battle-tested [C++ SFrame](https://github.com/turi-code/SFrame)
+that powered Turi Create and GraphLab, rebuilt in Rust for safety and speed.
+
+## Why SFrame?
+
+- **No memory limits.** Sort, join, and group datasets larger than RAM.
+  External-memory algorithms spill to disk automatically.
+- **No infrastructure.** Single-machine, single-process. No separate runtime,
+  no cluster manager, no YAML.
+- **Fast by default.** Queries build lazy plans, auto-parallelize across cores,
+  and read only the columns they need. Columnar compression (frame-of-reference
+  bit packing, dictionary encoding, LZ4) keeps I/O minimal.
+- **Python-native.** `SFrame({"x": [1,2,3]})` just works. Familiar pandas-like
+  API with `groupby`, `join`, `sort`, `filter`, `apply`.
+- **Pluggable storage.** Local disk, HTTP, S3 — swap backends via a VFS trait
+  without changing application code.
 
 ## Workspace Structure
 
@@ -29,7 +43,7 @@ library, reading the V2 on-disk format.
 |-------|-------------|
 | `sframe-types` | Core data types (`FlexType`, error types, varint encoding) |
 | `sframe-config` | Runtime configuration via environment variables |
-| `sframe-io` | VFS trait and filesystem backends (local, HTTP, S3, HDFS, cache) |
+| `sframe-io` | VFS trait and filesystem backends (local, HTTP, S3, cache) |
 | `sframe-storage` | V2 format reader/writer, block codecs, segment handling |
 | `sframe-query` | Query planner, optimizer, and algorithms (groupby, join, sort, CSV/JSON) |
 | `sframe` | High-level API: `SFrame`, `SArray`, `SFrameStreamWriter` |
